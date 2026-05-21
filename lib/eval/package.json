@@ -1,0 +1,19 @@
+{
+  "name": "@workspace/eval",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eval:chat": "tsx ./src/runners/chat.ts",
+    "eval:triage": "tsx ./src/runners/triage.ts",
+    "eval:redteam": "tsx ./src/runners/redteam.ts",
+    "eval": "tsx ./src/runners/chat.ts && tsx ./src/runners/triage.ts && tsx ./src/runners/redteam.ts",
+    "eval:validate": "tsx ./src/validate.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "tsx": "catalog:",
+    "zod": "catalog:"
+  }
+}

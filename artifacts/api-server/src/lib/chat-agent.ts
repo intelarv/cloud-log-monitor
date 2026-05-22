@@ -1,16 +1,30 @@
+import { randomUUID } from "node:crypto";
 import { ai } from "@workspace/integrations-gemini-ai";
-import { findingsTable, type Finding } from "@workspace/db";
-import { eq, and } from "drizzle-orm";
+import { findingsTable, findingSafeColumns, type FindingSafe } from "@workspace/db";
+type Finding = FindingSafe;
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { withTenant } from "./db-context";
 import { toolRegistry } from "./tools";
+import { hybridSearchFindings } from "./search";
+import { appendLedger } from "./ledger";
 import {
   CHAT_AGENT_MODEL,
   CHAT_AGENT_SYSTEM_PROMPT,
   CHAT_AGENT_VERSION,
   promptHash,
 } from "./prompts";
+import type { PolicyViolation } from "./policy";
+import type { ToolName } from "./policy";
 
-const MAX_TOOL_CALLS = 1;
+// M1: the agent may chain up to two tool calls (typical pattern:
+// search_findings → get_finding). Bounded loop is what enforces the cap.
+const MAX_TOOL_CALLS = 2;
+
+// Hybrid-search top-K seeded with the user question, plus a "context floor"
+// of the most-severe open findings so questions like "list the critical
+// findings" still surface even when their tokens don't overlap the query.
+const HYBRID_TOP_K = 10;
+const SEVERITY_FLOOR_LIMIT = 8;
 
 export interface ChatTurnResult {
   text: string;
@@ -21,6 +35,10 @@ export interface ChatTurnResult {
     ok: boolean;
     error?: string;
   }>;
+  // M1: ids of the findings pre-loaded into the agent's context (hybrid
+  // search top-K ∪ severity floor). Audited via the chat.agent_turn ledger
+  // entry so a reviewer can reconstruct exactly what the model was shown.
+  preloaded_finding_ids: string[];
   agent_identity: {
     agent: string;
     agent_version: string;
@@ -47,6 +65,71 @@ export interface RunChatTurnOpts {
     result?: unknown;
     error?: string;
   }) => void;
+}
+
+// M1.6: side-effect emitter for tool-arg policy violations. Writes an incident
+// finding into the same tenant (so the dashboard surfaces it immediately) and
+// appends a ledger entry. Canary trips get a distinct event type +
+// `critical` severity so a verifier can grep for them precisely. Threat model
+// §EoP: "canary in any tool argument MUST trigger alert + ledgered incident".
+async function recordToolPolicyViolation(args: {
+  tenantId: string;
+  userId: string;
+  tool: ToolName;
+  violations: PolicyViolation[];
+  canaryTripped: boolean;
+}): Promise<void> {
+  const findingId = args.canaryTripped
+    ? `F-CANARY-TRIP-${randomUUID().slice(0, 8)}`
+    : `F-POLICY-VIOL-${randomUUID().slice(0, 8)}`;
+  const severity = args.canaryTripped ? "critical" : "high";
+  const subclass = args.canaryTripped
+    ? "canary_in_tool_args"
+    : args.violations[0]?.kind ?? "policy_violation";
+  await withTenant(args.tenantId, async (tx) =>
+    tx.insert(findingsTable).values({
+      id: findingId,
+      tenantId: args.tenantId,
+      classification: "phi_in_output",
+      subclass,
+      severity,
+      status: "open",
+      source: `agent:chat:${args.userId}`,
+      fingerprint: `tool_policy:${args.tool}:${subclass}`,
+      redactedEvidence: {
+        snippet: `<REDACTED: ${args.violations.length} tool-arg policy violation(s) on ${args.tool}>`,
+        redactions: args.violations.map((v) => v.kind),
+        truncated: true,
+        trust: "untrusted",
+      },
+      detectorVersion: "tool-policy@m1.6",
+      firstSeenAt: new Date(),
+      lastSeenAt: new Date(),
+      occurrenceCount: 1,
+    }),
+  );
+  await appendLedger({
+    tenantId: args.tenantId,
+    actor: { kind: "human", id: args.userId },
+    eventType: args.canaryTripped
+      ? "agent.canary_in_tool_args"
+      : "agent.tool_args_policy_violation",
+    subjectType: "finding",
+    subjectId: findingId,
+    payload: {
+      tool: args.tool,
+      finding_id: findingId,
+      // Per threat_model §Repudiation: ledger payload carries the kinds
+      // (categorical) and messages (already redacted to detector names),
+      // NEVER the raw arg values. The incident-finding subclass is enough
+      // for an investigator to pivot.
+      violations: args.violations.map((v) => ({
+        kind: v.kind,
+        message: v.message,
+      })),
+      canary_tripped: args.canaryTripped,
+    },
+  });
 }
 
 function buildContext(findings: Finding[]): string {
@@ -123,19 +206,69 @@ async function callGemini(
 export async function runChatTurn(
   opts: RunChatTurnOpts,
 ): Promise<ChatTurnResult> {
-  // Step 1: load the redacted findings the agent is allowed to see.
-  const findings = await withTenant(opts.tenantId, async (tx) =>
-    tx
-      .select()
-      .from(findingsTable)
-      .where(
-        and(
-          eq(findingsTable.tenantId, opts.tenantId),
-          eq(findingsTable.status, "open"),
-        ),
-      )
-      .limit(50),
-  );
+  // M1 — Step 1: build the candidate set the agent sees.
+  //
+  // Two retrievers compose the visible context:
+  //
+  //   (a) Hybrid BM25 + vector search over findings_redacted, seeded with
+  //       the user's question. Returns the top-K most relevant candidates.
+  //   (b) Severity floor: the top-N most-severe open findings, ordered by
+  //       (critical→low, then last_seen_at desc). This guarantees questions
+  //       like "list the critical findings" surface the right rows even
+  //       when their textual overlap with the query is small.
+  //
+  // The two lists are union'd (de-duped by id) and capped. Both queries
+  // run inside withTenant(...), so Postgres RLS isolates the tenant.
+  const [hybrid, floor] = await Promise.all([
+    hybridSearchFindings(opts.tenantId, opts.userQuestion, {
+      topK: HYBRID_TOP_K,
+    }),
+    withTenant(opts.tenantId, async (tx) =>
+      // M1.6: safe projection — severity-floor preloads feed the agent prompt.
+      tx
+        .select(findingSafeColumns)
+        .from(findingsTable)
+        .where(
+          and(
+            eq(findingsTable.tenantId, opts.tenantId),
+            eq(findingsTable.status, "open"),
+            or(
+              eq(findingsTable.severity, "critical"),
+              eq(findingsTable.severity, "high"),
+            ),
+          ),
+        )
+        // Severity is a text column; sort by an explicit ordinal so
+        // `critical` always wins ties with `high` regardless of last_seen_at.
+        // Lower number = more severe → ASC.
+        .orderBy(
+          sql`CASE ${findingsTable.severity}
+                WHEN 'critical' THEN 0
+                WHEN 'high' THEN 1
+                ELSE 2
+              END`,
+          sql`${findingsTable.lastSeenAt} DESC`,
+        )
+        .limit(SEVERITY_FLOOR_LIMIT),
+    ),
+  ]);
+
+  const seen = new Set<string>();
+  const findings: Finding[] = [];
+  for (const f of hybrid.findings) {
+    if (!seen.has(f.id)) {
+      seen.add(f.id);
+      findings.push(f);
+    }
+  }
+  for (const f of floor) {
+    if (!seen.has(f.id)) {
+      seen.add(f.id);
+      findings.push(f);
+    }
+  }
+  const preloadedFindingIds = findings.map((f) => f.id);
+  void inArray; // reserved for future agent-side filtering; suppress unused warning
 
   const initialPrompt = `<AVAILABLE_FINDINGS>
 ${buildContext(findings)}
@@ -176,6 +309,19 @@ Respond per the system instructions.`;
         tenantId: opts.tenantId,
         userId: opts.userId,
         agent: "chat",
+        // M1.6: when the policy revalidation pass rejects an arg payload
+        // (canary in args, PHI in args, oversize, bad id format), this hook
+        // creates an incident finding + ledger entry. The chat-agent is the
+        // right side-effect owner because it knows the session context the
+        // tool call originated from. See policy.ts + ARCHITECTURE.md §23.1.
+        onPolicyViolation: async (info) =>
+          recordToolPolicyViolation({
+            tenantId: opts.tenantId,
+            userId: opts.userId,
+            tool: info.tool,
+            violations: info.violations,
+            canaryTripped: info.canaryTripped,
+          }),
       });
       toolCalls.push({
         name: call.name,
@@ -219,6 +365,7 @@ Now produce your final answer per the system instructions.`,
     text: finalText,
     citations,
     tool_calls: toolCalls,
+    preloaded_finding_ids: preloadedFindingIds,
     agent_identity: {
       agent: "chat",
       agent_version: CHAT_AGENT_VERSION,

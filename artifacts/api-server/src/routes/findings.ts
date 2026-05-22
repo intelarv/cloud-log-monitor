@@ -1,6 +1,7 @@
 import { Router, type IRouter } from "express";
 import { sql, and, eq, desc } from "drizzle-orm";
-import { findingsTable, type Finding } from "@workspace/db";
+import { findingsTable, findingSafeColumns, type FindingSafe } from "@workspace/db";
+type Finding = FindingSafe;
 import { GetFindingResponse as FindingSchema } from "@workspace/api-zod";
 import { withTenant } from "../lib/db-context";
 import { requireSession } from "../lib/auth";
@@ -38,8 +39,9 @@ router.get("/findings", requireSession, async (req, res): Promise<void> => {
     const filters = [eq(findingsTable.tenantId, tenantId)];
     if (status) filters.push(eq(findingsTable.status, status));
     if (severity) filters.push(eq(findingsTable.severity, severity));
+    // M1.6: safe projection — dashboard list endpoint must never carry raw.
     return tx
-      .select()
+      .select(findingSafeColumns)
       .from(findingsTable)
       .where(and(...filters))
       .orderBy(desc(findingsTable.severity), desc(findingsTable.lastSeenAt))
@@ -52,8 +54,11 @@ router.get("/findings/:id", requireSession, async (req, res): Promise<void> => {
   const id = String(req.params.id);
   const tenantId = req.session!.tenant_id;
   const rows = await withTenant(tenantId, async (tx) =>
+    // M1.6: safe projection — single-finding read on the dashboard is the
+    // redacted path; raw evidence is reachable only via the step-up-gated
+    // /admin/findings/:id/raw endpoint.
     tx
-      .select()
+      .select(findingSafeColumns)
       .from(findingsTable)
       .where(
         and(eq(findingsTable.id, id), eq(findingsTable.tenantId, tenantId)),

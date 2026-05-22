@@ -17,24 +17,27 @@ lib/eval/
     judge.ts      — LLM-as-judge stubs + deterministic PHI/secrets/canary scanners
     validate.ts   — load + check all cases (no target needed)
     runners/
-      chat.ts     — Chat eval runner (targets M0 Chat Agent)
+      chat.ts     — Chat eval runner (targets Chat Agent, shipped M0–M1.6)
       triage.ts   — Triage eval runner (targets M4 Triage Agent)
       redteam.ts  — Red-team eval runner (targets all reachable agents)
-  reports/        — runner outputs (gitignored when M0 lands)
+  reports/        — runner outputs (gitignored)
 ```
 
 ## Status
 
-The 55 gold-set cases are authored. Runner skeletons are in place and SKIP
-every case until their target component exists. Each runner exits 0 while
-all cases are skipped (so CI doesn't break before M0). Once a target lands,
-replace its `invoke...Agent` stub with a real in-process invocation.
+The 55 gold-set cases are authored. Runner skeletons SKIP every case until
+their target component exists. The Chat Agent (and therefore the chat +
+red-team targets reachable through it) have shipped through M1.6 — the
+runners' `invoke...Agent` stubs can now be replaced with real in-process
+calls into `artifacts/api-server/src/lib/chat-agent.ts → runChatTurn`.
+The Triage Agent is still ahead of us (Milestone M4 in `docs/ARCHITECTURE.md`
+§17).
 
 | Suite | Cases | Target | Status |
 |---|---|---|---|
-| chat | 30 | M0 Chat Agent | runner SKIPs until M0 |
+| chat | 30 | Chat Agent (shipped) | runner SKIP — wire `invokeChatAgent` to `runChatTurn` |
 | triage | 15 | M4 Triage Agent | runner SKIPs until M4 |
-| redteam | 10 | Chat (M0) + others | runner SKIPs until M0 |
+| redteam | 10 | Chat Agent (shipped) + others | runner SKIP — same wiring as chat suite |
 
 ## Commands
 

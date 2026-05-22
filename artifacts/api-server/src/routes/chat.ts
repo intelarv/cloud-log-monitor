@@ -442,6 +442,7 @@ router.post(
         })),
         phi_in_output_hits: phiHits.length,
         tool_versions: result.agent_identity.tool_versions,
+        preloaded_finding_ids: result.preloaded_finding_ids,
       },
     });
     sse.send({

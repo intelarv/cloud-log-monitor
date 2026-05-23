@@ -36,3 +36,9 @@ id = "K1sqRMsyhGiMsDgqD7RBU"
 uri = "file://exports/phia-20260523-191930.zip"
 type = "unspecified"
 title = "phia (docs sync — §25.4 matches implementation)"
+
+[[outputs]]
+id = "dYkyKnCrXFPpAgQ652ajt"
+uri = "file://exports/phia-20260523-194943.zip"
+type = "unspecified"
+title = "phia (M1.8 — periodic chain verifier, 117 tests)"

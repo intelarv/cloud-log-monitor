@@ -5,7 +5,7 @@ Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port comes from workflow env)
-- `pnpm --filter @workspace/api-server run test` — vitest suite (117 tests as of M1.8)
+- `pnpm --filter @workspace/api-server run test` — vitest suite (122 tests as of M1.9)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
@@ -134,6 +134,12 @@ Closes the §23.2 promise that tamper-evidence is *actively* checked, not just v
   - After architect review: added a symmetric dead-entry check for `NOT_ALERTABLE` (surfaced and removed a speculative `auth.login_success` entry with no emitter); broadened the scan to include `lib/db/src/` so `finding.created` and `ledger.genesis` from seed.ts count as live; excluded drizzle schema dirs to avoid `text("event_type")` false positives; documented the scanner's known limitations (single-quote / template-literal / const-ref / field-rename indirection) and the migration path to a ts-morph AST walk.
   - Test count: 92 (pre-M1.7) → **113** (post-M1.7.3).
 - **M1.8** (complete): periodic chain verifier — hourly rolling-24h walk + weekly full walk, appends `ledger.chain_invalid` on mismatch (post-commit alert routed via §25 → critical). See "M1.8 — Periodic chain verifier" above. Test count: 113 → **117**.
+- **M1.9** (complete): closed out architect's M1.8 follow-ups on the verifier.
+  - **Leader election**: each `runOnce` is gated by `pg_try_advisory_lock` on a per-scope key (`rolling_24h`, `full`), held on a `pool.connect()` client across try-lock → fn → unlock. After architect review: if `pg_advisory_unlock` itself fails, `client.release(err)` destroys the connection instead of recycling it — otherwise the session-scoped lock would leak for the lifetime of the pooled connection.
+  - **Dedupe**: keyed on `{scope, signature}` where `signature = errors[0]` (e.g. `"seq 12: hash mismatch ..."`) — a stable corruption fingerprint. After architect review: do NOT key on `head_seq` (every `chain_invalid` append itself advances the head, so the next run would see a new head and re-alert forever); scope the dedupe query per scope (not global most-recent) so a full-walk alert doesn't silence the hourly one or vice versa. Payload now carries the signature alongside head_seq + error counts.
+  - **DB-backed integration tests** for `verifyChainSince`: empty window, contiguous valid chain, and the **bigserial-gap tolerance at the window boundary** (architect-corrected — first revision put the gap between two in-window rows, which doesn't exercise the boundary-seed lookup that was the actual M1.8 bug). The fixed test appends a preceding row, bumps the sequence with `setval(pg_get_serial_sequence(...))`, then crosses the window boundary so the gapped row is the *first* in-window row — the exact scenario the buggy `eq(seq, first.seq - 1)` would false-positive on. Plus 2 tests for leader-lock + dedupe semantics. The leader-lock test caught a real pool-handing-different-connection bug in the first implementation before merge.
+  - Deferred: integration-test DB isolation (tests pollute the shared dev ledger with a handful of `system.integration_test_marker` rows + sequence gaps each run; assertions are tolerant but a per-test transaction-rollback harness or a dedicated test schema would be cleaner). Acceptable for v1 because the ledger is append-only-by-design and rows are validly chained.
+  - Test count: 117 → **122**.
 
 ## User preferences
 

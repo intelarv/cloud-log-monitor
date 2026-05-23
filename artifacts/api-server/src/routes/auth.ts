@@ -10,6 +10,7 @@ import {
   verifyStepUpToken,
 } from "../lib/auth";
 import { appendLedger } from "../lib/ledger";
+import { validateLedgerSafeText } from "../lib/text-policy";
 
 const router: IRouter = Router();
 
@@ -61,6 +62,28 @@ router.post(
     const parsed = StepUpBody.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.message });
+      return;
+    }
+    // The step-up reason lands in the ledger payload AND is later copied
+    // into the break-glass.granted payload via the step-up cookie. Boundary
+    // scan to keep PHI/secrets out of the immutable chain.
+    const rv = validateLedgerSafeText(parsed.data.reason);
+    if (!rv.ok) {
+      await appendLedger({
+        tenantId: req.session!.tenant_id,
+        actor: { kind: "human", id: req.session!.sub },
+        eventType: "policy.text_field_rejected",
+        payload: {
+          endpoint: "POST /auth/step-up",
+          field: "reason",
+          reason: rv.reason,
+          detectors: rv.detectors,
+        },
+      });
+      res.status(400).json({
+        error: "reason rejected by content policy",
+        reason: rv.reason,
+      });
       return;
     }
     if (!verifyStepUpToken(parsed.data.token)) {

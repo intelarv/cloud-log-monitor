@@ -408,7 +408,7 @@ Each is a Temporal workflow with explicit compensations (e.g., reversing tokeniz
 6. Add Context + Remediation + Notifier agents; gate any code-touching action behind HITL.
 7. Add semantic memory (pgvector), consolidation jobs, importance-decay eviction.
 8. Add tiered storage lifecycle and quarterly hash-chain verification.
-9. Add break-glass workflow with step-up auth. *(Demo-scale slice landed in M1.6 — `POST /api/auth/step-up`, `POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`, per-access ledger events. Production still needs a real second-factor verifier (TOTP/WebAuthn/IdP) and the §18 second-person rule decision.)*
+9. Add break-glass workflow with step-up auth. *(Demo-scale slice landed in M1.6 — `POST /api/auth/step-up`, `POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`, per-access ledger events. M1.7 added the §18 two-person rule on critical grants: `POST /api/admin/break-glass/grants/:id/approve` requires a different user with fresh step-up; self-approval is refused and ledgered. Production still needs a real second-factor verifier (TOTP/WebAuthn/IdP).)*
 10. Harden: bulkheads, DLQs, circuit breakers, cost circuit breakers, policy guardrails.
 
 ---
@@ -420,7 +420,7 @@ Each is a Temporal workflow with explicit compensations (e.g., reversing tokeniz
 - Which workflow engine if Temporal cannot be adopted? (Conductor, Cadence, or custom on Postgres.)
 - Multi-tenant or single-tenant initial scope?
 - Which OIDC IdP for step-up auth?
-- **Break-glass second-person rule.** Should a raw-PHI break-glass grant require a second approver (compliance officer / security on-call), or is single-analyst self-grant with mandatory justification + ledgered per-access + weekly review sufficient? Must be decided **before M5** (when raw-PHI view ships). Default proposal: single-analyst for severity ≤ high; two-person for critical and for grants covering > 1 finding.
+- ~~**Break-glass second-person rule.**~~ **Resolved in M1.7.** Single-analyst for severity ≤ high; two-person for critical. Implemented as a pending-grant state — critical grants are created with `requires_second_approval=true` and are inactive until a *different* user in the same tenant completes step-up and calls `POST /api/admin/break-glass/grants/:id/approve` with an approval note. Self-approval is refused with HTTP 403 and ledgered `break_glass.approval_denied_self_approval`; approval ledgered `break_glass.approved` with both requester+approver ids; double-approval guarded by a CAS on `approver_user_id IS NULL`. `requires_second_approval` is captured at grant-creation time from the finding's then-current severity, so a later downgrade cannot bypass the rule retroactively. Multi-finding grants are still out of scope — every grant is per-finding.
 
 ---
 

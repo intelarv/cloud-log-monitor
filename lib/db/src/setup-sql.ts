@@ -84,6 +84,34 @@ CREATE TABLE IF NOT EXISTS break_glass_grants (
   expires_at timestamptz NOT NULL,
   revoked_at timestamptz
 );
+-- M1.7: two-person rule columns. Added idempotently so a DB seeded under
+-- M1.6 upgrades cleanly. Existing rows default to requires_second_approval
+-- = false, which preserves M1.6 single-analyst behavior for any
+-- already-issued non-critical grants.
+ALTER TABLE break_glass_grants
+  ADD COLUMN IF NOT EXISTS requires_second_approval boolean NOT NULL DEFAULT false;
+ALTER TABLE break_glass_grants
+  ADD COLUMN IF NOT EXISTS approver_user_id text;
+ALTER TABLE break_glass_grants
+  ADD COLUMN IF NOT EXISTS approved_at timestamptz;
+ALTER TABLE break_glass_grants
+  ADD COLUMN IF NOT EXISTS approver_step_up_reason text;
+-- M1.7: DB-level defense-in-depth for the two-person rule. Even if the
+-- application layer regresses, the DB refuses to record an approval where
+-- approver_user_id equals the requester's user_id. Added via DO block
+-- because Postgres has no IF NOT EXISTS for table CHECK constraints.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'bg_no_self_approval'
+      AND conrelid = 'break_glass_grants'::regclass
+  ) THEN
+    ALTER TABLE break_glass_grants
+      ADD CONSTRAINT bg_no_self_approval
+      CHECK (approver_user_id IS NULL OR approver_user_id <> user_id);
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS bg_grants_tenant_user_idx
   ON break_glass_grants (tenant_id, user_id);
 CREATE INDEX IF NOT EXISTS bg_grants_lookup_idx

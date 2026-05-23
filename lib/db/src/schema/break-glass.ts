@@ -3,6 +3,7 @@ import {
   text,
   timestamp,
   index,
+  boolean,
 } from "drizzle-orm/pg-core";
 
 // M1.6: break-glass grants for raw-PHI access.
@@ -33,6 +34,17 @@ import {
 //   - No append-only trigger here. Revocation needs UPDATE. The fact that a
 //     grant was issued AT ALL is captured in the ledger, so deletion/UPDATE
 //     of grant rows cannot hide the original grant from auditors.
+// M1.7: two-person rule.
+//
+// Grants on findings whose severity is `critical` require a second analyst to
+// approve before raw access is permitted. The grant row is created in a
+// PENDING state (`approverUserId IS NULL`) by the requester, and the approve
+// endpoint flips `approverUserId` + `approvedAt` only if a *different* user
+// in the same tenant completes step-up and approves.
+//
+// `requiresSecondApproval` is captured at grant-creation time (from the
+// finding's then-current severity) so a later severity change cannot
+// retroactively bypass the rule.
 export const breakGlassGrantsTable = pgTable(
   "break_glass_grants",
   {
@@ -46,6 +58,12 @@ export const breakGlassGrantsTable = pgTable(
       .defaultNow(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    requiresSecondApproval: boolean("requires_second_approval")
+      .notNull()
+      .default(false),
+    approverUserId: text("approver_user_id"),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    approverStepUpReason: text("approver_step_up_reason"),
   },
   (t) => [
     index("bg_grants_tenant_user_idx").on(t.tenantId, t.userId),

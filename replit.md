@@ -5,7 +5,7 @@ Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port comes from workflow env)
-- `pnpm --filter @workspace/api-server run test` — vitest suite (92 tests as of M1.6)
+- `pnpm --filter @workspace/api-server run test` — vitest suite (113 tests as of M1.7.3)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
@@ -114,6 +114,12 @@ Break-glass grants on findings whose severity is `critical` are created PENDING 
   - **Step-up auth + break-glass raw-PHI view**. New `POST /api/auth/step-up` issues a separate 5-min HMAC-signed `phia_stepup` cookie (signature domain-separated from the session cookie via a per-purpose tag, so neither can be replayed as the other). `POST /api/admin/break-glass/grants` (requires session + step-up) issues per-finding time-boxed grants (max 15 min, justification ≥10 chars). `GET /api/admin/findings/:id/raw` requires session only — the grant IS the gate — and ledgers `break_glass.raw_phi_accessed` on EVERY access (not just grant). Threat model §EoP "break-glass scope minimization" + §Repudiation "every break-glass access ledgered" both satisfied.
 - **M1.7** (complete): two-person rule on critical-severity break-glass grants. Pending state, separate approver, self-approval refused + ledgered, CAS-protected approval. See "M1.7 — Two-person rule on critical break-glass" above.
 - **M1.7.1** (complete): boundary scan on analyst free-text (justification, approval_note, step-up reason) keeps PHI/secrets/canary out of immutable ledger payloads; DB CHECK `bg_no_self_approval` enforces the two-person rule below the application layer. See "M1.7.1 — Ledger-payload safety on analyst free-text" above.
+- **M1.7.2** (complete): event-type-driven alerting. New `lib/alerts.ts` + post-commit hook in `appendLedger` emits structured `alert=true` stderr lines for `agent.canary_in_tool_args` (critical), `break_glass.approval_denied_self_approval` (critical), `policy.text_field_rejected` (high), `agent.tool_args_policy_violation` (high), `break_glass.raw_phi_accessed` (warning), `ledger.chain_invalid` (critical), plus a rolling 5-min ≥3 threshold on `auth.step_up_failed`. Spec consolidated in `docs/ARCHITECTURE.md` §25; 5 new vitest cases.
+- **M1.7.3** (complete): closed out architect's M1.7.1 follow-ups.
+  - 11 boundary tests for `validateLedgerSafeText` (SSN/email/AWS key/JWT/MRN/canary/clean/empty/canary-before-PHI/no-substring-leak/deduped detectors).
+  - **§25.4 mechanical guard** (`event-type-coverage.test.ts`): scans all source for `eventType:` literals (handles ternary + multi-line forms) and fails if any ledger event isn't either in `ALERT_RULES` or `NOT_ALERTABLE`. Also flags dead `ALERT_RULES` entries that no code emits. First run caught two real gaps: `chat.input_phi_refused` and `agent.output_phi_detected` had no alert decision; both are now in `ALERT_RULES` (high and critical respectively).
+  - After architect review: added a symmetric dead-entry check for `NOT_ALERTABLE` (surfaced and removed a speculative `auth.login_success` entry with no emitter); broadened the scan to include `lib/db/src/` so `finding.created` and `ledger.genesis` from seed.ts count as live; excluded drizzle schema dirs to avoid `text("event_type")` false positives; documented the scanner's known limitations (single-quote / template-literal / const-ref / field-rename indirection) and the migration path to a ts-morph AST walk.
+  - Test count: 92 (pre-M1.7) → **113** (post-M1.7.3).
 
 ## User preferences
 

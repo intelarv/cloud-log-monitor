@@ -12,3 +12,15 @@ id = "OnJ6QbPUm9ts8fwb8r2li"
 uri = "file://exports/phia-20260522-141740.zip"
 type = "unspecified"
 title = "phia-20260522-141740.zip — full repo (207 tracked files, 336 KB)"
+
+[[outputs]]
+id = "uZDl2Kct9EwcGm-Z0LJc9"
+uri = "file://exports/phia-20260522-220935.zip"
+type = "unspecified"
+title = "PHI/PII Log Audit — M1.7 + M1.7.1 (Two-person rule + ledger-safe free-text)"
+
+[[outputs]]
+id = "P521fNTwCjdCk6EQnJFUY"
+uri = "file://exports/phia-20260522-225515.zip"
+type = "unspecified"
+title = "PHI/PII Log Audit — M1.7.2 (event-type-driven alerting)"

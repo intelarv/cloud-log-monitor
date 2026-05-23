@@ -7,6 +7,7 @@ import {
   type Actor,
   type LedgerEntry,
 } from "@workspace/db";
+import { maybeEmitAlertFromLedger } from "./alerts";
 
 // Single arbitrary 64-bit key for the ledger writer advisory lock. Only one
 // process can hold this lock at a time; serializes all ledger writes across
@@ -66,6 +67,15 @@ export async function appendLedger(
         hash,
       })
       .returning();
+    return row;
+  }).then((row) => {
+    // Post-commit alert hook. Runs OUTSIDE the transaction so a flaky
+    // logger or alert sink can never roll back a ledger write. See §25.
+    try {
+      maybeEmitAlertFromLedger(row);
+    } catch {
+      // Alerting is best-effort; the ledger row is already durable.
+    }
     return row;
   });
 }

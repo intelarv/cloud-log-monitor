@@ -990,7 +990,65 @@ Plus: startup ledger-chain verification passes; per-request token spend logged.
 
 ---
 
-## 25. Related Documents
+## 25. Alerting
+
+The system makes alerting decisions from a single source of truth: the **ledger event type**. Every condition worth paging on already produces a ledger entry (that's what makes it auditable in the first place); the alert layer is a thin post-commit hook that maps `event_type → severity → destination`.
+
+### 25.1 Why event-type-driven
+
+Three properties fall out of binding alerts to ledger events:
+
+1. **No silent alerts.** Anything that pages on-call is also in the chain. An auditor can reconstruct every page from the ledger alone.
+2. **No alert without persistence.** The hook runs *after* the ledger transaction commits, so a flaky alert sink can never roll back a security event.
+3. **One review surface.** Adding a new ledger event type forces a documented decision about whether it alerts — see §25.4 review checklist.
+
+### 25.2 Alertable events
+
+| Event type | Severity | Rationale |
+|---|---|---|
+| `agent.canary_in_tool_args` | critical | Honeypot canary appeared in a tool argument → prompt injection succeeded against an agent. M0 detection, M1.6 enforcement. |
+| `agent.tool_args_policy_violation` | high | Other tool-arg revalidation failure (oversize, PHI-in-args, malformed id). Could be a probe. M1.6. |
+| `break_glass.approval_denied_self_approval` | critical | Insider-threat signal — an analyst tried to approve their own critical-finding grant. Rule blocked the disclosure but the attempt is the alert. M1.7. |
+| `policy.text_field_rejected` | high | Analyst typed PHI/secrets/canary into a justification, approval note, or step-up reason. Carelessness vs hostility is indistinguishable on a single event; pattern detection lives downstream. M1.7.1. |
+| `break_glass.raw_phi_accessed` | warning | Every raw-PHI read. Legitimate by design; warning-level so the alert stream is greppable for "who looked at PHI in the last 24h" without DB access. Anomaly detection (off-hours, new IP, first-time-for-user) is downstream. M1.6. |
+| `ledger.chain_invalid` | critical | Periodic chain-walk verifier found a mismatch. Integrity claim is dead until resolved. §23.2. |
+| `auth.step_up_failed` ≥ 3 / 5 min same actor | high | Single typo is noise; a burst is anti-brute-force. Threshold evaluated in-process for the dev/single-instance deployment; replaced by Redis or a streaming aggregator (Flink / Materialize) in multi-instance prod. |
+| Future: notarization checkpoint missing > 25h | critical | §23.2 + §259. Owned by the notarization job, not the API. Listed here so the alerting surface is single-sourced. |
+| Future: per-tenant LLM cost > daily budget × 0.8 | warning | §23.15. Owned by the cost circuit breaker. |
+| Future: per-tenant LLM cost > daily budget × 1.0 | critical | Hard breach → forced downgrade. §23.15. |
+
+Severities map 1:1 to PagerDuty Events API v2 (`critical` / `error` ≈ "high" / `warning`) so the channel-router rules in §291 apply directly.
+
+### 25.3 Mechanism
+
+- `appendLedger` calls `maybeEmitAlertFromLedger(row)` **after** the transaction commits.
+- The hook writes one structured stderr line via pino with `alert=true`. In dev this is visible in the workflow log; in production a log shipper (Vector / Fluent Bit / OTel) pattern-matches `alert=true`, joins on `event_type`/`severity`, and dispatches to PagerDuty / Slack / Opsgenie per the channel-router rules.
+- The alert payload is intentionally minimal: `{event_type, severity, tenant_id, ledger_seq, ledger_hash, subject_id}`. Sensitive context lives in the ledger row and is referenced by `ledger_seq` — the alert stream itself never carries detector matches, justification text, or raw payloads.
+- Threshold evaluation (today only `auth.step_up_failed`) lives in `lib/alerts.ts` and uses an in-process rolling-window counter. This is correct for the dev/demo deployment; the production deployment replaces it with a Redis-backed counter or a streaming aggregator. The threshold itself is documented per rule in §25.2.
+
+### 25.4 Adding a new ledger event type — review checklist
+
+Any PR that adds a new event type to `appendLedger` MUST do one of:
+
+1. **Add a row to §25.2 + an entry in `ALERT_RULES`** with severity + rationale; OR
+2. **Annotate the call site** with `// not-alertable: <reason>` (e.g. `auth.login_success` — high-volume, no security signal).
+
+Both paths are accepted by code review; what is *not* accepted is a new event type with no documented alerting decision. The review surface is intentionally on event-type creation, not on every endpoint, because most endpoints emit zero or one event type.
+
+### 25.5 Alert fatigue, suppression, and dev guards
+
+- **Dedup.** The log shipper is the only correct dedup site (per-`event_type` + per-`subject_id` window). The app does not dedup — every event must still appear in the ledger; the suppression is at notification time only.
+- **Throttling.** A canary-trip campaign could fire hundreds of `agent.canary_in_tool_args` events in seconds. Throttling rule (downstream): first event pages immediately, subsequent events within 10 min coalesce into a single summary page citing the seq range. The ledger still has every individual entry.
+- **Off-hours weighting.** `break_glass.raw_phi_accessed` outside business hours OR by a user without prior raw-access history is upgraded `warning → high` downstream. Owned by the SIEM/log shipper, not the app.
+- **Dev guard.** Production log shippers MUST filter on `process.env.NODE_ENV === "production"` (or equivalent shipper config) so a misconfigured dev environment can never page on-call. The app emits `alert=true` lines unconditionally — making the filter a shipper responsibility means there is no in-app flag that can be flipped to silence alerts.
+
+### 25.6 Out of scope here
+
+- Runtime error alerting (5xx rates, DB connection storms, pod restarts) is inherited from the platform observability stack (Prometheus + Alertmanager / Datadog / Cloud Monitoring). This section covers only application-level security/audit alerts where the ledger is the canonical source.
+
+---
+
+## 26. Related Documents
 
 - `DESIGN_OPTION_D.md` — full deep dive on the multi-agent supervisor architecture sized to the source-environment metrics, with the Bedrock AgentCore / Vertex AI mapping, build sequencing, and open questions.
 - `../threat_model.md` — STRIDE threat model per §23.4.

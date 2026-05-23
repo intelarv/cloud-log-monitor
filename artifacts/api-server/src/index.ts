@@ -5,6 +5,9 @@ import { verifyChain } from "./lib/ledger";
 import { startChainVerifier } from "./lib/chain-verifier";
 import { backfillEmbeddings } from "./lib/search";
 import { initEmbedderFromEnv } from "./lib/embedder-config";
+import { hasDedicatedNotarizationSecret } from "./lib/notarization";
+import { startIngestPipeline } from "./lib/ingest";
+import { logBus } from "./lib/log-bus";
 
 const rawPort = process.env["PORT"];
 if (!rawPort) {
@@ -58,7 +61,26 @@ async function main(): Promise<void> {
   // Step 3 (M1.8): start the periodic chain verifier — hourly 24h-window
   // walk + weekly full walk. On mismatch it appends `ledger.chain_invalid`
   // whose post-commit alert hook routes via §25. See ARCHITECTURE.md §23.2.
+  // M2: the same scheduler also drives external notarization checkpoint
+  // creation + verification (5min cadence in dev).
+  if (!hasDedicatedNotarizationSecret()) {
+    logger.warn(
+      "NOTARIZATION_SECRET is not set; falling back to SESSION_SECRET-derived dev key. " +
+        "Production deployments MUST set NOTARIZATION_SECRET to a value held in a SEPARATE trust zone " +
+        "(separate KMS / separate cloud account) per ARCHITECTURE.md §23.2 — co-locating the two " +
+        "secrets defeats the second-half tamper-evidence guarantee.",
+    );
+  }
   startChainVerifier();
+
+  // Step 4 (M3): wire the ingest pipeline to the process-wide log bus.
+  // Source adapters publish `LogRecord`s; the pipeline runs Stage-1
+  // detectors and produces findings + ledger entries. The in-memory bus
+  // is the dev stand-in for Kafka/Redpanda/NATS per ARCHITECTURE.md §3 —
+  // production swaps the bus impl without touching the pipeline.
+  // No source is auto-started; POST /api/admin/ingest/replay triggers
+  // the static fixture source on demand.
+  startIngestPipeline(logBus);
 
   app.listen(port, (err) => {
     if (err) {

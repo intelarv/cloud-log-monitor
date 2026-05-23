@@ -6,7 +6,7 @@ import chatRouter from "./chat";
 import ledgerRouter from "./ledger";
 import toolsRouter from "./tools";
 import adminRouter from "./admin";
-import uiRouter from "./ui";
+import ingestRouter from "./ingest";
 
 const router: IRouter = Router();
 
@@ -17,7 +17,6 @@ router.use(chatRouter);
 router.use(ledgerRouter);
 router.use(toolsRouter);
 router.use(adminRouter);
-// UI must be mounted last (root path "/") so it doesn't shadow API routes.
-router.use(uiRouter);
+router.use(ingestRouter);
 
 export default router;

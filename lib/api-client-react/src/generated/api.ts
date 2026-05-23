@@ -22,19 +22,28 @@ import type {
 } from '@tanstack/react-query';
 
 import type {
+  BreakGlassApprovalInput,
+  BreakGlassGrant,
+  BreakGlassGrantInput,
   ChatMessage,
   ChatMessageInput,
   ChatSession,
   ChatSessionInput,
   ErrorResponse,
   Finding,
+  FindingRawEvidence,
   HealthStatus,
+  IngestReplayResult,
+  LedgerCheckpointsPage,
   LedgerPage,
   LedgerVerifyResult,
   ListFindingsParams,
+  ListLedgerCheckpointsParams,
   ListLedgerParams,
   LoginInput,
   Session,
+  StepUpInput,
+  StepUpResult,
   ToolGetFindingInput
 } from './api.schemas';
 
@@ -975,6 +984,639 @@ export function useVerifyLedger<TData = Awaited<ReturnType<typeof verifyLedger>>
 
 
 
+
+export const getListLedgerCheckpointsUrl = (params?: ListLedgerCheckpointsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/api/admin/ledger/checkpoints?${stringifiedParams}` : `/api/admin/ledger/checkpoints`
+}
+
+/**
+ * @summary List external HMAC notarization checkpoints. Pass `verify=1` to also
+run the live cross-check (signature + ledger-hash match) and return
+the verification result.
+
+ */
+export const listLedgerCheckpoints = async (params?: ListLedgerCheckpointsParams, options?: RequestInit): Promise<LedgerCheckpointsPage> => {
+
+  return customFetch<LedgerCheckpointsPage>(getListLedgerCheckpointsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListLedgerCheckpointsQueryKey = (params?: ListLedgerCheckpointsParams,) => {
+    return [
+    `/api/admin/ledger/checkpoints`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListLedgerCheckpointsQueryOptions = <TData = Awaited<ReturnType<typeof listLedgerCheckpoints>>, TError = ErrorType<unknown>>(params?: ListLedgerCheckpointsParams, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listLedgerCheckpoints>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListLedgerCheckpointsQueryKey(params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listLedgerCheckpoints>>> = ({ signal }) => listLedgerCheckpoints(params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listLedgerCheckpoints>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type ListLedgerCheckpointsQueryResult = NonNullable<Awaited<ReturnType<typeof listLedgerCheckpoints>>>
+export type ListLedgerCheckpointsQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary List external HMAC notarization checkpoints. Pass `verify=1` to also
+run the live cross-check (signature + ledger-hash match) and return
+the verification result.
+
+ */
+
+export function useListLedgerCheckpoints<TData = Awaited<ReturnType<typeof listLedgerCheckpoints>>, TError = ErrorType<unknown>>(
+ params?: ListLedgerCheckpointsParams, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listLedgerCheckpoints>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getListLedgerCheckpointsQueryOptions(params,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getStepUpUrl = () => {
+
+
+
+
+  return `/api/auth/step-up`
+}
+
+/**
+ * @summary Elevate the session for break-glass actions (5-min cookie).
+ */
+export const stepUp = async (stepUpInput: StepUpInput, options?: RequestInit): Promise<StepUpResult> => {
+
+  return customFetch<StepUpResult>(getStepUpUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      stepUpInput,)
+  }
+);}
+
+
+
+
+export const getStepUpMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUp>>, TError,{data: BodyType<StepUpInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUp>>, TError,{data: BodyType<StepUpInput>}, TContext> => {
+
+const mutationKey = ['stepUp'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUp>>, {data: BodyType<StepUpInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  stepUp(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpMutationResult = NonNullable<Awaited<ReturnType<typeof stepUp>>>
+    export type StepUpMutationBody = BodyType<StepUpInput>
+    export type StepUpMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Elevate the session for break-glass actions (5-min cookie).
+ */
+export const useStepUp = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUp>>, TError,{data: BodyType<StepUpInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUp>>,
+        TError,
+        {data: BodyType<StepUpInput>},
+        TContext
+      > => {
+      return useMutation(getStepUpMutationOptions(options));
+    }
+
+export const getListBreakGlassGrantsUrl = () => {
+
+
+
+
+  return `/api/admin/break-glass/grants`
+}
+
+/**
+ * @summary List the caller's break-glass grants (most recent first).
+ */
+export const listBreakGlassGrants = async ( options?: RequestInit): Promise<BreakGlassGrant[]> => {
+
+  return customFetch<BreakGlassGrant[]>(getListBreakGlassGrantsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListBreakGlassGrantsQueryKey = () => {
+    return [
+    `/api/admin/break-glass/grants`
+    ] as const;
+    }
+
+
+export const getListBreakGlassGrantsQueryOptions = <TData = Awaited<ReturnType<typeof listBreakGlassGrants>>, TError = ErrorType<unknown>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listBreakGlassGrants>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListBreakGlassGrantsQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listBreakGlassGrants>>> = ({ signal }) => listBreakGlassGrants({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listBreakGlassGrants>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type ListBreakGlassGrantsQueryResult = NonNullable<Awaited<ReturnType<typeof listBreakGlassGrants>>>
+export type ListBreakGlassGrantsQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary List the caller's break-glass grants (most recent first).
+ */
+
+export function useListBreakGlassGrants<TData = Awaited<ReturnType<typeof listBreakGlassGrants>>, TError = ErrorType<unknown>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listBreakGlassGrants>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getListBreakGlassGrantsQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getCreateBreakGlassGrantUrl = () => {
+
+
+
+
+  return `/api/admin/break-glass/grants`
+}
+
+/**
+ * @summary Issue a break-glass grant for raw-PHI access on a single finding.
+Requires a valid step-up cookie. Critical-severity findings are
+created PENDING and require a second-person approval.
+
+ */
+export const createBreakGlassGrant = async (breakGlassGrantInput: BreakGlassGrantInput, options?: RequestInit): Promise<BreakGlassGrant> => {
+
+  return customFetch<BreakGlassGrant>(getCreateBreakGlassGrantUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      breakGlassGrantInput,)
+  }
+);}
+
+
+
+
+export const getCreateBreakGlassGrantMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createBreakGlassGrant>>, TError,{data: BodyType<BreakGlassGrantInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createBreakGlassGrant>>, TError,{data: BodyType<BreakGlassGrantInput>}, TContext> => {
+
+const mutationKey = ['createBreakGlassGrant'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createBreakGlassGrant>>, {data: BodyType<BreakGlassGrantInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  createBreakGlassGrant(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateBreakGlassGrantMutationResult = NonNullable<Awaited<ReturnType<typeof createBreakGlassGrant>>>
+    export type CreateBreakGlassGrantMutationBody = BodyType<BreakGlassGrantInput>
+    export type CreateBreakGlassGrantMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Issue a break-glass grant for raw-PHI access on a single finding.
+Requires a valid step-up cookie. Critical-severity findings are
+created PENDING and require a second-person approval.
+
+ */
+export const useCreateBreakGlassGrant = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createBreakGlassGrant>>, TError,{data: BodyType<BreakGlassGrantInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof createBreakGlassGrant>>,
+        TError,
+        {data: BodyType<BreakGlassGrantInput>},
+        TContext
+      > => {
+      return useMutation(getCreateBreakGlassGrantMutationOptions(options));
+    }
+
+export const getApproveBreakGlassGrantUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/break-glass/grants/${id}/approve`
+}
+
+/**
+ * @summary Second-person approval of a pending critical-severity grant. Approver
+must hold a fresh step-up cookie and be a different user than the
+requester. Self-approval is refused (HTTP 403) and ledgered.
+
+ */
+export const approveBreakGlassGrant = async (id: string,
+    breakGlassApprovalInput: BreakGlassApprovalInput, options?: RequestInit): Promise<BreakGlassGrant> => {
+
+  return customFetch<BreakGlassGrant>(getApproveBreakGlassGrantUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      breakGlassApprovalInput,)
+  }
+);}
+
+
+
+
+export const getApproveBreakGlassGrantMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof approveBreakGlassGrant>>, TError,{id: string;data: BodyType<BreakGlassApprovalInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof approveBreakGlassGrant>>, TError,{id: string;data: BodyType<BreakGlassApprovalInput>}, TContext> => {
+
+const mutationKey = ['approveBreakGlassGrant'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof approveBreakGlassGrant>>, {id: string;data: BodyType<BreakGlassApprovalInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  approveBreakGlassGrant(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ApproveBreakGlassGrantMutationResult = NonNullable<Awaited<ReturnType<typeof approveBreakGlassGrant>>>
+    export type ApproveBreakGlassGrantMutationBody = BodyType<BreakGlassApprovalInput>
+    export type ApproveBreakGlassGrantMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Second-person approval of a pending critical-severity grant. Approver
+must hold a fresh step-up cookie and be a different user than the
+requester. Self-approval is refused (HTTP 403) and ledgered.
+
+ */
+export const useApproveBreakGlassGrant = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof approveBreakGlassGrant>>, TError,{id: string;data: BodyType<BreakGlassApprovalInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof approveBreakGlassGrant>>,
+        TError,
+        {id: string;data: BodyType<BreakGlassApprovalInput>},
+        TContext
+      > => {
+      return useMutation(getApproveBreakGlassGrantMutationOptions(options));
+    }
+
+export const getListPendingBreakGlassApprovalsUrl = () => {
+
+
+
+
+  return `/api/admin/break-glass/pending-approvals`
+}
+
+/**
+ * @summary List grants pending second-person approval that the caller is
+eligible to approve (excludes grants the caller requested).
+
+ */
+export const listPendingBreakGlassApprovals = async ( options?: RequestInit): Promise<BreakGlassGrant[]> => {
+
+  return customFetch<BreakGlassGrant[]>(getListPendingBreakGlassApprovalsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListPendingBreakGlassApprovalsQueryKey = () => {
+    return [
+    `/api/admin/break-glass/pending-approvals`
+    ] as const;
+    }
+
+
+export const getListPendingBreakGlassApprovalsQueryOptions = <TData = Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>, TError = ErrorType<unknown>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListPendingBreakGlassApprovalsQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>> = ({ signal }) => listPendingBreakGlassApprovals({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type ListPendingBreakGlassApprovalsQueryResult = NonNullable<Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>>
+export type ListPendingBreakGlassApprovalsQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary List grants pending second-person approval that the caller is
+eligible to approve (excludes grants the caller requested).
+
+ */
+
+export function useListPendingBreakGlassApprovals<TData = Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>, TError = ErrorType<unknown>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listPendingBreakGlassApprovals>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getListPendingBreakGlassApprovalsQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getGetFindingRawUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/findings/${id}/raw`
+}
+
+/**
+ * @summary Read raw evidence for a finding under an active break-glass grant.
+Every access is ledgered. Critical-severity findings require a
+two-person-approved grant.
+
+ */
+export const getFindingRaw = async (id: string, options?: RequestInit): Promise<FindingRawEvidence> => {
+
+  return customFetch<FindingRawEvidence>(getGetFindingRawUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetFindingRawQueryKey = (id: string,) => {
+    return [
+    `/api/admin/findings/${id}/raw`
+    ] as const;
+    }
+
+
+export const getGetFindingRawQueryOptions = <TData = Awaited<ReturnType<typeof getFindingRaw>>, TError = ErrorType<ErrorResponse>>(id: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getFindingRaw>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetFindingRawQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getFindingRaw>>> = ({ signal }) => getFindingRaw(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: !!(id), ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getFindingRaw>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetFindingRawQueryResult = NonNullable<Awaited<ReturnType<typeof getFindingRaw>>>
+export type GetFindingRawQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Read raw evidence for a finding under an active break-glass grant.
+Every access is ledgered. Critical-severity findings require a
+two-person-approved grant.
+
+ */
+
+export function useGetFindingRaw<TData = Awaited<ReturnType<typeof getFindingRaw>>, TError = ErrorType<ErrorResponse>>(
+ id: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getFindingRaw>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetFindingRawQueryOptions(id,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getReplayIngestFixtureUrl = () => {
+
+
+
+
+  return `/api/admin/ingest/replay`
+}
+
+/**
+ * @summary Replay the static fixture log source through the in-memory bus and
+ingest pipeline. Dev/demo trigger; produces findings + ledger entries
+through the normal path. Rate-limited (5/min).
+
+ */
+export const replayIngestFixture = async ( options?: RequestInit): Promise<IngestReplayResult> => {
+
+  return customFetch<IngestReplayResult>(getReplayIngestFixtureUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getReplayIngestFixtureMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof replayIngestFixture>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof replayIngestFixture>>, TError,void, TContext> => {
+
+const mutationKey = ['replayIngestFixture'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof replayIngestFixture>>, void> = () => {
+
+
+          return  replayIngestFixture(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ReplayIngestFixtureMutationResult = NonNullable<Awaited<ReturnType<typeof replayIngestFixture>>>
+
+    export type ReplayIngestFixtureMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Replay the static fixture log source through the in-memory bus and
+ingest pipeline. Dev/demo trigger; produces findings + ledger entries
+through the normal path. Rate-limited (5/min).
+
+ */
+export const useReplayIngestFixture = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof replayIngestFixture>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof replayIngestFixture>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getReplayIngestFixtureMutationOptions(options));
+    }
 
 export const getInvokeGetFindingToolUrl = () => {
 

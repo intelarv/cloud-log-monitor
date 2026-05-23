@@ -182,6 +182,110 @@ export interface LedgerVerifyResult {
   errors: string[];
 }
 
+export interface LedgerCheckpoint {
+  id: number;
+  seq: number;
+  head_hash: string;
+  notarized_at: string;
+  signature: string;
+  signing_key_id: string;
+}
+
+export interface LedgerCheckpointsVerifyResult {
+  ok: boolean;
+  checked: number;
+  errors: string[];
+}
+
+export interface LedgerCheckpointsPage {
+  checkpoints: LedgerCheckpoint[];
+  verify?: LedgerCheckpointsVerifyResult | null;
+}
+
+export interface StepUpInput {
+  /**
+     * @minLength 1
+     * @maxLength 256
+     */
+  token: string;
+  /**
+     * @minLength 3
+     * @maxLength 200
+     */
+  reason: string;
+}
+
+export interface StepUpResult {
+  ok: boolean;
+  expires_at: string;
+  ttl_seconds: number;
+}
+
+export interface BreakGlassGrantInput {
+  /**
+     * @minLength 1
+     * @maxLength 64
+     */
+  finding_id: string;
+  /**
+     * @minLength 10
+     * @maxLength 2000
+     */
+  justification: string;
+  /**
+     * @minimum 60
+     * @maximum 900
+     */
+  ttl_seconds?: number;
+}
+
+export interface BreakGlassApprovalInput {
+  /**
+     * @minLength 10
+     * @maxLength 2000
+     */
+  approval_note: string;
+}
+
+export interface BreakGlassGrant {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  finding_id: string;
+  justification: string;
+  granted_at: string;
+  expires_at: string;
+  /** @nullable */
+  revoked_at: string | null;
+  requires_second_approval: boolean;
+  /** @nullable */
+  approver_user_id: string | null;
+  /** @nullable */
+  approved_at: string | null;
+  pending_approval: boolean;
+  active: boolean;
+}
+
+export type FindingRawEvidenceRawEvidence = { [key: string]: unknown } | null;
+
+export interface FindingRawEvidence {
+  finding_id: string;
+  grant_id: string;
+  grant_expires_at: string;
+  classification: string;
+  severity: string;
+  raw_evidence: FindingRawEvidenceRawEvidence;
+  two_person_approved: boolean;
+  /** @nullable */
+  approver_user_id: string | null;
+}
+
+export interface IngestReplayResult {
+  replayed: number;
+  delivered: number;
+  errors: number;
+}
+
 export interface ToolGetFindingInput {
   /**
      * @minLength 1
@@ -225,4 +329,21 @@ after_seq?: number;
  */
 limit?: number;
 };
+
+export type ListLedgerCheckpointsParams = {
+/**
+ * @minimum 1
+ * @maximum 500
+ */
+limit?: number;
+verify?: ListLedgerCheckpointsVerify;
+};
+
+export type ListLedgerCheckpointsVerify = typeof ListLedgerCheckpointsVerify[keyof typeof ListLedgerCheckpointsVerify];
+
+
+export const ListLedgerCheckpointsVerify = {
+  NUMBER_0: '0',
+  NUMBER_1: '1',
+} as const;
 

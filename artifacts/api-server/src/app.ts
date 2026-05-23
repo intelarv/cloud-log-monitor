@@ -92,11 +92,22 @@ const breakGlassLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: userOrIpKey,
 });
+// M3: replay is a dev/demo affordance that mints findings + ledger entries.
+// A scripted loop would balloon both. 5/min is enough for analyst-driven
+// "show me this works" clicks but kills runaway automation.
+const ingestReplayLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 5,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+});
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/auth/step-up", stepUpLimiter);
 app.use("/api/chat", chatLimiter);
 app.use("/api/tools", toolLimiter);
 app.use("/api/admin/break-glass/grants", breakGlassLimiter);
+app.use("/api/admin/ingest/replay", ingestReplayLimiter);
 
 app.use("/api", router);
 

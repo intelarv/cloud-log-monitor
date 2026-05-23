@@ -237,6 +237,199 @@ export const VerifyLedgerResponse = zod.object({
 
 
 /**
+ * @summary List external HMAC notarization checkpoints. Pass `verify=1` to also
+run the live cross-check (signature + ledger-hash match) and return
+the verification result.
+
+ */
+export const listLedgerCheckpointsQueryLimitDefault = 100;
+export const listLedgerCheckpointsQueryLimitMax = 500;
+
+
+
+export const ListLedgerCheckpointsQueryParams = zod.object({
+  "limit": zod.coerce.number().min(1).max(listLedgerCheckpointsQueryLimitMax).default(listLedgerCheckpointsQueryLimitDefault),
+  "verify": zod.enum(['0', '1']).optional()
+})
+
+export const ListLedgerCheckpointsResponse = zod.object({
+  "checkpoints": zod.array(zod.object({
+  "id": zod.number(),
+  "seq": zod.number(),
+  "head_hash": zod.string(),
+  "notarized_at": zod.coerce.date(),
+  "signature": zod.string(),
+  "signing_key_id": zod.string()
+})),
+  "verify": zod.union([zod.object({
+  "ok": zod.boolean(),
+  "checked": zod.number(),
+  "errors": zod.array(zod.string())
+}),zod.null()]).optional()
+})
+
+
+/**
+ * @summary Elevate the session for break-glass actions (5-min cookie).
+ */
+export const stepUpBodyTokenMax = 256;
+
+export const stepUpBodyReasonMin = 3;
+export const stepUpBodyReasonMax = 200;
+
+
+
+export const StepUpBody = zod.object({
+  "token": zod.string().min(1).max(stepUpBodyTokenMax),
+  "reason": zod.string().min(stepUpBodyReasonMin).max(stepUpBodyReasonMax)
+})
+
+export const StepUpResponse = zod.object({
+  "ok": zod.boolean(),
+  "expires_at": zod.coerce.date(),
+  "ttl_seconds": zod.number()
+})
+
+
+/**
+ * @summary List the caller's break-glass grants (most recent first).
+ */
+export const ListBreakGlassGrantsResponseItem = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "user_id": zod.string(),
+  "finding_id": zod.string(),
+  "justification": zod.string(),
+  "granted_at": zod.coerce.date(),
+  "expires_at": zod.coerce.date(),
+  "revoked_at": zod.coerce.date().nullable(),
+  "requires_second_approval": zod.boolean(),
+  "approver_user_id": zod.string().nullable(),
+  "approved_at": zod.coerce.date().nullable(),
+  "pending_approval": zod.boolean(),
+  "active": zod.boolean()
+})
+export const ListBreakGlassGrantsResponse = zod.array(ListBreakGlassGrantsResponseItem)
+
+
+/**
+ * @summary Issue a break-glass grant for raw-PHI access on a single finding.
+Requires a valid step-up cookie. Critical-severity findings are
+created PENDING and require a second-person approval.
+
+ */
+export const createBreakGlassGrantBodyFindingIdMax = 64;
+
+export const createBreakGlassGrantBodyJustificationMin = 10;
+export const createBreakGlassGrantBodyJustificationMax = 2000;
+
+export const createBreakGlassGrantBodyTtlSecondsMin = 60;
+export const createBreakGlassGrantBodyTtlSecondsMax = 900;
+
+
+
+export const CreateBreakGlassGrantBody = zod.object({
+  "finding_id": zod.string().min(1).max(createBreakGlassGrantBodyFindingIdMax),
+  "justification": zod.string().min(createBreakGlassGrantBodyJustificationMin).max(createBreakGlassGrantBodyJustificationMax),
+  "ttl_seconds": zod.number().min(createBreakGlassGrantBodyTtlSecondsMin).max(createBreakGlassGrantBodyTtlSecondsMax).optional()
+})
+
+
+/**
+ * @summary Second-person approval of a pending critical-severity grant. Approver
+must hold a fresh step-up cookie and be a different user than the
+requester. Self-approval is refused (HTTP 403) and ledgered.
+
+ */
+export const ApproveBreakGlassGrantParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const approveBreakGlassGrantBodyApprovalNoteMin = 10;
+export const approveBreakGlassGrantBodyApprovalNoteMax = 2000;
+
+
+
+export const ApproveBreakGlassGrantBody = zod.object({
+  "approval_note": zod.string().min(approveBreakGlassGrantBodyApprovalNoteMin).max(approveBreakGlassGrantBodyApprovalNoteMax)
+})
+
+export const ApproveBreakGlassGrantResponse = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "user_id": zod.string(),
+  "finding_id": zod.string(),
+  "justification": zod.string(),
+  "granted_at": zod.coerce.date(),
+  "expires_at": zod.coerce.date(),
+  "revoked_at": zod.coerce.date().nullable(),
+  "requires_second_approval": zod.boolean(),
+  "approver_user_id": zod.string().nullable(),
+  "approved_at": zod.coerce.date().nullable(),
+  "pending_approval": zod.boolean(),
+  "active": zod.boolean()
+})
+
+
+/**
+ * @summary List grants pending second-person approval that the caller is
+eligible to approve (excludes grants the caller requested).
+
+ */
+export const ListPendingBreakGlassApprovalsResponseItem = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "user_id": zod.string(),
+  "finding_id": zod.string(),
+  "justification": zod.string(),
+  "granted_at": zod.coerce.date(),
+  "expires_at": zod.coerce.date(),
+  "revoked_at": zod.coerce.date().nullable(),
+  "requires_second_approval": zod.boolean(),
+  "approver_user_id": zod.string().nullable(),
+  "approved_at": zod.coerce.date().nullable(),
+  "pending_approval": zod.boolean(),
+  "active": zod.boolean()
+})
+export const ListPendingBreakGlassApprovalsResponse = zod.array(ListPendingBreakGlassApprovalsResponseItem)
+
+
+/**
+ * @summary Read raw evidence for a finding under an active break-glass grant.
+Every access is ledgered. Critical-severity findings require a
+two-person-approved grant.
+
+ */
+export const GetFindingRawParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const GetFindingRawResponse = zod.object({
+  "finding_id": zod.string(),
+  "grant_id": zod.string(),
+  "grant_expires_at": zod.coerce.date(),
+  "classification": zod.string(),
+  "severity": zod.string(),
+  "raw_evidence": zod.union([zod.record(zod.string(), zod.unknown()),zod.null()]),
+  "two_person_approved": zod.boolean(),
+  "approver_user_id": zod.string().nullable()
+})
+
+
+/**
+ * @summary Replay the static fixture log source through the in-memory bus and
+ingest pipeline. Dev/demo trigger; produces findings + ledger entries
+through the normal path. Rate-limited (5/min).
+
+ */
+export const ReplayIngestFixtureResponse = zod.object({
+  "replayed": zod.number(),
+  "delivered": zod.number(),
+  "errors": zod.number()
+})
+
+
+/**
  * @summary MCP-shaped tool invocation surface for `get_finding`. Mirrors what the
 agent calls internally; useful for dashboard re-validation of
 citations and for manual exercises.

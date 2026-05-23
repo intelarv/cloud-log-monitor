@@ -42,3 +42,9 @@ id = "dYkyKnCrXFPpAgQ652ajt"
 uri = "file://exports/phia-20260523-194943.zip"
 type = "unspecified"
 title = "phia (M1.8 — periodic chain verifier, 117 tests)"
+
+[[outputs]]
+id = "4fy2kLhoaCUYAI6ObBF3Y"
+uri = "file://exports/phia-20260523-202057.zip"
+type = "unspecified"
+title = "phia (M1.9 — verifier leader-lock + dedupe + integration tests, 122 tests)"

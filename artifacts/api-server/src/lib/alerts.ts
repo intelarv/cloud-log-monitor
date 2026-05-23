@@ -70,6 +70,28 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // model that produces PHI is a model that has either been prompt-injected
   // or has training-data contamination. Either way, critical.
   "agent.output_phi_detected": "critical",
+  // M2: an external notarization checkpoint disagreed with the live ledger.
+  // Critical — either someone with writer access has rewritten a ledger
+  // row a checkpoint pinned (exactly the threat §23.2 second-half exists
+  // to detect) OR a checkpoint signature itself was forged. Either is a
+  // top-of-page incident.
+  "ledger.checkpoint_mismatch": "critical",
+  // M3: the ingest pipeline's defense-in-depth rescan found PHI/secrets
+  // surviving in a redacted snippet that was about to land in the
+  // searchable hot tier. The pipeline falls back to a fully-opaque
+  // placeholder before insert so nothing actually leaks, but this means
+  // either a detector regex regressed or the redactor walk has a bug —
+  // either is a top-of-page incident because subsequent records would
+  // leak silently if the fallback weren't there.
+  "ingest.redaction_regression": "critical",
+  // M3: a log source delivered a record that failed trust-boundary
+  // validation (oversized provenance fields, disallowed charset, oversized
+  // payload). The record is dropped before processing, but the drop itself
+  // is auditable — a misbehaving or compromised log shipper is operationally
+  // interesting. Warning, not critical: most occurrences are
+  // misconfiguration, not attack; threshold/aggregation lives downstream
+  // in the log shipper per §25.
+  "ingest.malformed_record": "warning",
 } as const;
 
 /** Event types that are legitimately emitted at high volume or as part of a
@@ -100,6 +122,11 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   "finding.created",
   // Ledger bootstrap. Fires once.
   "ledger.genesis",
+  // M2: each successful notarization checkpoint creation. Routine signal
+  // (one row per cadence tick when the ledger changes); auditable via the
+  // ledger and `GET /api/admin/ledger/checkpoints`. Mismatch is the event
+  // worth paging on, not creation.
+  "ledger.checkpoint_created",
 ]);
 
 /** In-memory rolling counters for threshold-based alerts.

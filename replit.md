@@ -2,10 +2,12 @@
 
 Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/secrets, maintains a tamper-evident audit ledger, and exposes a chat-over-audit dashboard for healthcare compliance analysts. See `docs/ARCHITECTURE.md`.
 
+Current milestone: **M4 complete** (analyst dashboard UI: findings list/detail w/ break-glass + two-person approval, AG-UI SSE chat, ledger viewer w/ chain + checkpoint verify, ingest replay, light/dark/system theme toggle). Test suite: **150 tests** passing (backend unchanged). Per-milestone history is in the appendix at the bottom of this file.
+
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port comes from workflow env)
-- `pnpm --filter @workspace/api-server run test` — vitest suite (122 tests as of M1.9)
+- `pnpm --filter @workspace/api-server run test` — vitest suite
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
@@ -13,6 +15,7 @@ Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/
 - Required env: `DATABASE_URL`, `SESSION_SECRET`
 - Optional embedder config (see "Embedder selection" below): `EMBEDDING_PROVIDER`, `DEPLOYMENT_TARGET`, `EMBEDDING_MODEL`, `EMBEDDING_DIM` plus provider-specific creds.
 - Optional step-up auth (dev): `STEP_UP_DEV_TOKEN` (default `dev-stepup`, ≥8 chars). Replace with a TOTP/WebAuthn verifier in production.
+- Optional notarization: `NOTARIZATION_SECRET` (≥16 chars, held in a *separate* trust zone from `SESSION_SECRET` — KMS in a separate cloud account per §23.2). Unset → SESSION_SECRET-derived dev fallback + boot WARN. Rotation: set `NOTARIZATION_RETIRED_KEYS={"<old_key_id>":"<old_secret>"}` so existing checkpoints keep verifying after `ACTIVE_KEY_ID` is bumped.
 
 ## Embedder selection (cloud-aware)
 
@@ -35,28 +38,36 @@ The embedder used for hybrid retrieval is selected at boot via env. Precedence:
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5, AG-UI SSE
-- DB: PostgreSQL + Drizzle ORM, pgvector 0.8 (M1)
+- DB: PostgreSQL + Drizzle ORM, pgvector 0.8
 - Validation: Zod v4, `drizzle-zod`
 - API codegen: Orval (from OpenAPI spec)
 - LLM: Gemini 2.5 Flash via Replit AI Integrations (no user key required)
 
 ## Where things live
 
-- API entry: `artifacts/api-server/src/index.ts` (bootstrap → embedding backfill → chain verify → listen)
+- API entry: `artifacts/api-server/src/index.ts` (bootstrap → embedding backfill → chain verify → start chain verifier + notarizer → wire ingest pipeline → listen)
 - Chat agent loop: `artifacts/api-server/src/lib/chat-agent.ts`
 - Tool registry (MCP-shaped): `artifacts/api-server/src/lib/tools.ts`
 - Hybrid retrieval (BM25 + vector + RRF): `artifacts/api-server/src/lib/search.ts`
 - Embedder interface + dev embedder: `artifacts/api-server/src/lib/embeddings.ts`
 - Cloud embedders (Bedrock/Vertex/Azure/TEI, lazy-loaded): `artifacts/api-server/src/lib/cloud-embedders.ts`
+- Log ingestion (M3): `lib/log-source.ts` (LogRecord + LogSource interface + StaticFixtureLogSource + CloudwatchLogSourceStub), `lib/log-bus.ts` (LogBus interface + InMemoryLogBus stub for Kafka/NATS), `lib/ingest.ts` (detector → redact → fingerprint upsert → ledger), `routes/ingest.ts` (`POST /api/admin/ingest/replay` dev/demo trigger)
+- Inline redaction helper (`redactInline`): `artifacts/api-server/src/lib/redact.ts`
 - Embedder factory + env config + registry: `artifacts/api-server/src/lib/embedder-config.ts`
-- Per-agent tool allow-list **+ tool-arg revalidation (M1.6)**: `artifacts/api-server/src/lib/policy.ts`
+- Per-agent tool allow-list + tool-arg revalidation: `artifacts/api-server/src/lib/policy.ts`
+- Free-text ledger-payload guard (justification/approval_note/step-up reason): `artifacts/api-server/src/lib/text-policy.ts`
 - Agent prompts (version-pinned): `artifacts/api-server/src/lib/prompts.ts`
 - Ledger writer + chain walk: `artifacts/api-server/src/lib/ledger.ts`
+- Periodic chain verifier + notarization scheduler (per-scope advisory leader lock): `artifacts/api-server/src/lib/chain-verifier.ts`
+- HMAC notarization (canonical-JSON signing, retired-key registry): `artifacts/api-server/src/lib/notarization.ts`
+- Event-type alert routing + post-commit hook: `artifacts/api-server/src/lib/alerts.ts`
+- Mechanical event-type coverage scan: `artifacts/api-server/src/lib/event-type-coverage.test.ts`
 - Session + step-up cookies (HMAC, domain-separated): `artifacts/api-server/src/lib/auth.ts`
 - Step-up + break-glass admin routes: `artifacts/api-server/src/routes/admin.ts`, `artifacts/api-server/src/routes/auth.ts`
+- Ledger admin route (incl. `GET /api/admin/ledger/checkpoints?verify=1`): `artifacts/api-server/src/routes/ledger.ts`
 - Per-user rate limiters (chat, tools, break-glass, step-up): `artifacts/api-server/src/app.ts`
 - DB schema (source of truth): `lib/db/src/schema/*.ts` — `findingSafeColumns` / `FindingSafe` in `findings.ts` is the compile-time gate that keeps `raw_evidence` out of non-break-glass reads.
-- DB setup SQL (RLS, pgvector, FTS, triggers, break-glass grants table, F-CANARY raw backfill): `lib/db/src/setup-sql.ts`
+- DB setup SQL (RLS, pgvector, FTS, triggers, break-glass grants table, `ledger_checkpoints` + ENABLE ALWAYS triggers, F-CANARY raw backfill): `lib/db/src/setup-sql.ts`
 - Seed (10 findings + canary w/ raw payload + genesis): `lib/db/src/seed.ts`
 - Threat model: `threat_model.md`
 
@@ -65,81 +76,29 @@ The embedder used for hybrid retrieval is selected at boot via env. Precedence:
 - **Embedder is pluggable and cloud-aware; dev ships a deterministic feature-hash embedder.** Neither Replit's Gemini nor OpenAI AI Integration exposes embeddings. Rather than require a third-party key for a demo, dev uses a 256-dim SHA-256 feature-hashing embedder (tagged `featurehash-v1@dev:256`) behind an `Embedder` interface. Production picks per cloud via `EMBEDDING_PROVIDER` (or `DEPLOYMENT_TARGET` shortcut): Bedrock Titan v2 on AWS, Vertex `text-embedding-005` on GCP, Azure OpenAI `text-embedding-3-small` on Azure, or self-hosted TEI for cloud-agnostic. All defaults support Matryoshka truncation to 256 so the schema is portable. Cloud SDKs are lazy-imported — dev never pays for them. The BM25 half of the hybrid is real lexical retrieval and carries most of the dev-mode signal; the vector half becomes semantically meaningful as soon as a real embedder is configured.
 - **PHI guard wraps every embedder, not just the dev one.** `PhiGuardEmbedder` runs `scanForPhi` on every input before it's embedded — for cloud providers this also means no PHI ever leaves the cluster boundary to a third-party model endpoint. Defense-in-depth on top of the redaction pipeline.
 - **Hybrid retrieval = BM25 ∪ vector, fused with RRF (k=60).** Postgres `tsvector` (generated column over redacted snippet + classification + subclass + severity + source, with weights A/B/C) gives lexical matches; pgvector cosine (`ivfflat`, lists=10) gives sub-word/semantic matches. RRF avoids needing score normalization and is the standard fusion choice.
-- **Defense-in-depth on embedder input.** `PhiGuardEmbedder` refuses any text that trips `scanForPhi`. Pipeline only ever feeds redacted text, but the guard turns any regression into an immediate failure instead of silently storing PHI-derived vectors.
 - **Agent context = hybrid top-K ∪ severity floor.** The chat agent sees (a) the top-10 RRF-fused candidates seeded with the user question and (b) the 8 most recent critical/high open findings. This guarantees questions like "list the critical findings" still surface the right rows even when their tokens don't overlap the query. The full preloaded id list is recorded in the `chat.agent_turn` ledger entry for audit.
 - **Tool calls are bounded.** `MAX_TOOL_CALLS=2` per turn (typical chain: `search_findings` → `get_finding`). Per-agent tool allow-list in `policy.ts` is the single source of truth for "which agent can call what".
-- **Ledger writes are append-only via a single advisory-locked writer.** `ENABLE ALWAYS` triggers in setup SQL refuse UPDATE/DELETE on the ledger table even from the owner role — belt-and-suspenders for the tamper-evidence claim. SSE envelopes are Zod-validated before being sent.
-- **Raw evidence is reachable through exactly one code path.** `findings.raw_evidence` (M1.6, jsonb, nullable) is excluded from `findingSafeColumns`; every read of findings — `get_finding` tool, hybrid-search hydration, chat-agent severity-floor preload, dashboard list + detail — uses `.select(findingSafeColumns)` and is typed `FindingSafe = Omit<Finding,'rawEvidence'>`. The only `.select()` over the full row is `GET /admin/findings/:id/raw`, which requires a session + an active per-finding break-glass grant and ledgers `break_glass.raw_phi_accessed` on every read. Compile-time exclusion + a single audited call site instead of runtime field-stripping.
+- **Ledger writes are append-only via a single advisory-locked writer.** `ENABLE ALWAYS` triggers in setup SQL refuse UPDATE/DELETE on `ledger_entries` AND `ledger_checkpoints` even from the owner role — belt-and-suspenders for the tamper-evidence claim. SSE envelopes are Zod-validated before being sent.
+- **Tamper-evidence is two-layer: internal hash chain + external HMAC checkpoints.** Periodic chain walks (hourly rolling-24h + weekly full) detect chain mismatches; periodic checkpoints (5min) sign the current head with an HMAC keyed in a separate trust zone so an attacker who controls the DB cannot rewrite history without also producing valid signatures under a key they don't hold. Both verification paths emit critical alerts on mismatch with stable-signature dedupe so persistent corruption alerts once, not every tick.
+- **Raw evidence is reachable through exactly one code path.** `findings.raw_evidence` (jsonb, nullable) is excluded from `findingSafeColumns`; every read of findings — `get_finding` tool, hybrid-search hydration, chat-agent severity-floor preload, dashboard list + detail — uses `.select(findingSafeColumns)` and is typed `FindingSafe = Omit<Finding,'rawEvidence'>`. The only `.select()` over the full row is `GET /admin/findings/:id/raw`, which requires a session + an active per-finding break-glass grant and ledgers `break_glass.raw_phi_accessed` on every read. Compile-time exclusion + a single audited call site instead of runtime field-stripping.
 - **Step-up cookie is signed independently from the session cookie.** Both share `SESSION_SECRET`, but each HMAC input is tagged with a per-purpose label (`session` vs `stepup`) so a session cookie cannot be replayed as a step-up cookie or vice versa. Step-up TTL is 5 min; grants are ≤15 min and per-finding.
+- **Two-person rule on critical-severity break-glass.** Critical-severity grants are created PENDING and require a second analyst (different `user_id`, same tenant) to complete fresh step-up and approve before raw PHI is released. `requires_second_approval` is captured at grant-creation time from the finding's then-current severity, so a later severity downgrade cannot retroactively bypass the rule. Self-approval refused + ledgered (`break_glass.approval_denied_self_approval`); double-approval defeated by compare-and-swap on `approver_user_id IS NULL`. DB-level CHECK `bg_no_self_approval` defends the rule below the application layer.
+- **Analyst free-text is scanned before it lands in the immutable ledger.** `validateLedgerSafeText` runs `scanForPhi` + canary-token check on `justification`, `approval_note`, and step-up `reason` at three route boundaries. On hit → HTTP 400 + ledger `policy.text_field_rejected` with detector *names only* (matched substrings never leave the request).
+- **Ingest is interface-first; bus and source adapters are swappable.** `LogBus` is the seam between sources and the detector pipeline — the in-memory dev impl is one of many (Kafka, NATS, Redpanda all satisfy the same shape). `LogSource` is the seam between the cloud and the bus — CloudWatch / Cloud Logging / Azure Monitor / on-prem / fixtures all produce the same `LogRecord`. Cloud SDKs are lazy-imported so a dev install stays small (matches the cloud-embedder pattern). The ingest pipeline never knows who the broker or cloud is.
+- **Ingest does defense-in-depth on redaction.** Every redacted snippet is re-scanned by `scanForPhi` before insert. A regression (detector regex or redactor walk producing leaky output) fires `ingest.redaction_regression` (critical alert) and the snippet falls back to a fully-opaque placeholder — the finding row is still created so the leak is auditable, but no payload-derived text reaches the BM25-indexed `redacted_evidence`. Raw payload lands in `raw_evidence` (jsonb, break-glass-gated via existing `/admin/findings/:id/raw` flow).
+- **Ingest dedupes by fingerprint.** Fingerprint = `<classification>:<detector>:<sourceType>:<sourceName>:v1`. Repeat records from the same source with the same leak class increment `occurrence_count` and bump `last_seen_at` on the existing finding instead of inserting a duplicate row. SELECT-then-upsert inside `withTenant(tx)`; no DB-level UNIQUE on `(tenant_id, fingerprint)` because the existing chat / tool-policy paths intentionally share fingerprints across distinct rows. `finding.created` ledger entry fires on first observation only (the audit anchor); subsequent occurrences advance `last_seen_at` silently.
+- **Event-type-driven alerting with a mechanical coverage guard.** Every `eventType:` literal in source must have a decision in either `ALERT_RULES` (critical/high/warning/threshold) or `NOT_ALERTABLE`; a vitest scan fails CI if any new event type is added without one. Dead entries in either table are also flagged.
 
 ## Product
 
 - Auth (session cookies), per-tenant chat sessions, AG-UI SSE chat over findings.
 - Findings browse + single-finding read, all RLS-scoped, raw evidence excluded by safe projection.
 - Hybrid search exposed to the chat agent as a tool; agents cite findings as `[F:<id>]`.
-- Tool-arg revalidation refuses canary tokens, PHI, oversize payloads, or malformed ids on every agent tool call; refusals materialize as critical/high incident findings (M1.6).
-- Step-up auth (`POST /api/auth/step-up`) + break-glass raw-PHI view (`POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`) with per-access ledger events (M1.6).
-- Per-user rate limits on chat, tools, and break-glass issuance; per-IP on login + step-up (M1.6).
-- Tamper-evident ledger over every chat turn, every input PHI refusal, every agent output PHI detection, every finding create, every step-up grant/denial, every break-glass grant, and every raw-PHI read. `GET /api/admin/ledger/verify` walks the chain.
-- Honeypot canary finding traps prompt-injection attempts; verified working in M1 (canary in chat input) and M1.6 (canary echoed into a tool argument).
-
-## M1.7.1 — Ledger-payload safety on analyst free-text
-
-Code-review on M1.7 surfaced a real pre-existing risk: break-glass `justification`, the M1.7 `approval_note`, and step-up `reason` were all analyst free-text fields that landed unscrubbed in immutable ledger payloads. A careless or hostile analyst could leak PHI/secrets into the chain.
-
-- New `artifacts/api-server/src/lib/text-policy.ts` exports `validateLedgerSafeText`: runs `scanForPhi` (PHI/PII/secrets) + canary-token check against any free-text field about to be persisted.
-- Applied at three boundaries: `POST /admin/break-glass/grants` (`justification`), `POST /admin/break-glass/grants/:id/approve` (`approval_note`), `POST /auth/step-up` (`reason`). On hit → HTTP 400 + ledger `policy.text_field_rejected` with detector *names only* (matched substrings never leave the request).
-- DB-level defense-in-depth for the two-person rule: `CHECK (approver_user_id IS NULL OR approver_user_id <> user_id)` named `bg_no_self_approval`, added idempotently via DO block (verified — a direct INSERT with `approver_user_id = user_id` raises `check constraint violation` at the DB).
-
-## M1.7 — Two-person rule on critical break-glass
-
-Break-glass grants on findings whose severity is `critical` are created PENDING and require a **second analyst** (different `user_id`, same tenant) to complete step-up and approve before raw-PHI access is permitted. Non-critical grants are unchanged.
-
-- New columns on `break_glass_grants`: `requires_second_approval` (captured at grant-creation time from the finding's then-current severity, so a later severity downgrade cannot retroactively bypass the rule), `approver_user_id`, `approved_at`, `approver_step_up_reason`.
-- New endpoints (under existing `/api/admin/break-glass/grants` rate limit prefix):
-  - `POST /api/admin/break-glass/grants/:id/approve` — session + step-up by a *different* user. Self-approval returns 403 and is ledgered `break_glass.approval_denied_self_approval`. Approval is ledgered `break_glass.approved` with both requester and approver ids + the approver's step-up reason. Uses a compare-and-swap on `approver_user_id IS NULL` to defeat double-approve races.
-  - `GET /api/admin/break-glass/pending-approvals` — lists grants the caller is eligible to approve (other users' pending grants in the same tenant).
-- `GET /api/admin/findings/:id/raw` now distinguishes "no grant" (`break_glass_required: true`) from "grant exists but pending approval" (`approval_required: true`).
-- Closes the `docs/ARCHITECTURE.md` §18 open question with the proposed rule: single-analyst for severity ≤ high, two-person for critical.
-- Threat model §EoP "Insider threat (rogue analyst)" satisfied at the moment of access — a rogue analyst cannot unilaterally read raw PHI on a critical finding even with valid session + step-up.
-
-## M1.8 — Periodic chain verifier
-
-Closes the §23.2 promise that tamper-evidence is *actively* checked, not just verifiable on demand.
-
-- New `artifacts/api-server/src/lib/chain-verifier.ts` schedules two cadences:
-  - **Rolling 24h walk** every hour — `verifyChainSince(now - 24h)` (new helper in `ledger.ts`) seeded with the hash of the immediately-preceding *existing* row (`seq < first.seq ORDER BY seq DESC LIMIT 1`, not `seq = first.seq - 1`) so the boundary `prev_hash` linkage is verified without false-positiving on legitimate `bigserial` gaps from rollback / cache loss / crash recovery. Architect-flagged correctness fix before merge.
-  - **Full chain walk** every 7 days — existing `verifyChain()`.
-- On mismatch: `appendLedger({eventType: "ledger.chain_invalid", actor: {kind: "system", id: "chain_verifier"}, payload: {scope, walked, head_seq, head_hash, error_count, first_errors[≤5]}})`. The post-commit alert hook in `lib/alerts.ts` then emits `alert=true severity=critical` per §25.2.
-- Operational failure (DB blip, network) is logged at ERROR but does **not** synthesize a `ledger.chain_invalid` — that signal is reserved for actual chain mismatches.
-- Verifier interval handles are `.unref()`ed so they never block process shutdown. Started from `index.ts` after `app.listen`.
-- Removes the `FUTURE` allow-list entry for `ledger.chain_invalid` in `event-type-coverage.test.ts` — the rule is now live with a real emitter.
-- 4 new vitest cases mock `appendLedger` at the module boundary to assert: ok→no-append, fail→capped payload + correct actor/scope/subject, 20-error→first_errors capped at 5, thrown verifier→no append.
-
-## Milestones
-
-- **M0** (complete): walking skeleton — auth, RLS, ledger with hash chain, chat over findings, deterministic PHI/PII detectors, input + output PHI scans, honeypot canary, SSE envelope Zod validation.
-- **M1** (complete): pgvector + FTS hybrid retrieval, `search_findings` tool, agent context = top-K hybrid ∪ severity floor, preloaded ids in agent-turn ledger, embedder pluggability + PHI guard.
-- **M1.5** (complete): cloud-aware embedder factory (Bedrock / Vertex / Azure OpenAI / TEI / featurehash) with env-driven provider+model+dim selection, `DEPLOYMENT_TARGET` shortcut, runtime column-dim invariant check, PHI guard on outbound text. Cloud SDKs are lazy-loaded so dev installs stay small.
-- **M1.6** (complete): security pass —
-  - **Tool-arg revalidation** (ARCHITECTURE.md §23.1). Every `ToolRegistry.call` runs `validateToolArgs` after Zod parse: canary-token scan in any string arg, PHI-in-args scan, 8KB arg-size cap, finding-id whitelist (`[A-Za-z0-9_-]{1,64}`). Failures return `code: "policy_violation"`; the chat-agent's `onPolicyViolation` hook creates an incident finding (critical for canary trips, high otherwise) and ledgers `agent.canary_in_tool_args` / `agent.tool_args_policy_violation`. Raw arg values never enter the ledger payload — only violation kinds + tool name.
-  - **Per-user rate limiting**. `userOrIpKey` (session.sub if authenticated, else IPv6-safe IP) on `/api/chat`, `/api/tools`, `/api/admin/break-glass/grants`. Login + step-up stay per-IP (no stable identity / can't trust the identity being proven). Step-up gets a tight 5/min cap as anti-brute-force per threat_model §AuthN. Break-glass issuance gets 10/min — issuance is intentionally rare; bursts are themselves suspicious.
-  - **Step-up auth + break-glass raw-PHI view**. New `POST /api/auth/step-up` issues a separate 5-min HMAC-signed `phia_stepup` cookie (signature domain-separated from the session cookie via a per-purpose tag, so neither can be replayed as the other). `POST /api/admin/break-glass/grants` (requires session + step-up) issues per-finding time-boxed grants (max 15 min, justification ≥10 chars). `GET /api/admin/findings/:id/raw` requires session only — the grant IS the gate — and ledgers `break_glass.raw_phi_accessed` on EVERY access (not just grant). Threat model §EoP "break-glass scope minimization" + §Repudiation "every break-glass access ledgered" both satisfied.
-- **M1.7** (complete): two-person rule on critical-severity break-glass grants. Pending state, separate approver, self-approval refused + ledgered, CAS-protected approval. See "M1.7 — Two-person rule on critical break-glass" above.
-- **M1.7.1** (complete): boundary scan on analyst free-text (justification, approval_note, step-up reason) keeps PHI/secrets/canary out of immutable ledger payloads; DB CHECK `bg_no_self_approval` enforces the two-person rule below the application layer. See "M1.7.1 — Ledger-payload safety on analyst free-text" above.
-- **M1.7.2** (complete): event-type-driven alerting. New `lib/alerts.ts` + post-commit hook in `appendLedger` emits structured `alert=true` stderr lines for `agent.canary_in_tool_args` (critical), `break_glass.approval_denied_self_approval` (critical), `policy.text_field_rejected` (high), `agent.tool_args_policy_violation` (high), `break_glass.raw_phi_accessed` (warning), `ledger.chain_invalid` (critical), plus a rolling 5-min ≥3 threshold on `auth.step_up_failed`. Spec consolidated in `docs/ARCHITECTURE.md` §25; 5 new vitest cases.
-- **M1.7.3** (complete): closed out architect's M1.7.1 follow-ups.
-  - 11 boundary tests for `validateLedgerSafeText` (SSN/email/AWS key/JWT/MRN/canary/clean/empty/canary-before-PHI/no-substring-leak/deduped detectors).
-  - **§25.4 mechanical guard** (`event-type-coverage.test.ts`): scans all source for `eventType:` literals (handles ternary + multi-line forms) and fails if any ledger event isn't either in `ALERT_RULES` or `NOT_ALERTABLE`. Also flags dead `ALERT_RULES` entries that no code emits. First run caught two real gaps: `chat.input_phi_refused` and `agent.output_phi_detected` had no alert decision; both are now in `ALERT_RULES` (high and critical respectively).
-  - After architect review: added a symmetric dead-entry check for `NOT_ALERTABLE` (surfaced and removed a speculative `auth.login_success` entry with no emitter); broadened the scan to include `lib/db/src/` so `finding.created` and `ledger.genesis` from seed.ts count as live; excluded drizzle schema dirs to avoid `text("event_type")` false positives; documented the scanner's known limitations (single-quote / template-literal / const-ref / field-rename indirection) and the migration path to a ts-morph AST walk.
-  - Test count: 92 (pre-M1.7) → **113** (post-M1.7.3).
-- **M1.8** (complete): periodic chain verifier — hourly rolling-24h walk + weekly full walk, appends `ledger.chain_invalid` on mismatch (post-commit alert routed via §25 → critical). See "M1.8 — Periodic chain verifier" above. Test count: 113 → **117**.
-- **M1.9** (complete): closed out architect's M1.8 follow-ups on the verifier.
-  - **Leader election**: each `runOnce` is gated by `pg_try_advisory_lock` on a per-scope key (`rolling_24h`, `full`), held on a `pool.connect()` client across try-lock → fn → unlock. After architect review: if `pg_advisory_unlock` itself fails, `client.release(err)` destroys the connection instead of recycling it — otherwise the session-scoped lock would leak for the lifetime of the pooled connection.
-  - **Dedupe**: keyed on `{scope, signature}` where `signature = errors[0]` (e.g. `"seq 12: hash mismatch ..."`) — a stable corruption fingerprint. After architect review: do NOT key on `head_seq` (every `chain_invalid` append itself advances the head, so the next run would see a new head and re-alert forever); scope the dedupe query per scope (not global most-recent) so a full-walk alert doesn't silence the hourly one or vice versa. Payload now carries the signature alongside head_seq + error counts.
-  - **DB-backed integration tests** for `verifyChainSince`: empty window, contiguous valid chain, and the **bigserial-gap tolerance at the window boundary** (architect-corrected — first revision put the gap between two in-window rows, which doesn't exercise the boundary-seed lookup that was the actual M1.8 bug). The fixed test appends a preceding row, bumps the sequence with `setval(pg_get_serial_sequence(...))`, then crosses the window boundary so the gapped row is the *first* in-window row — the exact scenario the buggy `eq(seq, first.seq - 1)` would false-positive on. Plus 2 tests for leader-lock + dedupe semantics. The leader-lock test caught a real pool-handing-different-connection bug in the first implementation before merge.
-  - Deferred: integration-test DB isolation (tests pollute the shared dev ledger with a handful of `system.integration_test_marker` rows + sequence gaps each run; assertions are tolerant but a per-test transaction-rollback harness or a dedicated test schema would be cleaner). Acceptable for v1 because the ledger is append-only-by-design and rows are validly chained.
-  - Test count: 117 → **122**.
+- Tool-arg revalidation refuses canary tokens, PHI, oversize payloads, or malformed ids on every agent tool call; refusals materialize as critical/high incident findings.
+- Step-up auth (`POST /api/auth/step-up`) + break-glass raw-PHI view (`POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`) with per-access ledger events. Critical-severity grants require a second-analyst approval (`POST /api/admin/break-glass/grants/:id/approve`, `GET /api/admin/break-glass/pending-approvals`).
+- Per-user rate limits on chat, tools, and break-glass issuance; per-IP on login + step-up.
+- Tamper-evident ledger over every chat turn, every input PHI refusal, every agent output PHI detection, every finding create, every step-up grant/denial, every break-glass grant + approval + raw-PHI read, every chain walk, and every notarization checkpoint. `GET /api/admin/ledger/verify` walks the chain on demand; `GET /api/admin/ledger/checkpoints?verify=1` walks the external notarization.
+- Honeypot canary finding traps prompt-injection attempts in chat input and tool arguments.
 
 ## User preferences
 
@@ -148,12 +107,51 @@ _None recorded._
 ## Gotchas
 
 - Always run `pnpm run typecheck` from the repo root after schema or tool changes — leaf workspace packages are only checked there.
-- Bootstrap is idempotent: `CREATE EXTENSION IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, embedding backfill skips rows whose `embedder_version` matches, and the F-CANARY `raw_evidence` backfill is conditional on `IS NULL`. Safe to restart freely.
+- Bootstrap is idempotent: `CREATE EXTENSION IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, embedding backfill skips rows whose `embedder_version` matches, F-CANARY `raw_evidence` backfill is conditional on `IS NULL`, and `CREATE TABLE IF NOT EXISTS ledger_checkpoints` runs *before* the ENABLE ALWAYS trigger block in `setup-sql.ts` so boot ordering is correct. Safe to restart freely.
 - Drizzle's `sql\`... = ANY(${ids})\`` interpolates arrays as N separate params and fails at runtime. Use `inArray(col, ids)` instead.
+- `db.execute(sql\`...\`)` returns a QueryResult; use `.rows[0]`, not array destructuring on the result.
+- Drizzle wraps trigger-raised errors inside `"Failed query: ..."`, so test assertions should match the underlying cause string, not the outer envelope.
 - Don't add to root `tsconfig.json` references — that's libs-only. Artifacts are leaf workspace packages.
 - **Never `.select().from(findingsTable)` outside `routes/admin.ts`'s raw endpoint** — use `.select(findingSafeColumns)` so `rawEvidence` cannot enter an LLM prompt or SSE frame. The `FindingSafe` type is the compile-time guard; if you find yourself typing a non-admin result as `Finding`, you've widened the protection away.
 - Rate-limiter `keyGenerator` must use `ipKeyGenerator(req.ip)` (not `req.ip` directly) for IPv6 safety — `express-rate-limit` v8 enforces this.
+- DB integration tests pollute the shared dev ledger with `system.integration_test_marker` rows + sequence gaps + occasional forged checkpoint rows (deferred isolation per M1.9). New tests that walk ledger or checkpoints must scope to just-created rows (pass `sinceSeq` / filter by id), not assume the table is clean.
+- When adding a new `eventType:` literal, also add it to `ALERT_RULES` or `NOT_ALERTABLE` in `alerts.ts` in the same change, or `event-type-coverage.test.ts` will fail.
 
 ## Pointers
 
 - See `.local/skills/pnpm-workspace/SKILL.md` for workspace structure, TypeScript setup, and package details.
+- Agent continuity / crash-recovery notes (gitignored): `.agent-context.md`.
+
+---
+
+# Milestone history
+
+Chronological. Each entry captures what shipped and any architect-flagged correctness fixes applied before merge. Recent entries carry more detail; older ones are summarized.
+
+_M0–M1.7.x condensed; full detail in git history._
+
+- **M0**: walking skeleton — auth, RLS, ledger w/ hash chain, chat-over-findings, deterministic PHI/PII detectors, input+output PHI scans, honeypot canary, SSE Zod validation.
+- **M1**: pgvector + FTS hybrid retrieval, `search_findings` tool, agent context = top-K hybrid ∪ severity floor, preloaded ids in agent-turn ledger, embedder pluggability + PHI guard.
+- **M1.5**: cloud-aware embedder factory (Bedrock / Vertex / Azure OpenAI / TEI / featurehash), env-driven provider+model+dim, `DEPLOYMENT_TARGET` shortcut, runtime column-dim invariant, PHI guard on outbound text, lazy-loaded cloud SDKs.
+- **M1.6**: security pass — tool-arg revalidation (canary/PHI/size/id-whitelist, refusals → incident finding + ledger), per-user rate limiting (`userOrIpKey`), step-up auth (5-min `phia_stepup` cookie, domain-separated HMAC) + break-glass raw-PHI view w/ per-access ledger.
+- **M1.7**: two-person rule on critical-severity break-glass — `requires_second_approval` captured at grant-creation from then-current severity (no retroactive bypass via downgrade), `POST /grants/:id/approve` by a *different* user w/ fresh step-up, self-approval → 403 + ledger, CAS on `approver_user_id IS NULL` defeats double-approve races. Closes ARCH §18 + threat_model §EoP "Insider threat".
+- **M1.7.1**: `validateLedgerSafeText` (PHI/PII/secrets + canary) on `justification`/`approval_note`/`reason` → HTTP 400 + ledger `policy.text_field_rejected` (detector *names only*). DB CHECK `bg_no_self_approval` defends two-person rule below the app layer.
+- **M1.7.2**: event-type-driven alerting — `lib/alerts.ts` + post-commit hook, severity routing for canary/self-approval/text-rejected/tool-policy/raw-PHI-read/chain-invalid + rolling 5-min ≥3 threshold on `auth.step_up_failed`. Spec: ARCH §25.
+- **M1.7.3**: §25.4 mechanical guard in `event-type-coverage.test.ts` — scans every `eventType:` literal (ternary + multi-line) and fails CI if missing from `ALERT_RULES` / `NOT_ALERTABLE`. Caught two real gaps on first run. Symmetric dead-entry check, schema-dir exclusions to avoid `text("event_type")` false positives. Test count: 92 → **113**.
+- **M1.8**: periodic chain verifier — hourly rolling-24h (`verifyChainSince`) + weekly full (`verifyChain`). Boundary seed uses *preceding existing* row (NOT `seq = first.seq - 1`) so bigserial gaps from rollback/crash-recovery don't false-positive. Mismatch → `ledger.chain_invalid` (critical per §25.2); operational failures logged but never synthesize `chain_invalid`. Interval handles `.unref()`-ed. Test count: 113 → **117**.
+- **M1.9**: M1.8 follow-ups — leader election via `pg_try_advisory_lock` per-scope on a held `pool.connect()` client (unlock failure → `client.release(err)` to avoid session-scoped lock leak); dedupe keyed on `{scope, signature=errors[0]}` (NOT `head_seq`, since every `chain_invalid` advances head and would re-alert forever); DB integration tests for empty window / contiguous chain / bigserial gap at window-boundary (architect-corrected — the exact scenario the buggy `eq(seq, first.seq-1)` would false-positive on); leader-lock test caught a real pool-handing-different-connection bug. Deferred: integration-test DB isolation. Test count: 117 → **122**.
+- **M2**: external ledger notarization (ARCH §23.2) — `ledger_checkpoints` table under same ENABLE ALWAYS triggers as `ledger_entries`; `lib/notarization.ts` HMAC-signs canonical-JSON over `{seq, head_hash, notarized_at, signing_key_id}` (signing_key_id mixed in → v1 sig can't replay as v2 post-rotation). 5min cadence inside chain-verifier scheduler under per-scope advisory lock; `createCheckpoint` uses `onConflictDoNothing({target: seq})` on race; `verifyCheckpoints` cross-checks sig AND live ledger hash, ≤5 mismatches/payload, signature-keyed dedupe. `GET /api/admin/ledger/checkpoints?verify=1`. Boot WARN if `NOTARIZATION_SECRET` unset.
+  - **Architect-flagged fixes pre-merge**: (1) `constantTimeEq` returns `false` (not throws) on malformed/non-hex/length-mismatched sig bytes — a tamperer with insert capability could otherwise write garbage to suppress the critical mismatch alert by routing through the operational-failure catch. (2) `NOTARIZATION_RETIRED_KEYS` JSON map resolves historical `signing_key_id`s so bumping `ACTIVE_KEY_ID` doesn't turn every existing checkpoint into a permanent mismatch. (3) `createCheckpoint` + `verifyCheckpoints` in *separate* try blocks so a transient create failure can't mask a real existing-checkpoint mismatch.
+  - Test count: 122 → **131** (+9: signature determinism, tamper, unknown-key, malformed-hex alert-suppression fix, key rotation, env presence, DB round-trip, idempotency, tampered-checkpoint detection).
+- **M3** (complete): log ingestion end-to-end for one source per ARCHITECTURE.md §17.2.
+  - **Architect-flagged fixes pre-merge (two passes)**: (1) `pg_advisory_xact_lock` per `(tenant, fingerprint)` inside upsert tx kills the dedupe race + duplicate `finding.created`. (2) `raw_evidence` shape changed to `{first, latest}` w/ migration of pre-fix flat rows (forensic value: latest+earliest occurrence both retained). (3) `validateProvenance` at ingest entry (tenantId/sourceName/sourceRecordId charset+len caps, 64KB payload cap) → malformed records dropped + ledgered as `ingest.malformed_record` (warning). (4) `redactInline` zero-width hit guard. (5) `InMemoryLogBus.publish` returns `PublishResult {delivered, errors[]}`. (6) `ingestReplayLimiter` 5/min. (7, second pass) `startIngestPipeline` handler RETHROWS after logging so PublishResult.errors[] actually captures ingest failures (was silently swallowing → `/api/admin/ingest/replay` could have reported `errors: 0` on real failures). (8, second pass) Malformed-record ledger tenant fallback requires full validity (typeof + non-empty + length cap + regex) else `null` — closes an overlong-but-regex-valid ledger-scope-poisoning hole.
+  - **Cloud-agnostic seams**: `LogRecord` (provenance: tenantId + sourceType + sourceName + sourceRecordId + observedAt + ingestedAt + payload) + `LogSource` adapter + `LogBus` pub/sub. `StaticFixtureLogSource` ships as dev source; `CloudwatchLogSourceStub` lazy-load-throws (same pattern as cloud embedders).
+  - **Pipeline**: `ingestRecord` → `scanForPhi` → group by classification (one finding per `(source, classification)` so multi-class records fan out) → `redactInline` (overlap-safe: start-asc, end-desc; longer match wins on tie) → defense-in-depth rescan → upsert by fingerprint inside `withTenant` tx. `raw_evidence: {first, latest}` for break-glass; `redacted_evidence` for BM25 hot tier. Snippet capped at 1KB.
+  - **Boot wiring**: `startIngestPipeline(logBus)` after chain verifier. No source auto-started in dev (avoids per-restart DB pollution); `POST /api/admin/ingest/replay` (session-gated, 5/min) triggers one-shot fixture replay.
+  - **Alerts**: `ingest.redaction_regression` → critical; `ingest.malformed_record` → warning; `finding.created` already in `NOT_ALERTABLE` from M0.
+  - **Tests (+19, 131 → 150)**: `log-bus.test.ts` (6, including throwing-handler → `errors[]` contract), `ingest.test.ts` (13 mix of unit + real-DB integration: `redactInline` boundary cases incl. overlap + zero-width; clean record → no finding/ledger; PHI record → finding + raw_evidence first/latest + rescan-clean snippet + single `finding.created`; fingerprint dedupe → occurrence_count=2 + raw_evidence latest updated + no second ledger; multi-class fan-out; redaction-regression via injected faulty redactor → safe fallback + critical ledger; advisory-lock-serialized concurrent dedupe race (N=5 → 1 finding + occ=5 + 1 `finding.created`); malformed-record rejection; **rethrow contract** (forces TypeError via non-Date `observedAt`, asserts `PublishResult.errors[0].err instanceof TypeError`); **overlong-but-regex-valid tenant** → ledger `tenant_id IS NULL`). Integration tests scope reads to self-created rows per M1.9 dev-DB-pollution gotcha.
+  - **Deferred (intentional)**: real Kafka/NATS bus, real CloudWatch SDK fetch loop, Stage 2 (Presidio NER for different-tech rescan), tokenize-via-KMS, WORM tier for raw payloads, partial unique index `(tenant_id, fingerprint) WHERE source LIKE 'ingest:%'` to harden dedupe at the DB layer, per-tenant bus topics (multi-tenant milestone), per-occurrence ledger entries (operational-counter exemption: `finding.created` is the audit anchor; subsequent occurrences bump `last_seen_at` + `occurrence_count` silently).
+- **M4** (complete): analyst dashboard UI (`artifacts/dashboard`, React + Vite + shadcn/wouter/next-themes/react-query). Login → cookie session; pages: Findings (list + filters + severity badges), Finding detail (redacted view + break-glass request + raw-evidence reveal once granted), Chat (AG-UI SSE, citation chips → finding links, session list + new session), Ledger (paginated entries + on-demand `GET /admin/ledger/verify` and `GET /admin/ledger/checkpoints?verify=1` via `enabled:false` + `refetch()`), Admin (active grants + pending two-person approvals + ingest replay). Light/dark/system toggle via `next-themes`. All data flows through generated `@workspace/api-client-react` hooks; raw-evidence is reachable only via the admin `/api/admin/findings/:id/raw` path. Backend untouched aside from removing the legacy server-rendered HTML UI (`routes/ui.ts` + `lib/ui.ts`) and exporting `ApiError`/`ResponseParseError`/`ErrorType` from `@workspace/api-client-react`. OpenAPI extended with `/auth/step-up`, `/admin/break-glass/grants`(+`/{id}/approve`, `/pending-approvals`), `/admin/findings/{id}/raw`, `/admin/ingest/replay` so the dashboard uses typed hooks end-to-end.
+  - **Architect-flagged fixes pre-merge**: (1) SSE chat parser was decoding non-existent event names — server emits AG-UI `agent_message_delta` / `agent_message_complete` / `tool_call{tool}` / `done` (see `routes/chat.ts` + `lib/sse.ts`), frontend was reading `text_delta` / `tool_call.name`. Rewrote parser to AG-UI shape, multi-`data:` line join, content-type + `response.ok` guard so non-SSE error responses hard-fail instead of silently consuming HTML/JSON. (2) Finding detail was fetching `/api/findings/{id}/raw` (404, route doesn't exist) — fixed to admin path `/api/admin/findings/{id}/raw` (the only audited raw-evidence call site). (3) Admin approve was posting to `/api/admin/break-glass/{id}/approve` (404) — switched to generated `useApproveBreakGlassGrant` hook against `/api/admin/break-glass/grants/{id}/approve`, added explicit 401 (re-step-up) / 403 (self-approval) toast recovery.
+  - **Test count unchanged**: 150 → **150** (no backend changes; M4 is frontend-only against the existing API surface).
+  - **Deferred (intentional)**: e2e Playwright coverage of the dashboard flows (covered by backend integration tests + manual smoke); virtualized list for findings/ledger at >10k rows; light/dark explicit per-component theming pass beyond shadcn defaults; chat assistant-message persistence happens server-side already, so frontend just refetches history on `done`.

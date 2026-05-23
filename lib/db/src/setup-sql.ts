@@ -238,6 +238,51 @@ CREATE TRIGGER ledger_entries_no_truncate
   BEFORE TRUNCATE ON ledger_entries
   FOR EACH STATEMENT EXECUTE FUNCTION ledger_entries_append_only();
 ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ledger_entries_no_truncate;
+
+-- M2: ledger_checkpoints (external notarization). Same append-only lockdown
+-- as ledger_entries — a checkpoint that can be rewritten is not a
+-- checkpoint. In production this table additionally lives in a separate
+-- account with Object Lock per §23.2; the ENABLE ALWAYS triggers here are
+-- the dev/in-cluster equivalent.
+--
+-- Created idempotently here (rather than via drizzle push) so the triggers
+-- below can reference it on first boot. Schema mirrors lib/db/src/schema/
+-- checkpoints.ts; the two must stay in sync.
+CREATE TABLE IF NOT EXISTS ledger_checkpoints (
+  id bigserial PRIMARY KEY,
+  seq bigint NOT NULL,
+  head_hash text NOT NULL,
+  notarized_at timestamptz NOT NULL DEFAULT now(),
+  signature text NOT NULL,
+  signing_key_id text NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ledger_checkpoints_seq_uniq
+  ON ledger_checkpoints (seq);
+
+CREATE OR REPLACE FUNCTION ledger_checkpoints_append_only() RETURNS trigger AS $fn$
+BEGIN
+  RAISE EXCEPTION 'ledger_checkpoints is append-only (% rejected)', TG_OP
+    USING ERRCODE = 'insufficient_privilege';
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS ledger_checkpoints_no_update ON ledger_checkpoints;
+CREATE TRIGGER ledger_checkpoints_no_update
+  BEFORE UPDATE ON ledger_checkpoints
+  FOR EACH ROW EXECUTE FUNCTION ledger_checkpoints_append_only();
+ALTER TABLE ledger_checkpoints ENABLE ALWAYS TRIGGER ledger_checkpoints_no_update;
+
+DROP TRIGGER IF EXISTS ledger_checkpoints_no_delete ON ledger_checkpoints;
+CREATE TRIGGER ledger_checkpoints_no_delete
+  BEFORE DELETE ON ledger_checkpoints
+  FOR EACH ROW EXECUTE FUNCTION ledger_checkpoints_append_only();
+ALTER TABLE ledger_checkpoints ENABLE ALWAYS TRIGGER ledger_checkpoints_no_delete;
+
+DROP TRIGGER IF EXISTS ledger_checkpoints_no_truncate ON ledger_checkpoints;
+CREATE TRIGGER ledger_checkpoints_no_truncate
+  BEFORE TRUNCATE ON ledger_checkpoints
+  FOR EACH STATEMENT EXECUTE FUNCTION ledger_checkpoints_append_only();
+ALTER TABLE ledger_checkpoints ENABLE ALWAYS TRIGGER ledger_checkpoints_no_truncate;
 `;
 }
 

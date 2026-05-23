@@ -89,6 +89,40 @@ export function scanForPhi(text: string): PhiHit[] {
   return hits;
 }
 
+// M3: inline redaction helper used by the ingest pipeline to produce the
+// `redacted_evidence` snippet that lands in the searchable hot tier. The
+// strategy is "mask" per ARCHITECTURE.md §6 (tokenize-via-KMS is post-M3).
+//
+// Overlap handling: hits are sorted by start ascending, then by end
+// descending so the longer span wins on tie. Any later hit whose start
+// falls inside an already-redacted span is skipped — the earlier span's
+// `[REDACTED:<detector>]` placeholder already covers the bytes.
+//
+// Returns the redacted text plus the ordered list of detector names that
+// were actually applied (skipped overlapping hits are NOT counted).
+export function redactInline(
+  text: string,
+  hits: PhiHit[],
+): { snippet: string; redactions: string[] } {
+  if (hits.length === 0) return { snippet: text, redactions: [] };
+  const sorted = [...hits].sort(
+    (a, b) => a.start - b.start || b.end - a.end,
+  );
+  const out: string[] = [];
+  const redactions: string[] = [];
+  let cursor = 0;
+  for (const h of sorted) {
+    if (h.end <= h.start) continue; // zero/negative-width hit — nothing to mask
+    if (h.start < cursor) continue; // overlap — earlier (longer) span covers it
+    out.push(text.slice(cursor, h.start));
+    out.push(`[REDACTED:${h.detector}]`);
+    redactions.push(h.detector);
+    cursor = h.end;
+  }
+  out.push(text.slice(cursor));
+  return { snippet: out.join(""), redactions };
+}
+
 export const SAFE_REFUSAL =
   "I can't share that. The response I was about to send contained " +
   "values that look like PHI/secrets. The attempt has been logged as a " +

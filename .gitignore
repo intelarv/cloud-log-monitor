@@ -47,3 +47,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Agent continuity / crash-recovery notes (local-only)
+.agent-context.md

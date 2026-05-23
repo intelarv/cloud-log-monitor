@@ -26,6 +26,11 @@ import { db, pool, ledgerEntriesTable } from "@workspace/db";
 import { logger } from "./logger";
 import { appendLedger, verifyChain, verifyChainSince } from "./ledger";
 import type { VerifyResult } from "./ledger";
+import {
+  createCheckpoint,
+  verifyCheckpoints,
+  type CheckpointVerifyResult,
+} from "./notarization";
 
 export interface ChainVerifierSchedule {
   /** Rolling 24h-window walk cadence. Default 1h. */
@@ -34,12 +39,18 @@ export interface ChainVerifierSchedule {
   fullMs: number;
   /** Window size for the rolling walk. Default 24h. */
   lookbackMs: number;
+  /** Cadence for creating + verifying external notarization checkpoints
+   *  (M2). Default 5min in dev — production §23.2 spec is "every 1,000
+   *  entries OR daily, whichever first"; this is a time-only approximation
+   *  that's fine for the dev write rate. */
+  checkpointMs: number;
 }
 
 const DEFAULT_SCHEDULE: ChainVerifierSchedule = {
   windowMs: 60 * 60 * 1000,
   fullMs: 7 * 24 * 60 * 60 * 1000,
   lookbackMs: 24 * 60 * 60 * 1000,
+  checkpointMs: 5 * 60 * 1000,
 };
 
 // Per-scope advisory-lock keys. Distinct from LEDGER_LOCK_KEY in ledger.ts
@@ -48,9 +59,10 @@ const DEFAULT_SCHEDULE: ChainVerifierSchedule = {
 const LOCK_KEYS: Record<Scope, bigint> = {
   rolling_24h: 7331_4242_0000_0010n,
   full: 7331_4242_0000_0011n,
+  checkpoint: 7331_4242_0000_0012n,
 };
 
-type Scope = "rolling_24h" | "full";
+type Scope = "rolling_24h" | "full" | "checkpoint";
 
 // Stable corruption fingerprint for dedupe. `head_seq` is NOT a stable key
 // because every chain_invalid append itself advances the head — the next
@@ -198,6 +210,114 @@ async function runOnce(
   });
 }
 
+// M2: checkpoint dedupe. Mirrors `isDuplicateChainInvalid`. A persistent
+// checkpoint mismatch (e.g. someone overwrote a ledger row that an old
+// checkpoint pinned) should alert ONCE per signature, not every cadence
+// tick — same reasoning as for chain_invalid: the verifier's own append
+// advances the head, so head_seq is not stable; the first-mismatch string
+// IS stable.
+function checkpointSignature(r: CheckpointVerifyResult): string {
+  return r.first_mismatches[0] ?? "<unknown>";
+}
+
+async function isDuplicateCheckpointMismatch(
+  signature: string,
+): Promise<boolean> {
+  const [last] = await db
+    .select({ payload: ledgerEntriesTable.payload })
+    .from(ledgerEntriesTable)
+    .where(eq(ledgerEntriesTable.eventType, "ledger.checkpoint_mismatch"))
+    .orderBy(desc(ledgerEntriesTable.seq))
+    .limit(1);
+  if (!last) return false;
+  const p = last.payload as { signature?: string };
+  return p.signature === signature;
+}
+
+async function runCheckpointOnce(): Promise<void> {
+  await withLeaderLock("checkpoint", async () => {
+    // (1) Sign current head into a new checkpoint (no-op if unchanged).
+    // Architect-flagged: verify MUST run even if create errors (e.g. a
+    // transient insert race). Wrap create in its own try so a creation
+    // failure cannot mask an existing-checkpoint mismatch.
+    try {
+      const created = await createCheckpoint();
+      if (created.kind === "created") {
+        await appendLedger({
+          tenantId: null,
+          actor: { kind: "system", id: "notarizer" },
+          eventType: "ledger.checkpoint_created",
+          subjectType: "ledger_checkpoint",
+          subjectId: String(created.checkpoint.id),
+          payload: {
+            seq: created.checkpoint.seq,
+            head_hash: created.checkpoint.headHash,
+            signing_key_id: created.checkpoint.signingKeyId,
+          },
+        });
+        logger.debug(
+          {
+            id: created.checkpoint.id,
+            seq: created.checkpoint.seq,
+            key: created.checkpoint.signingKeyId,
+          },
+          "notarization checkpoint created",
+        );
+      }
+    } catch (err) {
+      logger.error(
+        { err },
+        "notarization create step failed; continuing to verify existing checkpoints",
+      );
+    }
+
+    try {
+      // (2) Verify all existing checkpoints against the live ledger.
+      const r = await verifyCheckpoints();
+      if (r.ok) {
+        logger.debug(
+          { walked: r.walked },
+          "notarization checkpoints verified ok",
+        );
+        return;
+      }
+      const signature = checkpointSignature(r);
+      logger.error(
+        {
+          walked: r.walked,
+          mismatch_count: r.mismatch_count,
+          first_mismatches: r.first_mismatches,
+        },
+        "notarization mismatch — emitting ledger.checkpoint_mismatch",
+      );
+      if (await isDuplicateCheckpointMismatch(signature)) {
+        logger.warn(
+          { signature, mismatch_count: r.mismatch_count },
+          "checkpoint mismatch already alerted for this signature; skipping duplicate emit",
+        );
+        return;
+      }
+      await appendLedger({
+        tenantId: null,
+        actor: { kind: "system", id: "notarizer" },
+        eventType: "ledger.checkpoint_mismatch",
+        subjectType: "ledger",
+        subjectId: "checkpoint",
+        payload: {
+          signature,
+          walked: r.walked,
+          mismatch_count: r.mismatch_count,
+          first_mismatches: r.first_mismatches,
+        },
+      });
+    } catch (err) {
+      // Same policy as chain-verifier: operational failure ≠ integrity
+      // event. Don't synthesize a checkpoint_mismatch on DB blips.
+      logger.error({ err }, "notarization run failed");
+    }
+  });
+}
+
 /** Start the periodic chain verifier. Returns a stop() handle for tests. */
 export function startChainVerifier(
   schedule: Partial<ChainVerifierSchedule> = {},
@@ -216,7 +336,11 @@ export function startChainVerifier(
     () => void runOnce("full", () => verifyChain()),
     s.fullMs,
   );
-  intervals.push(windowTimer, fullTimer);
+  const checkpointTimer = setInterval(
+    () => void runCheckpointOnce(),
+    s.checkpointMs,
+  );
+  intervals.push(windowTimer, fullTimer, checkpointTimer);
 
   // Never keep the process alive on shutdown.
   for (const t of intervals) t.unref?.();
@@ -226,6 +350,7 @@ export function startChainVerifier(
       windowMs: s.windowMs,
       fullMs: s.fullMs,
       lookbackMs: s.lookbackMs,
+      checkpointMs: s.checkpointMs,
     },
     "chain verifier scheduled",
   );
@@ -240,9 +365,11 @@ export function startChainVerifier(
 // without standing up a second DB connection.
 export const __test__ = {
   runOnce,
+  runCheckpointOnce,
   emitInvalid,
   withLeaderLock,
   isDuplicateChainInvalid,
+  isDuplicateCheckpointMismatch,
   LOCK_KEYS,
 };
 

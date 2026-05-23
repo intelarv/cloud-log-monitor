@@ -16,6 +16,7 @@ tags:
   - name: chat
   - name: ledger
   - name: tools
+  - name: admin
 
 paths:
   /healthz:
@@ -240,6 +241,223 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/LedgerVerifyResult" }
 
+  /admin/ledger/checkpoints:
+    get:
+      operationId: listLedgerCheckpoints
+      tags: [ledger]
+      summary: |
+        List external HMAC notarization checkpoints. Pass `verify=1` to also
+        run the live cross-check (signature + ledger-hash match) and return
+        the verification result.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: verify
+          in: query
+          schema: { type: string, enum: ["0", "1"] }
+      responses:
+        "200":
+          description: Checkpoints (and optional verify result)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LedgerCheckpointsPage" }
+
+  /auth/step-up:
+    post:
+      operationId: stepUp
+      tags: [auth]
+      summary: Elevate the session for break-glass actions (5-min cookie).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StepUpInput" }
+      responses:
+        "200":
+          description: Step-up granted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpResult" }
+        "400":
+          description: Invalid input or rejected reason text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Invalid step-up token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/break-glass/grants:
+    get:
+      operationId: listBreakGlassGrants
+      tags: [admin]
+      summary: List the caller's break-glass grants (most recent first).
+      responses:
+        "200":
+          description: Grants
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/BreakGlassGrant" }
+    post:
+      operationId: createBreakGlassGrant
+      tags: [admin]
+      summary: |
+        Issue a break-glass grant for raw-PHI access on a single finding.
+        Requires a valid step-up cookie. Critical-severity findings are
+        created PENDING and require a second-person approval.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BreakGlassGrantInput" }
+      responses:
+        "201":
+          description: Grant issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BreakGlassGrant" }
+        "400":
+          description: Invalid input or rejected justification text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated or step-up missing
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Finding not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/break-glass/grants/{id}/approve:
+    post:
+      operationId: approveBreakGlassGrant
+      tags: [admin]
+      summary: |
+        Second-person approval of a pending critical-severity grant. Approver
+        must hold a fresh step-up cookie and be a different user than the
+        requester. Self-approval is refused (HTTP 403) and ledgered.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BreakGlassApprovalInput" }
+      responses:
+        "200":
+          description: Grant approved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BreakGlassGrant" }
+        "400":
+          description: Invalid input, rejected approval_note, or grant does not require approval
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "403":
+          description: Self-approval refused
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Grant not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "409":
+          description: Grant already approved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "410":
+          description: Grant revoked or expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/break-glass/pending-approvals:
+    get:
+      operationId: listPendingBreakGlassApprovals
+      tags: [admin]
+      summary: |
+        List grants pending second-person approval that the caller is
+        eligible to approve (excludes grants the caller requested).
+      responses:
+        "200":
+          description: Pending grants
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/BreakGlassGrant" }
+
+  /admin/findings/{id}/raw:
+    get:
+      operationId: getFindingRaw
+      tags: [admin]
+      summary: |
+        Read raw evidence for a finding under an active break-glass grant.
+        Every access is ledgered. Critical-severity findings require a
+        two-person-approved grant.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Raw evidence
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FindingRawEvidence" }
+        "403":
+          description: No active grant, or pending second-person approval
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Finding not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/ingest/replay:
+    post:
+      operationId: replayIngestFixture
+      tags: [admin]
+      summary: |
+        Replay the static fixture log source through the in-memory bus and
+        ingest pipeline. Dev/demo trigger; produces findings + ledger entries
+        through the normal path. Rate-limited (5/min).
+      responses:
+        "200":
+          description: Replay result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestReplayResult" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /tools/get_finding:
     post:
       operationId: invokeGetFindingTool
@@ -449,6 +667,144 @@ components:
         errors:
           type: array
           items: { type: string }
+
+    LedgerCheckpoint:
+      type: object
+      required: [id, seq, head_hash, notarized_at, signature, signing_key_id]
+      properties:
+        id: { type: integer }
+        seq: { type: integer }
+        head_hash: { type: string }
+        notarized_at: { type: string, format: date-time }
+        signature: { type: string }
+        signing_key_id: { type: string }
+
+    LedgerCheckpointsPage:
+      type: object
+      required: [checkpoints]
+      properties:
+        checkpoints:
+          type: array
+          items: { $ref: "#/components/schemas/LedgerCheckpoint" }
+        verify:
+          oneOf:
+            - $ref: "#/components/schemas/LedgerCheckpointsVerifyResult"
+            - type: "null"
+
+    LedgerCheckpointsVerifyResult:
+      type: object
+      required: [ok, checked, errors]
+      properties:
+        ok: { type: boolean }
+        checked: { type: integer }
+        errors:
+          type: array
+          items: { type: string }
+
+    StepUpInput:
+      type: object
+      required: [token, reason]
+      properties:
+        token: { type: string, minLength: 1, maxLength: 256 }
+        reason: { type: string, minLength: 3, maxLength: 200 }
+
+    StepUpResult:
+      type: object
+      required: [ok, expires_at, ttl_seconds]
+      properties:
+        ok: { type: boolean }
+        expires_at: { type: string, format: date-time }
+        ttl_seconds: { type: integer }
+
+    BreakGlassGrantInput:
+      type: object
+      required: [finding_id, justification]
+      properties:
+        finding_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        justification:
+          type: string
+          minLength: 10
+          maxLength: 2000
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 900
+
+    BreakGlassApprovalInput:
+      type: object
+      required: [approval_note]
+      properties:
+        approval_note:
+          type: string
+          minLength: 10
+          maxLength: 2000
+
+    BreakGlassGrant:
+      type: object
+      required:
+        - id
+        - tenant_id
+        - user_id
+        - finding_id
+        - justification
+        - granted_at
+        - expires_at
+        - revoked_at
+        - requires_second_approval
+        - approver_user_id
+        - approved_at
+        - pending_approval
+        - active
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        user_id: { type: string }
+        finding_id: { type: string }
+        justification: { type: string }
+        granted_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        revoked_at: { type: ["string", "null"], format: date-time }
+        requires_second_approval: { type: boolean }
+        approver_user_id: { type: ["string", "null"] }
+        approved_at: { type: ["string", "null"], format: date-time }
+        pending_approval: { type: boolean }
+        active: { type: boolean }
+
+    FindingRawEvidence:
+      type: object
+      required:
+        - finding_id
+        - grant_id
+        - grant_expires_at
+        - classification
+        - severity
+        - raw_evidence
+        - two_person_approved
+        - approver_user_id
+      properties:
+        finding_id: { type: string }
+        grant_id: { type: string }
+        grant_expires_at: { type: string, format: date-time }
+        classification: { type: string }
+        severity: { type: string }
+        raw_evidence:
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
+        two_person_approved: { type: boolean }
+        approver_user_id: { type: ["string", "null"] }
+
+    IngestReplayResult:
+      type: object
+      required: [replayed, delivered, errors]
+      properties:
+        replayed: { type: integer }
+        delivered: { type: integer }
+        errors: { type: integer }
 
     ToolGetFindingInput:
       type: object

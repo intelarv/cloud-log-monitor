@@ -5,7 +5,7 @@ Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port comes from workflow env)
-- `pnpm --filter @workspace/api-server run test` — vitest suite (113 tests as of M1.7.3)
+- `pnpm --filter @workspace/api-server run test` — vitest suite (117 tests as of M1.8)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
@@ -103,6 +103,19 @@ Break-glass grants on findings whose severity is `critical` are created PENDING 
 - Closes the `docs/ARCHITECTURE.md` §18 open question with the proposed rule: single-analyst for severity ≤ high, two-person for critical.
 - Threat model §EoP "Insider threat (rogue analyst)" satisfied at the moment of access — a rogue analyst cannot unilaterally read raw PHI on a critical finding even with valid session + step-up.
 
+## M1.8 — Periodic chain verifier
+
+Closes the §23.2 promise that tamper-evidence is *actively* checked, not just verifiable on demand.
+
+- New `artifacts/api-server/src/lib/chain-verifier.ts` schedules two cadences:
+  - **Rolling 24h walk** every hour — `verifyChainSince(now - 24h)` (new helper in `ledger.ts`) seeded with the hash of the immediately-preceding *existing* row (`seq < first.seq ORDER BY seq DESC LIMIT 1`, not `seq = first.seq - 1`) so the boundary `prev_hash` linkage is verified without false-positiving on legitimate `bigserial` gaps from rollback / cache loss / crash recovery. Architect-flagged correctness fix before merge.
+  - **Full chain walk** every 7 days — existing `verifyChain()`.
+- On mismatch: `appendLedger({eventType: "ledger.chain_invalid", actor: {kind: "system", id: "chain_verifier"}, payload: {scope, walked, head_seq, head_hash, error_count, first_errors[≤5]}})`. The post-commit alert hook in `lib/alerts.ts` then emits `alert=true severity=critical` per §25.2.
+- Operational failure (DB blip, network) is logged at ERROR but does **not** synthesize a `ledger.chain_invalid` — that signal is reserved for actual chain mismatches.
+- Verifier interval handles are `.unref()`ed so they never block process shutdown. Started from `index.ts` after `app.listen`.
+- Removes the `FUTURE` allow-list entry for `ledger.chain_invalid` in `event-type-coverage.test.ts` — the rule is now live with a real emitter.
+- 4 new vitest cases mock `appendLedger` at the module boundary to assert: ok→no-append, fail→capped payload + correct actor/scope/subject, 20-error→first_errors capped at 5, thrown verifier→no append.
+
 ## Milestones
 
 - **M0** (complete): walking skeleton — auth, RLS, ledger with hash chain, chat over findings, deterministic PHI/PII detectors, input + output PHI scans, honeypot canary, SSE envelope Zod validation.
@@ -120,6 +133,7 @@ Break-glass grants on findings whose severity is `critical` are created PENDING 
   - **§25.4 mechanical guard** (`event-type-coverage.test.ts`): scans all source for `eventType:` literals (handles ternary + multi-line forms) and fails if any ledger event isn't either in `ALERT_RULES` or `NOT_ALERTABLE`. Also flags dead `ALERT_RULES` entries that no code emits. First run caught two real gaps: `chat.input_phi_refused` and `agent.output_phi_detected` had no alert decision; both are now in `ALERT_RULES` (high and critical respectively).
   - After architect review: added a symmetric dead-entry check for `NOT_ALERTABLE` (surfaced and removed a speculative `auth.login_success` entry with no emitter); broadened the scan to include `lib/db/src/` so `finding.created` and `ledger.genesis` from seed.ts count as live; excluded drizzle schema dirs to avoid `text("event_type")` false positives; documented the scanner's known limitations (single-quote / template-literal / const-ref / field-rename indirection) and the migration path to a ts-morph AST walk.
   - Test count: 92 (pre-M1.7) → **113** (post-M1.7.3).
+- **M1.8** (complete): periodic chain verifier — hourly rolling-24h walk + weekly full walk, appends `ledger.chain_invalid` on mismatch (post-commit alert routed via §25 → critical). See "M1.8 — Periodic chain verifier" above. Test count: 113 → **117**.
 
 ## User preferences
 

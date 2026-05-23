@@ -24,3 +24,15 @@ id = "P521fNTwCjdCk6EQnJFUY"
 uri = "file://exports/phia-20260522-225515.zip"
 type = "unspecified"
 title = "PHI/PII Log Audit — M1.7.2 (event-type-driven alerting)"
+
+[[outputs]]
+id = "uuJSwnVioxwW7CRu0608i"
+uri = "file://exports/phia-20260523-191557.zip"
+type = "unspecified"
+title = "phia (M1.7.3 — §25.4 guard hardened, 113 tests)"
+
+[[outputs]]
+id = "K1sqRMsyhGiMsDgqD7RBU"
+uri = "file://exports/phia-20260523-191930.zip"
+type = "unspecified"
+title = "phia (docs sync — §25.4 matches implementation)"

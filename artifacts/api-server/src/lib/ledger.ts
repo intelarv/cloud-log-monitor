@@ -1,4 +1,4 @@
-import { sql, desc, asc, gt } from "drizzle-orm";
+import { sql, desc, asc, gt, gte, lt } from "drizzle-orm";
 import {
   db,
   ledgerEntriesTable,
@@ -88,17 +88,21 @@ export interface VerifyResult {
   errors: string[];
 }
 
-// Walk the ledger from seq=1 forward and recompute every hash. Stops collecting
-// errors after `maxErrors` for bounded memory. Used both at startup and via
-// GET /admin/ledger/verify.
-export async function verifyChain(maxErrors = 50): Promise<VerifyResult> {
+// Walk the ledger from `startSeq` forward, seeded with `seedPrevHash`, and
+// recompute every hash. Stops collecting errors after `maxErrors` for bounded
+// memory. Shared by full-chain and windowed verifies.
+async function walkFrom(
+  startSeq: number,
+  seedPrevHash: string,
+  maxErrors: number,
+): Promise<VerifyResult> {
   const errors: string[] = [];
-  let prevHash = GENESIS_PREV_HASH;
+  let prevHash = seedPrevHash;
   let walked = 0;
-  let headSeq = 0;
-  let headHash = GENESIS_PREV_HASH;
+  let headSeq = startSeq > 1 ? startSeq - 1 : 0;
+  let headHash = seedPrevHash;
   const batchSize = 500;
-  let lastSeq = 0;
+  let lastSeq = startSeq - 1;
   // Loop in batches so verifying a large ledger doesn't OOM.
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -147,4 +151,56 @@ export async function verifyChain(maxErrors = 50): Promise<VerifyResult> {
     head_hash: headHash,
     errors,
   };
+}
+
+// Walk the entire ledger from seq=1. Used at startup, via
+// GET /admin/ledger/verify, and by the periodic full-chain check (§23.2).
+export async function verifyChain(maxErrors = 50): Promise<VerifyResult> {
+  return walkFrom(1, GENESIS_PREV_HASH, maxErrors);
+}
+
+// Walk the ledger starting at the first row with ts >= sinceTs, seeded with
+// the hash of the immediately-prior row (so the window's prev_hash linkage
+// is itself verified). Used by the rolling 24h chain-verifier (§23.2 / §25).
+// If no rows fall in the window, returns ok with walked=0.
+export async function verifyChainSince(
+  sinceTs: Date,
+  maxErrors = 50,
+): Promise<VerifyResult> {
+  const [first] = await db
+    .select({ seq: ledgerEntriesTable.seq })
+    .from(ledgerEntriesTable)
+    .where(gte(ledgerEntriesTable.ts, sinceTs))
+    .orderBy(asc(ledgerEntriesTable.seq))
+    .limit(1);
+  if (!first) {
+    return {
+      ok: true,
+      walked: 0,
+      head_seq: 0,
+      head_hash: GENESIS_PREV_HASH,
+      errors: [],
+    };
+  }
+  // Seed prevHash from the immediately preceding *existing* row, not
+  // `first.seq - 1` — Postgres `bigserial` may have legitimate gaps from
+  // rollbacks / cache loss / crash recovery, and a gap is not corruption.
+  // If no prior row exists at all, `first` is the genesis-window row and
+  // GENESIS_PREV_HASH is the correct seed.
+  let seedPrev = GENESIS_PREV_HASH;
+  let startSeq = first.seq;
+  const [prior] = await db
+    .select({ seq: ledgerEntriesTable.seq, hash: ledgerEntriesTable.hash })
+    .from(ledgerEntriesTable)
+    .where(lt(ledgerEntriesTable.seq, first.seq))
+    .orderBy(desc(ledgerEntriesTable.seq))
+    .limit(1);
+  if (prior) {
+    seedPrev = prior.hash;
+    // walkFrom will pick up rows with seq > prior.seq — which is correct
+    // for non-contiguous sequences (the gap is benign, the chain is still
+    // linked by prev_hash → hash regardless of seq numbering).
+    startSeq = prior.seq + 1;
+  }
+  return walkFrom(startSeq, seedPrev, maxErrors);
 }

@@ -2,6 +2,7 @@ import app from "./app";
 import { logger } from "./lib/logger";
 import { bootstrap } from "@workspace/db";
 import { verifyChain } from "./lib/ledger";
+import { startChainVerifier } from "./lib/chain-verifier";
 import { backfillEmbeddings } from "./lib/search";
 import { initEmbedderFromEnv } from "./lib/embedder-config";
 
@@ -53,6 +54,11 @@ async function main(): Promise<void> {
     logger.error({ errors: v.errors }, "Ledger chain INVALID — refusing to start");
     process.exit(2);
   }
+
+  // Step 3 (M1.8): start the periodic chain verifier — hourly 24h-window
+  // walk + weekly full walk. On mismatch it appends `ledger.chain_invalid`
+  // whose post-commit alert hook routes via §25. See ARCHITECTURE.md §23.2.
+  startChainVerifier();
 
   app.listen(port, (err) => {
     if (err) {

@@ -1011,7 +1011,7 @@ Three properties fall out of binding alerts to ledger events:
 | `break_glass.approval_denied_self_approval` | critical | Insider-threat signal — an analyst tried to approve their own critical-finding grant. Rule blocked the disclosure but the attempt is the alert. M1.7. |
 | `policy.text_field_rejected` | high | Analyst typed PHI/secrets/canary into a justification, approval note, or step-up reason. Carelessness vs hostility is indistinguishable on a single event; pattern detection lives downstream. M1.7.1. |
 | `break_glass.raw_phi_accessed` | warning | Every raw-PHI read. Legitimate by design; warning-level so the alert stream is greppable for "who looked at PHI in the last 24h" without DB access. Anomaly detection (off-hours, new IP, first-time-for-user) is downstream. M1.6. |
-| `ledger.chain_invalid` | critical | Periodic chain-walk verifier found a mismatch. Integrity claim is dead until resolved. §23.2. |
+| `ledger.chain_invalid` | critical | Periodic chain-walk verifier found a mismatch (hourly rolling-24h walk + weekly full walk, `lib/chain-verifier.ts`). Integrity claim is dead until resolved. §23.2. M1.8. |
 | `auth.step_up_failed` ≥ 3 / 5 min same actor | high | Single typo is noise; a burst is anti-brute-force. Threshold evaluated in-process for the dev/single-instance deployment; replaced by Redis or a streaming aggregator (Flink / Materialize) in multi-instance prod. |
 | Future: notarization checkpoint missing > 25h | critical | §23.2 + §259. Owned by the notarization job, not the API. Listed here so the alerting surface is single-sourced. |
 | Future: per-tenant LLM cost > daily budget × 0.8 | warning | §23.15. Owned by the cost circuit breaker. |
@@ -1030,10 +1030,19 @@ Severities map 1:1 to PagerDuty Events API v2 (`critical` / `error` ≈ "high" /
 
 Any PR that adds a new event type to `appendLedger` MUST do one of:
 
-1. **Add a row to §25.2 + an entry in `ALERT_RULES`** with severity + rationale; OR
-2. **Annotate the call site** with `// not-alertable: <reason>` (e.g. `auth.login_success` — high-volume, no security signal).
+1. **Add a row to §25.2 + an entry in `ALERT_RULES`** in `lib/alerts.ts` with severity + rationale; OR
+2. **Add the event type to `NOT_ALERTABLE`** in `lib/alerts.ts` with a one-line comment explaining why it is legitimate-flow (e.g. `chat.user_turn` — per-request, too high-volume to page on, auditable via the ledger).
 
-Both paths are accepted by code review; what is *not* accepted is a new event type with no documented alerting decision. The review surface is intentionally on event-type creation, not on every endpoint, because most endpoints emit zero or one event type.
+Both paths are accepted; what is *not* accepted is a new event type with no documented alerting decision.
+
+This rule is enforced mechanically by `event-type-coverage.test.ts` (M1.7.3):
+
+- It scans `artifacts/api-server/src/` and `lib/db/src/` for `eventType:` properties (literal, ternary, and multi-line forms) and asserts every emitted event type is in `ALERT_RULES` ∪ `NOT_ALERTABLE`.
+- It asserts `ALERT_RULES` ∩ `NOT_ALERTABLE` is empty.
+- It asserts no dead entries in either set (every documented event is actually emitted somewhere). `ledger.chain_invalid` is allow-listed as a known-future entry until the periodic chain-walk verifier lands (TODO M1.8); `auth.step_up_failed.threshold` is allow-listed as a synthetic alerter-only event (never persisted).
+- Drizzle schema files are excluded from the scan to avoid matching `text("event_type")` column definitions.
+
+Known scanner limitations (intentional — keep the codebase to this style or migrate the scanner to a ts-morph AST walk over `appendLedger({ eventType: ... })` call sites): single-quoted strings, template literals (`` ` `` ), const references, helper indirection, and a `eventType` field rename all bypass the regex. The first PR to need any of those should migrate the scanner; until then the regex is materially cheaper than the AST walk.
 
 ### 25.5 Alert fatigue, suppression, and dev guards
 

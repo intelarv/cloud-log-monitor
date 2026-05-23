@@ -132,10 +132,9 @@ describe("§25.4: ledger event-type alert coverage", () => {
     );
   });
 
-  // `ledger.chain_invalid` is reserved for a future periodic verifier
-  // (see ALERT_RULES comment in alerts.ts). Allow as a known-future entry
-  // until the verifier lands. TODO(M1.8): remove once the verifier emits it.
-  const FUTURE: ReadonlySet<string> = new Set(["ledger.chain_invalid"]);
+  // No outstanding future-entries. (M1.8 wired `ledger.chain_invalid` to
+  // an actual emitter — `lib/chain-verifier.ts` — so it is now live.)
+  const FUTURE: ReadonlySet<string> = new Set();
 
   it("every ALERT_RULES entry is actually emitted somewhere (no dead rules)", () => {
     // A rule for an event that no code emits is a docs lie — flag it so

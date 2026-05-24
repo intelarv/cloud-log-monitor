@@ -7,10 +7,13 @@ See docs/ARCHITECTURE.md §24 for scope.
 
  * OpenAPI spec version: 0.1.0
  */
+import type { FindingAgentReviewStatus } from './findingAgentReviewStatus';
 import type { FindingClassification } from './findingClassification';
 import type { FindingSeverity } from './findingSeverity';
 import type { FindingStatus } from './findingStatus';
 import type { RedactedEvidence } from './redactedEvidence';
+import type { TriageVerdict } from './triageVerdict';
+import type { VerifierVerdict } from './verifierVerdict';
 
 export interface Finding {
   id: string;
@@ -27,4 +30,8 @@ export interface Finding {
   first_seen_at: Date;
   last_seen_at: Date;
   occurrence_count: number;
+  agent_review_status?: FindingAgentReviewStatus;
+  triage_verdict?: null | TriageVerdict;
+  verifier_verdict?: null | VerifierVerdict;
+  last_agent_review_at?: null | Date;
 }

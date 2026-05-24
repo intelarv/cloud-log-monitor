@@ -8,6 +8,7 @@ import {
   type LedgerEntry,
 } from "@workspace/db";
 import { maybeEmitAlertFromLedger } from "./alerts";
+import { maybeEnqueueReviewFromLedger } from "./agents/supervisor";
 
 // Single arbitrary 64-bit key for the ledger writer advisory lock. Only one
 // process can hold this lock at a time; serializes all ledger writes across
@@ -75,6 +76,14 @@ export async function appendLedger(
       maybeEmitAlertFromLedger(row);
     } catch {
       // Alerting is best-effort; the ledger row is already durable.
+    }
+    // M5: post-commit fan-out to the multi-agent supervisor on
+    // `finding.created`. Fire-and-forget — the supervisor's own work is
+    // queued + bounded; a slow LLM cannot block ledger writes.
+    try {
+      maybeEnqueueReviewFromLedger(row);
+    } catch {
+      // Same best-effort guarantee as alerting; the ledger row is durable.
     }
     return row;
   });

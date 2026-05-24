@@ -67,6 +67,17 @@ export const FindingStatus = {
   false_positive: 'false_positive',
 } as const;
 
+export type FindingAgentReviewStatus = typeof FindingAgentReviewStatus[keyof typeof FindingAgentReviewStatus];
+
+
+export const FindingAgentReviewStatus = {
+  pending: 'pending',
+  in_progress: 'in_progress',
+  completed: 'completed',
+  failed: 'failed',
+  skipped: 'skipped',
+} as const;
+
 export type RedactedEvidenceTrust = typeof RedactedEvidenceTrust[keyof typeof RedactedEvidenceTrust];
 
 
@@ -80,6 +91,51 @@ export interface RedactedEvidence {
   redactions: string[];
   truncated: boolean;
   trust?: RedactedEvidenceTrust;
+}
+
+export type TriageVerdictRecommendedSeverity = typeof TriageVerdictRecommendedSeverity[keyof typeof TriageVerdictRecommendedSeverity];
+
+
+export const TriageVerdictRecommendedSeverity = {
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  critical: 'critical',
+} as const;
+
+export type TriageVerdictRecommendedAction = typeof TriageVerdictRecommendedAction[keyof typeof TriageVerdictRecommendedAction];
+
+
+export const TriageVerdictRecommendedAction = {
+  page_oncall: 'page_oncall',
+  open_ticket: 'open_ticket',
+  human_review: 'human_review',
+  auto_resolve: 'auto_resolve',
+} as const;
+
+export interface TriageVerdict {
+  recommended_severity: TriageVerdictRecommendedSeverity;
+  recommended_action: TriageVerdictRecommendedAction;
+  rationale: string;
+  confidence: number;
+  prompt_injection_suspected: boolean;
+}
+
+export type VerifierVerdictVerdict = typeof VerifierVerdictVerdict[keyof typeof VerifierVerdictVerdict];
+
+
+export const VerifierVerdictVerdict = {
+  true_positive: 'true_positive',
+  likely_false_positive: 'likely_false_positive',
+  needs_human_review: 'needs_human_review',
+} as const;
+
+export interface VerifierVerdict {
+  verdict: VerifierVerdictVerdict;
+  rationale: string;
+  confidence: number;
+  prompt_injection_suspected: boolean;
+  agrees_with_triage: boolean;
 }
 
 export interface Finding {
@@ -97,6 +153,10 @@ export interface Finding {
   first_seen_at: string;
   last_seen_at: string;
   occurrence_count: number;
+  agent_review_status?: FindingAgentReviewStatus;
+  triage_verdict?: null | TriageVerdict;
+  verifier_verdict?: null | VerifierVerdict;
+  last_agent_review_at?: null | string;
 }
 
 export interface ChatSession {

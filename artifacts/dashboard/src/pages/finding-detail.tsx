@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink } from "lucide-react";
+import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle } from "lucide-react";
 import { format } from "date-fns";
 import BreakGlassModal from "../components/break-glass-modal";
 import { ApiError } from "@workspace/api-client-react";
@@ -207,6 +207,8 @@ export default function FindingDetail() {
               </CardContent>
             </Card>
             
+            <AgentReviewCard finding={finding} />
+
             <Card>
               <CardHeader>
                 <CardTitle>Agent Triage</CardTitle>
@@ -240,3 +242,109 @@ export default function FindingDetail() {
 
 // Temporary to make it compile until we create MessageSquare properly
 import { MessageSquare } from "lucide-react";
+
+// ---------------------------------------------------------------------------
+// M5: Multi-agent supervisor verdict card. Shows the Triage + Verifier
+// verdicts that the in-process supervisor produced post-ingest, plus the
+// review status (pending / in_progress / completed / failed / skipped). The
+// rationale text shown here has already been PHI-scanned by the supervisor
+// before persist — if PHI was detected in agent output, the supervisor
+// replaces the rationale with `<REDACTED: ...>` and ledgers
+// `agent.output_phi_detected`.
+// ---------------------------------------------------------------------------
+
+interface AgentReviewCardProps {
+  finding: {
+    agent_review_status?: string;
+    triage_verdict?: unknown;
+    verifier_verdict?: unknown;
+    last_agent_review_at?: string | null;
+  };
+}
+
+function statusBadge(status: string | undefined) {
+  switch (status) {
+    case "completed":
+      return <Badge className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20"><CheckCircle2 className="h-3 w-3 mr-1" /> Reviewed</Badge>;
+    case "in_progress":
+      return <Badge variant="secondary"><Clock className="h-3 w-3 mr-1" /> In Progress</Badge>;
+    case "pending":
+      return <Badge variant="secondary"><Clock className="h-3 w-3 mr-1" /> Pending</Badge>;
+    case "failed":
+      return <Badge variant="destructive"><XCircle className="h-3 w-3 mr-1" /> Failed</Badge>;
+    case "skipped":
+      return <Badge variant="outline"><HelpCircle className="h-3 w-3 mr-1" /> Skipped (budget)</Badge>;
+    default:
+      return <Badge variant="outline">{status ?? "unknown"}</Badge>;
+  }
+}
+
+function AgentReviewCard({ finding }: AgentReviewCardProps) {
+  const triage = finding.triage_verdict as null | {
+    recommended_severity: string;
+    recommended_action: string;
+    rationale: string;
+    confidence: number;
+    prompt_injection_suspected: boolean;
+  };
+  const verifier = finding.verifier_verdict as null | {
+    verdict: string;
+    rationale: string;
+    confidence: number;
+    prompt_injection_suspected: boolean;
+    agrees_with_triage: boolean;
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2"><Bot className="h-4 w-4" /> Agent Review</CardTitle>
+          {statusBadge(finding.agent_review_status)}
+        </div>
+        {finding.last_agent_review_at && (
+          <CardDescription className="text-xs">
+            {format(new Date(finding.last_agent_review_at), "yyyy-MM-dd HH:mm:ss")}
+          </CardDescription>
+        )}
+      </CardHeader>
+      <CardContent className="space-y-4 text-sm">
+        {triage ? (
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="text-xs uppercase tracking-wide text-muted-foreground">Triage</span>
+              <Badge variant="outline" className="font-mono text-xs">{triage.recommended_severity}</Badge>
+              <Badge variant="secondary" className="font-mono text-xs">{triage.recommended_action}</Badge>
+              <span className="text-xs text-muted-foreground ml-auto">conf {triage.confidence.toFixed(2)}</span>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">{triage.rationale}</p>
+            {triage.prompt_injection_suspected && (
+              <Badge variant="destructive" className="text-xs"><ShieldAlert className="h-3 w-3 mr-1" /> Prompt injection suspected</Badge>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">No triage verdict yet.</p>
+        )}
+
+        {verifier ? (
+          <div className="space-y-1.5 pt-2 border-t">
+            <div className="flex items-center gap-2">
+              <span className="text-xs uppercase tracking-wide text-muted-foreground">Verifier</span>
+              <Badge variant="outline" className="font-mono text-xs">{verifier.verdict}</Badge>
+              <Badge variant={verifier.agrees_with_triage ? "secondary" : "destructive"} className="text-xs">
+                {verifier.agrees_with_triage ? "agrees" : "disagrees"}
+              </Badge>
+              <span className="text-xs text-muted-foreground ml-auto">conf {verifier.confidence.toFixed(2)}</span>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">{verifier.rationale}</p>
+            {verifier.prompt_injection_suspected && (
+              <Badge variant="destructive" className="text-xs"><ShieldAlert className="h-3 w-3 mr-1" /> Prompt injection suspected</Badge>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">No verifier verdict yet.</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

@@ -554,6 +554,48 @@ components:
         first_seen_at: { type: string, format: date-time }
         last_seen_at: { type: string, format: date-time }
         occurrence_count: { type: integer }
+        agent_review_status:
+          type: string
+          enum: [pending, in_progress, completed, failed, skipped]
+        triage_verdict:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/TriageVerdict"
+        verifier_verdict:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/VerifierVerdict"
+        last_agent_review_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+
+    TriageVerdict:
+      type: object
+      required: [recommended_severity, recommended_action, rationale, confidence, prompt_injection_suspected]
+      properties:
+        recommended_severity:
+          type: string
+          enum: [low, medium, high, critical]
+        recommended_action:
+          type: string
+          enum: [page_oncall, open_ticket, human_review, auto_resolve]
+        rationale: { type: string }
+        confidence: { type: number }
+        prompt_injection_suspected: { type: boolean }
+
+    VerifierVerdict:
+      type: object
+      required: [verdict, rationale, confidence, prompt_injection_suspected, agrees_with_triage]
+      properties:
+        verdict:
+          type: string
+          enum: [true_positive, likely_false_positive, needs_human_review]
+        rationale: { type: string }
+        confidence: { type: number }
+        prompt_injection_suspected: { type: boolean }
+        agrees_with_triage: { type: boolean }
 
     RedactedEvidence:
       type: object

@@ -82,7 +82,23 @@ export const ListFindingsResponseItem = zod.object({
   "detector_version": zod.string(),
   "first_seen_at": zod.coerce.date(),
   "last_seen_at": zod.coerce.date(),
-  "occurrence_count": zod.number()
+  "occurrence_count": zod.number(),
+  "agent_review_status": zod.enum(['pending', 'in_progress', 'completed', 'failed', 'skipped']).optional(),
+  "triage_verdict": zod.union([zod.null(),zod.object({
+  "recommended_severity": zod.enum(['low', 'medium', 'high', 'critical']),
+  "recommended_action": zod.enum(['page_oncall', 'open_ticket', 'human_review', 'auto_resolve']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean()
+})]).optional(),
+  "verifier_verdict": zod.union([zod.null(),zod.object({
+  "verdict": zod.enum(['true_positive', 'likely_false_positive', 'needs_human_review']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean(),
+  "agrees_with_triage": zod.boolean()
+})]).optional(),
+  "last_agent_review_at": zod.union([zod.null(),zod.coerce.date()]).optional()
 })
 export const ListFindingsResponse = zod.array(ListFindingsResponseItem)
 
@@ -114,7 +130,23 @@ export const GetFindingResponse = zod.object({
   "detector_version": zod.string(),
   "first_seen_at": zod.coerce.date(),
   "last_seen_at": zod.coerce.date(),
-  "occurrence_count": zod.number()
+  "occurrence_count": zod.number(),
+  "agent_review_status": zod.enum(['pending', 'in_progress', 'completed', 'failed', 'skipped']).optional(),
+  "triage_verdict": zod.union([zod.null(),zod.object({
+  "recommended_severity": zod.enum(['low', 'medium', 'high', 'critical']),
+  "recommended_action": zod.enum(['page_oncall', 'open_ticket', 'human_review', 'auto_resolve']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean()
+})]).optional(),
+  "verifier_verdict": zod.union([zod.null(),zod.object({
+  "verdict": zod.enum(['true_positive', 'likely_false_positive', 'needs_human_review']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean(),
+  "agrees_with_triage": zod.boolean()
+})]).optional(),
+  "last_agent_review_at": zod.union([zod.null(),zod.coerce.date()]).optional()
 })
 
 
@@ -463,7 +495,23 @@ export const InvokeGetFindingToolResponse = zod.object({
   "detector_version": zod.string(),
   "first_seen_at": zod.coerce.date(),
   "last_seen_at": zod.coerce.date(),
-  "occurrence_count": zod.number()
+  "occurrence_count": zod.number(),
+  "agent_review_status": zod.enum(['pending', 'in_progress', 'completed', 'failed', 'skipped']).optional(),
+  "triage_verdict": zod.union([zod.null(),zod.object({
+  "recommended_severity": zod.enum(['low', 'medium', 'high', 'critical']),
+  "recommended_action": zod.enum(['page_oncall', 'open_ticket', 'human_review', 'auto_resolve']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean()
+})]).optional(),
+  "verifier_verdict": zod.union([zod.null(),zod.object({
+  "verdict": zod.enum(['true_positive', 'likely_false_positive', 'needs_human_review']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean(),
+  "agrees_with_triage": zod.boolean()
+})]).optional(),
+  "last_agent_review_at": zod.union([zod.null(),zod.coerce.date()]).optional()
 })
 
 

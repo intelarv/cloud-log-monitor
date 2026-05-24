@@ -49,6 +49,21 @@ export const findingsTable = pgTable(
       .notNull()
       .defaultNow(),
     occurrenceCount: integer("occurrence_count").notNull().default(1),
+    // M5: multi-agent supervisor review state. The Supervisor enqueues a
+    // Triage → Verifier pass on every newly-created finding. CAS on
+    // `agentReviewStatus` is the idempotency gate so a finding is never
+    // double-reviewed even if `finding.created` fires twice.
+    //   pending      → not yet picked up
+    //   in_progress  → a supervisor worker is currently running it
+    //   completed    → both triage + verifier succeeded; verdicts populated
+    //   failed       → at least one specialist errored; verdicts may be partial
+    //   skipped      → cost-budget or operator opt-out; no LLM call made
+    agentReviewStatus: text("agent_review_status").notNull().default("pending"),
+    // Verdict shapes are documented in lib/agents/{triage,verifier}.ts.
+    // Both are nullable until the corresponding agent has run.
+    triageVerdict: jsonb("triage_verdict"),
+    verifierVerdict: jsonb("verifier_verdict"),
+    lastAgentReviewAt: timestamp("last_agent_review_at", { withTimezone: true }),
   },
   (t) => [
     index("findings_tenant_idx").on(t.tenantId),
@@ -81,6 +96,14 @@ export const findingSafeColumns = {
   firstSeenAt: findingsTable.firstSeenAt,
   lastSeenAt: findingsTable.lastSeenAt,
   occurrenceCount: findingsTable.occurrenceCount,
+  // M5: agent-review verdicts are safe to expose — agents only ever
+  // see redacted evidence, so verdict text/rationale cannot contain raw
+  // PHI by construction. Verifier output is additionally re-scanned
+  // before persist (see lib/agents/supervisor.ts) as defense-in-depth.
+  agentReviewStatus: findingsTable.agentReviewStatus,
+  triageVerdict: findingsTable.triageVerdict,
+  verifierVerdict: findingsTable.verifierVerdict,
+  lastAgentReviewAt: findingsTable.lastAgentReviewAt,
 } as const;
 
 // Matches `Finding` minus `rawEvidence`. Drizzle infers this from the

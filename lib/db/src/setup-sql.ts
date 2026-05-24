@@ -58,6 +58,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- threat_model.md §Info Disclosure.
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS raw_evidence jsonb;
 
+-- M5: multi-agent supervisor review state. Added idempotently so a DB
+-- seeded under earlier milestones upgrades cleanly. Existing rows default
+-- to 'pending' so the supervisor will eventually pick them up on the next
+-- finding.created event (or via a manual replay). NULL verdicts mean the
+-- specialist hasn't run yet; an empty {} would imply "ran and returned
+-- nothing", which is a different state we never want to conflate.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS agent_review_status text NOT NULL DEFAULT 'pending';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS triage_verdict jsonb;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verifier_verdict jsonb;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS last_agent_review_at timestamptz;
+
 -- M1.6: one-shot idempotent backfill of the canary row's raw_evidence so a
 -- DB seeded before M1.6 still demos the break-glass-read path. Targets
 -- exactly one well-known synthetic row (F-CANARY) and only fires when the

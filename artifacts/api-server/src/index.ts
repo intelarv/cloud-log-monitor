@@ -8,6 +8,7 @@ import { initEmbedderFromEnv } from "./lib/embedder-config";
 import { hasDedicatedNotarizationSecret } from "./lib/notarization";
 import { startIngestPipeline } from "./lib/ingest";
 import { logBus } from "./lib/log-bus";
+import { startAgentSupervisor } from "./lib/agents/supervisor";
 
 const rawPort = process.env["PORT"];
 if (!rawPort) {
@@ -81,6 +82,15 @@ async function main(): Promise<void> {
   // No source is auto-started; POST /api/admin/ingest/replay triggers
   // the static fixture source on demand.
   startIngestPipeline(logBus);
+
+  // Step 5 (M5): start the multi-agent supervisor. Wires the in-memory
+  // review queue and arms `maybeEnqueueReviewFromLedger` (already attached
+  // to appendLedger's post-commit hook in lib/ledger.ts). On every newly
+  // created finding the supervisor runs Triage → Verifier and persists
+  // verdicts; both steps ledger with full agent identity per
+  // ARCH §7 / §24. Cost is bounded by AGENT_DAILY_TOKEN_BUDGET; concurrency
+  // is bounded inside the supervisor module.
+  startAgentSupervisor();
 
   app.listen(port, (err) => {
     if (err) {

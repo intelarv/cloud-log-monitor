@@ -92,6 +92,19 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // misconfiguration, not attack; threshold/aggregation lives downstream
   // in the log shipper per §25.
   "ingest.malformed_record": "warning",
+  // M5: a specialist agent (Triage or Verifier) errored mid-run. Warning,
+  // not critical — the finding row itself is still in the ledger and the
+  // supervisor marked the row 'failed' so it's surfaced in the dashboard;
+  // operators replay after fixing root cause. Repeated failures are the
+  // signal worth paging on, detected downstream.
+  "agent.review_failed": "warning",
+  // M5: cost-budget circuit breaker tripped. Architect-flagged: threat_model
+  // §DoS ("LLM cost circuit breaker MUST emit an alert and MUST be ledgered")
+  // requires this to be alertable, not silent. Warning, not critical — a
+  // single skip is the breaker working as designed; sustained skips mean
+  // an upstream sender storm or a wrongly-tuned budget. Threshold/pattern
+  // detection lives downstream.
+  "agent.review_skipped_budget": "warning",
 } as const;
 
 /** Event types that are legitimately emitted at high volume or as part of a
@@ -127,6 +140,11 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // ledger and `GET /api/admin/ledger/checkpoints`. Mismatch is the event
   // worth paging on, not creation.
   "ledger.checkpoint_created",
+  // M5: per-finding agent review steps. High-volume on bulk replay
+  // (one of each per new finding); auditable in the ledger; the failure
+  // event (`agent.review_failed`, warning above) is the alertable one.
+  "agent.triage_complete",
+  "agent.verifier_complete",
 ]);
 
 /** In-memory rolling counters for threshold-based alerts.

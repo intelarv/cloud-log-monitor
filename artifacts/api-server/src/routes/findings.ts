@@ -23,6 +23,12 @@ function toApi(row: Finding): unknown {
     first_seen_at: row.firstSeenAt.toISOString(),
     last_seen_at: row.lastSeenAt.toISOString(),
     occurrence_count: row.occurrenceCount,
+    agent_review_status: row.agentReviewStatus,
+    triage_verdict: row.triageVerdict ?? null,
+    verifier_verdict: row.verifierVerdict ?? null,
+    last_agent_review_at: row.lastAgentReviewAt
+      ? row.lastAgentReviewAt.toISOString()
+      : null,
   };
 }
 

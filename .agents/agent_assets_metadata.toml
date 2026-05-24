@@ -48,3 +48,15 @@ id = "4fy2kLhoaCUYAI6ObBF3Y"
 uri = "file://exports/phia-20260523-202057.zip"
 type = "unspecified"
 title = "phia (M1.9 — verifier leader-lock + dedupe + integration tests, 122 tests)"
+
+[[outputs]]
+id = "S5bwIAQnMk8e7G6ocnkf1"
+uri = "file://dist/phi-audit-m4.tar.gz"
+type = "unspecified"
+title = "PHI Audit — M4 snapshot (source archive)"
+
+[[outputs]]
+id = "cltxfneRpaHQc6Pks8Iyl"
+uri = "file://dist/phi-audit-m5.tar.gz"
+type = "unspecified"
+title = "PHI Audit — M5 source (multi-agent supervisor)"

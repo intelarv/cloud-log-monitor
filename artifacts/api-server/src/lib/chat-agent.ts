@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { ai } from "@workspace/integrations-gemini-ai";
 import { findingsTable, findingSafeColumns, type FindingSafe } from "@workspace/db";
 type Finding = FindingSafe;
 import { and, eq, inArray, or, sql } from "drizzle-orm";
@@ -15,6 +14,11 @@ import {
 } from "./prompts";
 import type { PolicyViolation } from "./policy";
 import type { ToolName } from "./policy";
+import {
+  getLlmRuntime,
+  streamFromRuntime,
+  type LlmHistoryTurn,
+} from "./llm-runtime";
 
 // M1: the agent may chain up to two tool calls (typical pattern:
 // search_findings → get_finding). Bounded loop is what enforces the cap.
@@ -42,6 +46,10 @@ export interface ChatTurnResult {
   agent_identity: {
     agent: string;
     agent_version: string;
+    /** Effective model id returned by the LlmAgentRuntime — may differ from
+     *  the prompt-pinned CHAT_AGENT_MODEL when a cloud provider overrode
+     *  with its operator-configured LLM_DEFAULT_MODEL. Per threat_model
+     *  §Repudiation, the ledger records what was actually called. */
     model_id: string;
     prompt_hash: string;
     tool_versions: string[];
@@ -179,28 +187,32 @@ function extractCitations(text: string): string[] {
   return Array.from(set);
 }
 
-async function callGemini(
-  contents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }>,
+/** Drains an LlmAgentRuntime stream into a single buffered string plus the
+ *  effective model id from the final `done` chunk. Optionally forwards
+ *  `text` chunks to `onDelta` for SSE. */
+async function callLlm(
+  history: LlmHistoryTurn[],
+  userPrompt: string,
   onDelta?: (delta: string) => void,
-): Promise<string> {
-  const stream = await ai.models.generateContentStream({
-    model: CHAT_AGENT_MODEL,
-    contents,
-    config: {
-      systemInstruction: CHAT_AGENT_SYSTEM_PROMPT,
-      maxOutputTokens: 1024,
-      temperature: 0.2,
-    },
-  });
+): Promise<{ text: string; modelId: string }> {
   let full = "";
-  for await (const chunk of stream) {
-    const t = chunk.text;
-    if (t) {
-      full += t;
-      onDelta?.(t);
+  let modelId = CHAT_AGENT_MODEL;
+  const runtime = getLlmRuntime();
+  for await (const chunk of streamFromRuntime(runtime, {
+    systemPrompt: CHAT_AGENT_SYSTEM_PROMPT,
+    history,
+    userPrompt,
+    modelId: CHAT_AGENT_MODEL,
+    temperature: 0.2,
+    maxOutputTokens: 1024,
+  })) {
+    if (chunk.text) {
+      full += chunk.text;
+      onDelta?.(chunk.text);
     }
+    if (chunk.done) modelId = chunk.done.modelId;
   }
-  return full;
+  return { text: full, modelId };
 }
 
 export async function runChatTurn(
@@ -280,26 +292,40 @@ ${opts.userQuestion}
 
 Respond per the system instructions.`;
 
-  const contents: Array<{
-    role: "user" | "model";
-    parts: Array<{ text: string }>;
-  }> = [{ role: "user", parts: [{ text: initialPrompt }] }];
+  // Multi-turn conversation: `history` accumulates prior turns (model
+  // responses + tool-result user messages); `nextUserPrompt` is the last
+  // user message that the runtime should respond to.
+  const history: LlmHistoryTurn[] = [];
+  let nextUserPrompt = initialPrompt;
 
   const toolCalls: ChatTurnResult["tool_calls"] = [];
   let toolBudget = MAX_TOOL_CALLS;
   let finalText = "";
+  // Track the effective model id across turns so the ledger records what
+  // actually serviced the FINAL response. Cloud runtimes may override the
+  // prompt-pinned CHAT_AGENT_MODEL with operator-configured LLM_DEFAULT_MODEL.
+  let effectiveModelId = CHAT_AGENT_MODEL;
 
   // Loop: call model -> if tool_call, execute -> feed back -> call model
   // again. Bounded by MAX_TOOL_CALLS.
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    // Important: we only stream deltas once we know this turn is NOT a tool
-    // call. To keep things simple, we buffer the first response, decide,
-    // and stream the second (final) response.
-    const text = await callGemini(
-      contents,
-      toolBudget === 0 ? opts.onDelta : undefined,
-    );
+    // We only stream deltas once we know this turn is NOT a tool call —
+    // when the budget is spent OR when this is the final turn. To keep
+    // things simple, the in-loop call buffers (no onDelta), then if it's
+    // the final, we re-emit by passing onDelta below. Cleaner: stream
+    // always, but buffer; if it parses as a tool call, drop the deltas
+    // (the SSE consumer never saw a partial JSON envelope because we
+    // gate the user-visible callback on the parse result after the
+    // stream completes).
+    //
+    // Streaming choice here: ALWAYS stream from the runtime (so cloud
+    // providers don't pay an extra blocking round-trip), but only
+    // forward to `opts.onDelta` once we've confirmed this turn is not
+    // a tool-call JSON envelope.
+    const buffered = await callLlm(history, nextUserPrompt);
+    effectiveModelId = buffered.modelId;
+    const text = buffered.text;
     const call = extractToolCall(text);
     if (call && toolBudget > 0) {
       toolBudget -= 1;
@@ -338,25 +364,30 @@ Respond per the system instructions.`;
           error: result.error,
         });
       }
-      // Feed result back to the model.
-      contents.push({ role: "model", parts: [{ text }] });
-      contents.push({
-        role: "user",
-        parts: [
-          {
-            text: `<TOOL_RESULT name="${call.name}" ok="${result.ok}">
+      // Append the FULL prior turn into history before swapping in the
+      // tool-result prompt. Order matters: the original user prompt
+      // (carrying <AVAILABLE_FINDINGS> + <USER_QUESTION>) must remain
+      // visible to the next model call, otherwise the post-tool turn
+      // sees only the model's tool-call envelope and the tool result —
+      // not the question that triggered them. Earlier draft only pushed
+      // the model envelope and silently dropped the user context;
+      // architect review caught it before merge.
+      history.push({ role: "user", text: nextUserPrompt });
+      history.push({ role: "model", text });
+      nextUserPrompt = `<TOOL_RESULT name="${call.name}" ok="${result.ok}">
 ${JSON.stringify(result.ok ? result.result : { error: result.error })}
 </TOOL_RESULT>
 
-Now produce your final answer per the system instructions.`,
-          },
-        ],
-      });
+Now produce your final answer per the system instructions.`;
       continue;
     }
+    // Not a tool call (or budget spent). If we have an onDelta callback
+    // and the text isn't empty, replay it as a single delta so the SSE
+    // consumer sees the full message. (The runtime already streamed it
+    // to us internally; we just didn't forward chunks during buffering
+    // because we didn't yet know whether this turn was a tool call.)
+    if (opts.onDelta && text) opts.onDelta(text);
     finalText = text;
-    // If the model emitted a tool_call but the budget is spent, surface as
-    // plain text — don't execute. Cap loop here.
     break;
   }
 
@@ -369,7 +400,7 @@ Now produce your final answer per the system instructions.`,
     agent_identity: {
       agent: "chat",
       agent_version: CHAT_AGENT_VERSION,
-      model_id: CHAT_AGENT_MODEL,
+      model_id: effectiveModelId,
       prompt_hash: promptHash(),
       tool_versions: toolRegistry
         .list()

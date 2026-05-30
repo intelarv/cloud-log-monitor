@@ -32,11 +32,14 @@ export interface VerifierAgentIdentity {
   prompt_hash: string;
 }
 
-export function verifierAgentIdentity(): VerifierAgentIdentity {
+/** See `triageAgentIdentity` doc — `modelId` defaults to the prompt-constant
+ *  but the supervisor passes the effective id from `LlmGenerateResult` so
+ *  the audit ledger records what actually ran. */
+export function verifierAgentIdentity(modelId: string = VERIFIER_AGENT_MODEL): VerifierAgentIdentity {
   return {
     agent: "verifier",
     agent_version: VERIFIER_AGENT_VERSION,
-    model_id: VERIFIER_AGENT_MODEL,
+    model_id: modelId,
     prompt_hash: verifierPromptHash(),
   };
 }
@@ -63,7 +66,7 @@ export async function runVerifierAgent(
   finding: FindingSafe,
   triage: TriageVerdict,
   runtime: LlmAgentRuntime = getLlmRuntime(),
-): Promise<{ verdict: VerifierVerdict; approxOutputTokens: number }> {
+): Promise<{ verdict: VerifierVerdict; approxOutputTokens: number; modelId: string }> {
   const userPrompt = buildUserPrompt(finding, triage);
   const out = await runtime.generate({
     systemPrompt: VERIFIER_AGENT_SYSTEM_PROMPT,
@@ -73,5 +76,5 @@ export async function runVerifierAgent(
     maxOutputTokens: 512,
   });
   const verdict = parseStrictJson(out.text, verifierVerdictSchema);
-  return { verdict, approxOutputTokens: out.approxOutputTokens };
+  return { verdict, approxOutputTokens: out.approxOutputTokens, modelId: out.modelId };
 }

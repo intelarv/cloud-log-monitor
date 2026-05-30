@@ -170,11 +170,21 @@ describe("notarization — DB integration", () => {
   it("is idempotent: second call with unchanged head is skipped", async () => {
     // First call (may create or skip depending on prior test state).
     await createCheckpoint();
-    // Second call with no intervening ledger writes → must skip.
-    const second = await createCheckpoint();
-    expect(second.kind).toBe("skipped");
-    if (second.kind === "skipped") {
-      expect(second.reason).toBe("head_unchanged");
+    // M1.9 gotcha: other test files share this DB and may append ledger
+    // rows between our two calls, so the second call may itself "create"
+    // a new checkpoint at the advanced head. The invariant we actually
+    // need is: a call that observes no head change returns "skipped".
+    // So loop up to a few times until we get two back-to-back calls
+    // with no intervening write, and assert the second is skipped.
+    let lastSkip: Awaited<ReturnType<typeof createCheckpoint>> | null = null;
+    for (let i = 0; i < 5 && !lastSkip; i++) {
+      await createCheckpoint();
+      const r = await createCheckpoint();
+      if (r.kind === "skipped") lastSkip = r;
+    }
+    expect(lastSkip?.kind).toBe("skipped");
+    if (lastSkip?.kind === "skipped") {
+      expect(lastSkip.reason).toBe("head_unchanged");
     }
   });
 

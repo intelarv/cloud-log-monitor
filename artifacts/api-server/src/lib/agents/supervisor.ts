@@ -281,7 +281,7 @@ async function reviewOne(job: ReviewJob): Promise<void> {
             finding_id: findingId,
             stage: "triage",
             detectors: Array.from(new Set(hits.map((h) => h.detector))),
-            agent_identity: triageAgentIdentity(),
+            agent_identity: triageAgentIdentity(t.modelId),
           },
         });
         triage = { ...triage, rationale: "<REDACTED: agent output contained PHI/secrets>" };
@@ -296,7 +296,7 @@ async function reviewOne(job: ReviewJob): Promise<void> {
       subjectId: findingId,
       payload: {
         finding_id: findingId,
-        agent_identity: triageAgentIdentity(),
+        agent_identity: triageAgentIdentity(t.modelId),
         verdict: triage,
         approx_output_tokens: t.approxOutputTokens,
       },
@@ -347,7 +347,7 @@ async function reviewOne(job: ReviewJob): Promise<void> {
             finding_id: findingId,
             stage: "verifier",
             detectors: Array.from(new Set(hits.map((h) => h.detector))),
-            agent_identity: verifierAgentIdentity(),
+            agent_identity: verifierAgentIdentity(v.modelId),
           },
         });
         verifier = { ...verifier, rationale: "<REDACTED: agent output contained PHI/secrets>" };
@@ -362,7 +362,7 @@ async function reviewOne(job: ReviewJob): Promise<void> {
       subjectId: findingId,
       payload: {
         finding_id: findingId,
-        agent_identity: verifierAgentIdentity(),
+        agent_identity: verifierAgentIdentity(v.modelId),
         verdict: verifier,
         approx_output_tokens: v.approxOutputTokens,
       },

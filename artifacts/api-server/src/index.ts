@@ -5,10 +5,13 @@ import { verifyChain } from "./lib/ledger";
 import { startChainVerifier } from "./lib/chain-verifier";
 import { backfillEmbeddings } from "./lib/search";
 import { initEmbedderFromEnv } from "./lib/embedder-config";
+import { initLlmRuntimeFromEnv } from "./lib/llm-runtime-config";
 import { hasDedicatedNotarizationSecret } from "./lib/notarization";
 import { startIngestPipeline } from "./lib/ingest";
 import { logBus } from "./lib/log-bus";
+import { buildCloudwatchSourceFromEnv } from "./lib/cloud-log-sources";
 import { startAgentSupervisor } from "./lib/agents/supervisor";
+import { buildChannelsFromEnv, initChannels } from "./lib/channels";
 
 const rawPort = process.env["PORT"];
 if (!rawPort) {
@@ -26,6 +29,13 @@ async function main(): Promise<void> {
   // bootstrap so the DB column dim matches what the embedder will produce.
   // See embedder-config.ts for precedence (EMBEDDING_PROVIDER > DEPLOYMENT_TARGET).
   const { config: embedderConfig } = initEmbedderFromEnv();
+
+  // Step 0.5: resolve the LLM agent runtime from env. Default is the Replit
+  // Gemini integration (dev/local); `aws` / `gcp` / `azure` deployment
+  // targets swap in Bedrock Converse / Vertex generateContent / Azure
+  // OpenAI Chat Completions respectively. PHI guard wraps every cloud
+  // provider. See llm-runtime-config.ts.
+  initLlmRuntimeFromEnv();
 
   // Step 1: idempotent DB setup (RLS policies + findings_redacted view).
   // Safe to run every boot; CREATE OR REPLACE / DROP IF EXISTS make it so.
@@ -83,6 +93,23 @@ async function main(): Promise<void> {
   // the static fixture source on demand.
   startIngestPipeline(logBus);
 
+  // Step 4.5 (M8): real cloud log source(s), env-driven. Inert by default —
+  // an operator opts in with `LOG_SOURCE=cloudwatch` + the required vars
+  // (CLOUDWATCH_TENANT_ID, CLOUDWATCH_LOG_GROUPS, AWS_REGION). When unset,
+  // `buildCloudwatchSourceFromEnv` returns null and we keep dev behavior:
+  // only the fixture replay endpoint produces records. Same lazy-load
+  // pattern as cloud-embedders — `@aws-sdk/client-cloudwatch-logs` is an
+  // optional dep that's only required when this branch fires.
+  const cloudwatchSource = buildCloudwatchSourceFromEnv((record) =>
+    logBus.publish("raw.logs", record),
+  );
+  if (cloudwatchSource) {
+    await cloudwatchSource.start();
+    logger.info({ source: cloudwatchSource.name }, "cloud log source started");
+  } else {
+    logger.info("no cloud log source configured (LOG_SOURCE unset)");
+  }
+
   // Step 5 (M5): start the multi-agent supervisor. Wires the in-memory
   // review queue and arms `maybeEnqueueReviewFromLedger` (already attached
   // to appendLedger's post-commit hook in lib/ledger.ts). On every newly
@@ -91,6 +118,17 @@ async function main(): Promise<void> {
   // ARCH §7 / §24. Cost is bounded by AGENT_DAILY_TOKEN_BUDGET; concurrency
   // is bounded inside the supervisor module.
   startAgentSupervisor();
+
+  // Step 6 (M6): wire notification channels (Slack incoming-webhook +
+  // generic HMAC-signed webhook). Adapter env is read here and validated
+  // by `buildChannelsFromEnv`; inert by default (dev/demo runs with no
+  // configured channels — alerts still go to structured stderr and the
+  // ledger). The post-commit hook in lib/ledger.ts is already wired to
+  // `dispatchAlertFromLedger`; `initChannels` only populates the
+  // adapter list it dispatches into. Threat_model §"Application ↔
+  // Channel Adapters" trust boundary + §Information Disclosure
+  // "Notification PHI guard" hard gate live inside the channels module.
+  initChannels(buildChannelsFromEnv());
 
   app.listen(port, (err) => {
     if (err) {

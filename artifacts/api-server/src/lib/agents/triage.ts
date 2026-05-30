@@ -35,11 +35,17 @@ export interface TriageAgentIdentity {
   prompt_hash: string;
 }
 
-export function triageAgentIdentity(): TriageAgentIdentity {
+/** Build the identity record for an agent ledger entry. `modelId` is the
+ *  *effective* model id reported by the runtime — when a cloud adapter
+ *  overrides the prompt-constant id with its operator-configured default
+ *  (e.g. Bedrock → Claude Haiku instead of the Gemini prompt constant),
+ *  the ledger reflects what actually ran, not what was requested. Per
+ *  threat_model §Repudiation / ARCH §24. */
+export function triageAgentIdentity(modelId: string = TRIAGE_AGENT_MODEL): TriageAgentIdentity {
   return {
     agent: "triage",
     agent_version: TRIAGE_AGENT_VERSION,
-    model_id: TRIAGE_AGENT_MODEL,
+    model_id: modelId,
     prompt_hash: triagePromptHash(),
   };
 }
@@ -65,7 +71,7 @@ Produce your JSON verdict per the system instructions.`;
 export async function runTriageAgent(
   finding: FindingSafe,
   runtime: LlmAgentRuntime = getLlmRuntime(),
-): Promise<{ verdict: TriageVerdict; approxOutputTokens: number }> {
+): Promise<{ verdict: TriageVerdict; approxOutputTokens: number; modelId: string }> {
   const userPrompt = buildUserPrompt(finding);
   const out = await runtime.generate({
     systemPrompt: TRIAGE_AGENT_SYSTEM_PROMPT,
@@ -75,7 +81,7 @@ export async function runTriageAgent(
     maxOutputTokens: 512,
   });
   const verdict = parseStrictJson(out.text, triageVerdictSchema);
-  return { verdict, approxOutputTokens: out.approxOutputTokens };
+  return { verdict, approxOutputTokens: out.approxOutputTokens, modelId: out.modelId };
 }
 
 // Strip common markdown fences the model occasionally emits despite the

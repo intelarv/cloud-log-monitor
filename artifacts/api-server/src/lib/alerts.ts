@@ -105,6 +105,35 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // an upstream sender storm or a wrongly-tuned budget. Threshold/pattern
   // detection lives downstream.
   "agent.review_skipped_budget": "warning",
+  // M6: outbound notification was blocked because the envelope rescan
+  // tripped the PHI detector. Critical — the envelope shape is already
+  // allow-listed metadata (no payload bodies), so a hit here means
+  // either (a) a future field addition let content leak through, or
+  // (b) a tenant id / subject id is itself classified PHI. Either way
+  // the channel system did its job by hard-failing the send, but the
+  // condition needs immediate triage. Threat_model §Information
+  // Disclosure "Notification PHI guard".
+  "channel.send_blocked_phi": "critical",
+  // M6: adapter returned non-2xx, timed out, or threw. Warning, not
+  // critical — a single Slack 429 or webhook 503 is noise; the failure
+  // event itself is auditable in the ledger and operators replay or
+  // re-route after pattern detection downstream. Loop-safe because
+  // `dispatchAlertFromLedger` filters `channel.*` event types at the
+  // top of the hook.
+  "channel.send_failed": "warning",
+  // M6: per-channel sliding-window rate limit tripped (default 30/min).
+  // Warning — usually a storm signal (chain-invalid flapping, ingest
+  // burst) that the operator wants visibility into without paging on
+  // every dropped notification.
+  "channel.send_throttled": "warning",
+  // M8: a pull-based log source (CloudWatch / Cloud Logging / Azure
+  // Monitor) failed to fetch a batch. Warning, not critical — transient
+  // upstream / credential / quota errors are expected and the adapter
+  // backs off and retries. Sustained failures or auth errors are the
+  // pageable pattern, detected downstream from the alert stream.
+  // Loop-safe because this event is emitted from the source loop, never
+  // from the alert dispatcher itself.
+  "ingest.source_error": "warning",
 } as const;
 
 /** Event types that are legitimately emitted at high volume or as part of a
@@ -145,6 +174,16 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // event (`agent.review_failed`, warning above) is the alertable one.
   "agent.triage_complete",
   "agent.verifier_complete",
+  // M6: every successful channel send is ledgered (per-access audit
+  // trail per threat_model §Repudiation), but high-volume — one row per
+  // outbound alert per channel. The failure / blocked / throttled
+  // events are the alertable ones above.
+  "channel.send_succeeded",
+  // M8: per-source lifecycle markers. One row each on start/stop is
+  // operationally useful in the ledger (proves a source was running
+  // during an investigation window) but routine — not pageable.
+  "ingest.source_started",
+  "ingest.source_stopped",
 ]);
 
 /** In-memory rolling counters for threshold-based alerts.

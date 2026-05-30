@@ -74,30 +74,11 @@ export class StaticFixtureLogSource implements LogSource {
   }
 }
 
-/** Interface stub for real CloudWatch Logs. M3 ships the contract only —
- *  the concrete implementation against `@aws-sdk/client-cloudwatch-logs`
- *  FilterLogEvents (paginated + checkpointed) lands post-M3 along with the
- *  Kafka-backed bus. Construction throws so accidental wiring in dev fails
- *  loudly instead of silently no-op'ing. Mirrors the lazy-load pattern in
- *  cloud-embedders.ts. */
-export class CloudwatchLogSourceStub implements LogSource {
-  readonly name: string;
-  constructor(opts: { tenantId: string; logGroup: string }) {
-    this.name = `cloudwatch:${opts.logGroup}`;
-    void opts.tenantId;
-    throw new Error(
-      "CloudwatchLogSourceStub is interface-only in M3. Implement against " +
-        "@aws-sdk/client-cloudwatch-logs FilterLogEvents (paginated, " +
-        "checkpointed) in a follow-up milestone.",
-    );
-  }
-  async start(): Promise<void> {
-    throw new Error("not implemented");
-  }
-  async stop(): Promise<void> {
-    /* no-op. */
-  }
-}
+// M8: real CloudWatch Logs adapter lives in `cloud-log-sources.ts` (lazy-
+// loaded SDK, same pattern as cloud-embedders.ts). Imported from there
+// rather than defined here so dev installs don't pay the SDK import cost
+// and so `log-source.ts` stays SDK-agnostic.
+export { CloudwatchLogSource } from "./cloud-log-sources";
 
 const TENANT = "default";
 

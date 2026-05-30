@@ -400,16 +400,16 @@ Each is a Temporal workflow with explicit compensations (e.g., reversing tokeniz
 
 ## 17. Build Sequencing (when greenlit)
 
-1. Define OpenAPI contract for the dashboard (findings, ledger, sources, automations, channels).
-2. Stand up ingest end-to-end for **one** log source: collector → Kafka → detectors → Postgres + object store. No agents yet.
-3. Build the dashboard against seeded findings (parallel with #2).
-4. Add Temporal + Supervisor + Triage/Verifier agents on a single log source.
-5. Add configurable channel router + first two adapters (Slack + webhook).
-6. Add Context + Remediation + Notifier agents; gate any code-touching action behind HITL.
-7. Add semantic memory (pgvector), consolidation jobs, importance-decay eviction.
-8. Add tiered storage lifecycle and quarterly hash-chain verification.
-9. Add break-glass workflow with step-up auth. *(Demo-scale slice landed in M1.6 — `POST /api/auth/step-up`, `POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`, per-access ledger events. M1.7 added the §18 two-person rule on critical grants: `POST /api/admin/break-glass/grants/:id/approve` requires a different user with fresh step-up; self-approval is refused and ledgered. Production still needs a real second-factor verifier (TOTP/WebAuthn/IdP).)*
-10. Harden: bulkheads, DLQs, circuit breakers, cost circuit breakers, policy guardrails.
+1. ✅ **Done (M0)** — OpenAPI contract for the dashboard (findings, ledger, sources, automations, channels).
+2. ✅ **Done (M3 + M8)** — Ingest end-to-end for one log source. M3 landed the `LogRecord`/`LogSource`/`LogBus` seams + `StaticFixtureLogSource` + detector → redact → fingerprint-upsert → ledger pipeline; M8 added the real `CloudwatchLogSource` (lazy-loaded `@aws-sdk/client-cloudwatch-logs`, durable cursor in `log_source_checkpoints`, contiguous-success-prefix watermark on partial failure, lifecycle ledgered). Production Kafka transport still deferred — current `InMemoryLogBus` satisfies the same `LogBus` shape and is replaceable.
+3. ✅ **Done (M4)** — Dashboard against seeded findings (React + Vite + shadcn; Findings, Finding detail, Chat, Ledger, Admin pages).
+4. ✅ **Done (M5, with Temporal deferred)** — Supervisor + Triage/Verifier agents. In-process orchestration + in-memory queue with CAS exactly-once; real Temporal workflows still deferred but the `LlmAgentRuntime` interface is in place.
+5. ✅ **Done (M6)** — Channel router + Slack incoming-webhook + generic HMAC-signed webhook adapters; five hard guarantees (PHI gate, self-recursion guard, rate limit, host allow-list, failure isolation).
+6. ⏳ **Not started (M9 candidate)** — Context + Remediation + Notifier agents; HITL gate on code-touching actions (proposals only, human-confirmed + ledgered).
+7. ⏳ **Partial** — pgvector + embedder factory shipped in M1.x; consolidation jobs + importance-decay eviction not yet built.
+8. ⏳ **Partial** — Periodic chain verifier (hourly rolling-24h + weekly full) shipped in M1.x + external HMAC notarization in M2; tiered storage lifecycle (hot → warm → WORM/Object Lock) not yet built.
+9. ✅ **Done (M1.6 + M1.7)** — Break-glass workflow with step-up auth. `POST /api/auth/step-up`, `POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`, per-access ledger events. M1.7 added the §18 two-person rule on critical grants: `POST /api/admin/break-glass/grants/:id/approve` requires a different user with fresh step-up; self-approval is refused and ledgered. Production still needs a real second-factor verifier (TOTP/WebAuthn/IdP) in place of `STEP_UP_DEV_TOKEN`.
+10. ⏳ **Partial** — Cost circuit breaker (M5 `AGENT_DAILY_TOKEN_BUDGET`), per-user rate limits (M1.x), event-type alerting (M1.x), alert dedupe (M1.x), channel rate limit (M6) are in. Still owed: bulkheads per log source (single in-process bus today), DLQ for permanently-failing ingest records, statement timeouts on expensive queries, broader policy guardrails (platform-side Bedrock Guardrails / Model Armor / Llama Guard).
 
 ---
 
@@ -952,20 +952,33 @@ The original M0 (one finding, one agent, one tool, Gemini, AG-UI events, three-p
 | Basic session auth (signed cookie) | ✓ | Even in dev — sets the precedent |
 | Canary token in seed data | ✓ | Eval-time check that no agent surfaces it |
 
-### 24.2 Explicit deferrals from M0
+### 24.2 Milestone status (was: "Explicit deferrals from M0")
 
-- pgvector + embeddings → **M1**
-- Multi-tool agent + retrieval merging → **M1**
-- `LlmAgentRuntime` abstraction with Bedrock/Vertex stubs → **M2**
-- A2A protocol → **M3**
-- Temporal workflows → **M4**
-- Verifier + tiered models → **M5**
-- Compliance Agent emitting findings → **M6**
-- Channel router + adapters → **M7**
-- HITL action path → **M8**
-- Real ingest → **M9**
-- DR, OpenSearch, tiered storage lifecycle, full eval harness → **M10**
-- External notarization of ledger checkpoints → **M10**
+Updated for actual delivery — original speculative ordering didn't survive contact with the work. See `replit.md` "Milestone history" for the as-shipped detail.
+
+**Shipped:**
+- pgvector + embeddings + cloud-aware embedder factory (Bedrock / Vertex / Azure OpenAI / TEI / dev featurehash) — **M1.x**
+- Multi-tool agent + hybrid (BM25 ∪ vector) retrieval w/ RRF fusion — **M1.x**
+- Step-up auth + break-glass raw-PHI view + two-person rule on critical grants — **M1.6 + M1.7**
+- Event-type-driven alerting + mechanical §25.4 coverage guard + periodic chain verifier — **M1.x**
+- External HMAC notarization of ledger checkpoints (was originally targeted M10) — **M2**
+- Real ingest pipeline (LogSource / LogBus interfaces, detector → redact → fingerprint-upsert → ledger) — **M3**
+- Analyst dashboard UI — **M4**
+- Supervisor + Triage + Verifier agents (in-process; Temporal still deferred) — **M5**
+- Channel router + Slack + HMAC-signed webhook adapters — **M6**
+- Real AWS CloudWatch Logs source (replaces stub; durable cursor; contiguous-success-prefix watermark) — **M8**
+
+**Still deferred (live items, not yet milestone-tagged):**
+- Real Temporal workflows + A2A protocol (today: in-process function calls)
+- ✅ **Cloud LLM adapters shipped** (model-call layer): `BedrockLlmRuntime` (Converse API), `VertexLlmRuntime` (generateContent), `AzureOpenAILlmRuntime` (Chat Completions), all PHI-guarded, lazy-loaded, env-selected via `LLM_PROVIDER` / `DEPLOYMENT_TARGET`. Still deferred: higher-level agent-builder runtimes (Bedrock AgentCore / Vertex AI Agent Builder reasoning engines) and AWS Strands wrapping — these sit *on top of* the Converse / generateContent APIs above, so the seam doesn't change.
+- GCP Cloud Logging + Azure Monitor source adapters (same shape as M8)
+- Context + Remediation + Notifier agents; HITL on code-touching actions
+- Semantic memory consolidation + importance-decay eviction
+- Tiered storage lifecycle (hot → warm → WORM/Object Lock)
+- Production hardening: per-source bulkheads, DLQs, statement timeouts, platform guardrails
+- OpenSearch (today: Postgres FTS)
+- Full eval harness; DR runbooks
+- Stuck `in_progress` reaper (supervisor + log-source cursors)
 
 ### 24.3 What M0 produces (demo)
 
@@ -1066,3 +1079,29 @@ Known scanner limitations (intentional — keep the codebase to this style or mi
 - `PROMPTS.md` — per-agent system prompts, tool allow-lists, guardrail config, prompt-change process.
 - `EVALS.md` — concrete gold sets and pass/fail thresholds for the 7 eval suites referenced in §23.5.
 - `CAPACITY.md` — Kafka partitions, Postgres roles/sizing, Temporal worker pools, pgvector strategy, LLM cost budgets, reliability targets.
+
+---
+
+## Appendix A. Implementation decisions log
+
+> Living record of the non-obvious "why" decisions taken during M0–M9.2 implementation. Moved here from `replit.md` to keep the repo README scannable. Newest decisions appended at the bottom.
+
+- **Embedder is pluggable and cloud-aware; dev ships a deterministic feature-hash embedder.** Neither Replit's Gemini nor OpenAI AI Integration exposes embeddings. Rather than require a third-party key for a demo, dev uses a 256-dim SHA-256 feature-hashing embedder (tagged `featurehash-v1@dev:256`) behind an `Embedder` interface. Production picks per cloud via `EMBEDDING_PROVIDER` (or `DEPLOYMENT_TARGET` shortcut): Bedrock Titan v2 on AWS, Vertex `text-embedding-005` on GCP, Azure OpenAI `text-embedding-3-small` on Azure, or self-hosted TEI for cloud-agnostic. All defaults support Matryoshka truncation to 256 so the schema is portable. Cloud SDKs are lazy-imported — dev never pays for them. The BM25 half of the hybrid is real lexical retrieval and carries most of the dev-mode signal; the vector half becomes semantically meaningful as soon as a real embedder is configured.
+- **PHI guard wraps every embedder, not just the dev one.** `PhiGuardEmbedder` runs `scanForPhi` on every input before it's embedded — for cloud providers this also means no PHI ever leaves the cluster boundary to a third-party model endpoint. Defense-in-depth on top of the redaction pipeline.
+- **Hybrid retrieval = BM25 ∪ vector, fused with RRF (k=60).** Postgres `tsvector` (generated column over redacted snippet + classification + subclass + severity + source, with weights A/B/C) gives lexical matches; pgvector cosine (`ivfflat`, lists=10) gives sub-word/semantic matches. RRF avoids needing score normalization and is the standard fusion choice.
+- **Agent context = hybrid top-K ∪ severity floor.** The chat agent sees (a) the top-10 RRF-fused candidates seeded with the user question and (b) the 8 most recent critical/high open findings. This guarantees questions like "list the critical findings" still surface the right rows even when their tokens don't overlap the query. The full preloaded id list is recorded in the `chat.agent_turn` ledger entry for audit.
+- **Tool calls are bounded.** `MAX_TOOL_CALLS=2` per turn (typical chain: `search_findings` → `get_finding`). Per-agent tool allow-list in `policy.ts` is the single source of truth for "which agent can call what".
+- **Ledger writes are append-only via a single advisory-locked writer.** `ENABLE ALWAYS` triggers in setup SQL refuse UPDATE/DELETE on `ledger_entries` AND `ledger_checkpoints` even from the owner role — belt-and-suspenders for the tamper-evidence claim. SSE envelopes are Zod-validated before being sent.
+- **Tamper-evidence is two-layer: internal hash chain + external HMAC checkpoints.** Periodic chain walks (hourly rolling-24h + weekly full) detect chain mismatches; periodic checkpoints (5min) sign the current head with an HMAC keyed in a separate trust zone so an attacker who controls the DB cannot rewrite history without also producing valid signatures under a key they don't hold. Both verification paths emit critical alerts on mismatch with stable-signature dedupe so persistent corruption alerts once, not every tick.
+- **Raw evidence is reachable through exactly one code path.** `findings.raw_evidence` (jsonb, nullable) is excluded from `findingSafeColumns`; every read of findings — `get_finding` tool, hybrid-search hydration, chat-agent severity-floor preload, dashboard list + detail — uses `.select(findingSafeColumns)` and is typed `FindingSafe = Omit<Finding,'rawEvidence'>`. The only `.select()` over the full row is `GET /admin/findings/:id/raw`, which requires a session + an active per-finding break-glass grant and ledgers `break_glass.raw_phi_accessed` on every read. Compile-time exclusion + a single audited call site instead of runtime field-stripping.
+- **Step-up cookie is signed independently from the session cookie.** Both share `SESSION_SECRET`, but each HMAC input is tagged with a per-purpose label (`session` vs `stepup`) so a session cookie cannot be replayed as a step-up cookie or vice versa. Step-up TTL is 5 min; grants are ≤15 min and per-finding.
+- **Two-person rule on critical-severity break-glass.** Critical-severity grants are created PENDING and require a second analyst (different `user_id`, same tenant) to complete fresh step-up and approve before raw PHI is released. `requires_second_approval` is captured at grant-creation time from the finding's then-current severity, so a later severity downgrade cannot retroactively bypass the rule. Self-approval refused + ledgered (`break_glass.approval_denied_self_approval`); double-approval defeated by compare-and-swap on `approver_user_id IS NULL`. DB-level CHECK `bg_no_self_approval` defends the rule below the application layer.
+- **Analyst free-text is scanned before it lands in the immutable ledger.** `validateLedgerSafeText` runs `scanForPhi` + canary-token check on `justification`, `approval_note`, and step-up `reason` at three route boundaries. On hit → HTTP 400 + ledger `policy.text_field_rejected` with detector *names only* (matched substrings never leave the request).
+- **Ingest is interface-first; bus and source adapters are swappable.** `LogBus` is the seam between sources and the detector pipeline — the in-memory dev impl is one of many (Kafka, NATS, Redpanda all satisfy the same shape). `LogSource` is the seam between the cloud and the bus — CloudWatch / Cloud Logging / Azure Monitor / on-prem / fixtures all produce the same `LogRecord`. Cloud SDKs are lazy-imported so a dev install stays small (matches the cloud-embedder pattern). The ingest pipeline never knows who the broker or cloud is.
+- **Ingest does defense-in-depth on redaction.** Every redacted snippet is re-scanned by `scanForPhi` before insert. A regression (detector regex or redactor walk producing leaky output) fires `ingest.redaction_regression` (critical alert) and the snippet falls back to a fully-opaque placeholder — the finding row is still created so the leak is auditable, but no payload-derived text reaches the BM25-indexed `redacted_evidence`. Raw payload lands in `raw_evidence` (jsonb, break-glass-gated via existing `/admin/findings/:id/raw` flow).
+- **Ingest dedupes by fingerprint.** Fingerprint = `<classification>:<detector>:<sourceType>:<sourceName>:v1`. Repeat records from the same source with the same leak class increment `occurrence_count` and bump `last_seen_at` on the existing finding instead of inserting a duplicate row. SELECT-then-upsert inside `withTenant(tx)`; no DB-level UNIQUE on `(tenant_id, fingerprint)` because the existing chat / tool-policy paths intentionally share fingerprints across distinct rows. `finding.created` ledger entry fires on first observation only (the audit anchor); subsequent occurrences advance `last_seen_at` silently.
+- **Event-type-driven alerting with a mechanical coverage guard.** Every `eventType:` literal in source must have a decision in either `ALERT_RULES` (critical/high/warning/threshold) or `NOT_ALERTABLE`; a vitest scan fails CI if any new event type is added without one. Dead entries in either table are also flagged.
+- **Real cloud log sources sit behind the same `LogSource` seam as fixtures; SDK loading is lazy.** `CloudwatchLogSource` (M8) is the first non-stub adapter; the same module exposes `InMemoryCheckpointStore` for tests and `DbCheckpointStore` for production. Per-`(source,logGroup)` cursor is persisted in `log_source_checkpoints` — mutable by design (advances every successful batch), not under the `ENABLE ALWAYS` triggers that lock down the audit chain (the audit anchor for ingested findings is `finding.created`, which IS locked down). Cursor advance uses `GREATEST(stored, incoming)` so a buggy adapter handing back a stale ts cannot rewind; tenant id is matched in the `WHERE` to refuse cross-tenant cursor overwrite. Poll loop bounds API spend with `maxPagesPerTick`, applies exponential backoff on error (capped), and uses an interruptible sleep so `stop()` returns promptly instead of waiting out a full poll interval. Per-record publish failures advance the cursor only as far as the last *successful* timestamp — so a bad message neither wedges the source nor gets silently lost. Lifecycle (`ingest.source_started` / `ingest.source_stopped`) is ledgered for investigation provenance; transient batch failures (`ingest.source_error`, warning) too. Inert by default: `LOG_SOURCE=cloudwatch` opts in; SDK is optional dependency loaded via the same `loadOptional` hidden-import pattern as the cloud embedders, so dev installs stay small.
+- **Channel dispatch is a thin layer over alerts with five hard guarantees.** (1) **Outbound PHI hard gate** — every envelope is rescanned by `scanForPhi` on content-bearing fields (`eventType`, `subjectType`, `subjectId`) BEFORE any adapter is called; a hit aborts the whole dispatch for that event and emits `channel.send_blocked_phi` (critical) with detector *names only* + the list of channels skipped. tenantId / ledgerHashShort / occurredAt are excluded from the rescan because they're system-generated fixed-format strings that would always false-positive (UUID → credit-card-like detector). (2) **Self-recursion guard** — `channel.*` ledger events themselves never re-enter the dispatcher. (3) **Per-channel sliding-window rate limit** (`CHANNEL_RATE_LIMIT_PER_MINUTE`, default 30) — over-limit sends emit `channel.send_throttled` (warning) instead of calling the adapter. (4) **Webhook host allow-list + HMAC signing** — `CHANNEL_WEBHOOK_ALLOWED_HOSTS` CSV restricts target URL; body is signed `HMAC-SHA256("${ts}.${body}", secret)`; headers `X-PHI-Audit-Signature: sha256=<hex>` + `X-PHI-Audit-Timestamp`; ≥16-char shared secret enforced at construction. (5) **Adapter failure isolation** — adapter errors never propagate out of the post-commit hook; they ledger `channel.send_failed` (warning) per attempt and continue. Adapters are inert by default (env-unset → no channels registered), and the dispatch hook itself is a no-op when the channel list is empty.
+
+- **Chat agent runs through the `LlmAgentRuntime` seam, not against a hardcoded SDK.** Pre-M9.5 the chat path imported `ai` from `@workspace/integrations-gemini-ai` directly, so `LLM_PROVIDER` controlled only the supervisor agents while chat stayed pinned to Gemini even on Bedrock/Vertex/Azure deploys. M9.5 routes `runChatTurn` through `streamFromRuntime(getLlmRuntime(), ...)` so a single env var (`LLM_PROVIDER` / `DEPLOYMENT_TARGET`) selects the cloud LLM for every call — chat, Triage, Verifier — uniformly. The `LlmAgentRuntime` interface gained an optional `generateStream(opts): AsyncIterable<LlmStreamChunk>` plus multi-turn `history?: LlmHistoryTurn[]`; `LlmStreamChunk = {text?, done?: {approxOutputTokens, modelId}}` with `done` emitted exactly once as the last chunk. Native streaming on all three cloud impls (Bedrock `ConverseStreamCommand`, Vertex `:streamGenerateContent?alt=sse`, Azure OpenAI `stream:true` + `stream_options.include_usage`); REST SSE parser is a 25-LoC in-file helper, no new dep. Each cloud impl's blocking `generate()` rebuilt to drain its own `generateStream` via a shared `drainStream()` so blocking and streaming code paths can't drift. `PhiGuardLlmRuntime.generateStream` runs `scanForPhi` over `systemPrompt + userPrompt + every history turn` synchronously at the first `next()` — defends multi-turn echoes where turn N+1 quotes back a redacted finding from turn N. The manual JSON `{tool_call:{name,args}}` protocol is unchanged (runtime-agnostic, no need for provider-native function-calling abstraction). `agent_identity.model_id` now records the runtime's effective `done.modelId` instead of the prompt-pinned `CHAT_AGENT_MODEL` constant — same fix the supervisor got in the post-M8 LLM adapters slice. Buffered-then-replayed delta on the final turn so a partial JSON tool-call envelope never reaches the SSE consumer.

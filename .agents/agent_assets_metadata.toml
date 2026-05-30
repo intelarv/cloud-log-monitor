@@ -60,3 +60,15 @@ id = "cltxfneRpaHQc6Pks8Iyl"
 uri = "file://dist/phi-audit-m5.tar.gz"
 type = "unspecified"
 title = "PHI Audit — M5 source (multi-agent supervisor)"
+
+[[outputs]]
+id = "xJ47bR493n9HqfH3sNEks"
+uri = "file://dist/phi-audit-m6.tar.gz"
+type = "unspecified"
+title = "PHI Audit — M6 (channel router + Slack/webhook adapters)"
+
+[[outputs]]
+id = "e3lGzUgIy_ygRmcHy3o7C"
+uri = "file://exports/phi-audit-project.tar.gz"
+type = "unspecified"
+title = "phi-audit-project.tar.gz (1.9 MB, source only)"

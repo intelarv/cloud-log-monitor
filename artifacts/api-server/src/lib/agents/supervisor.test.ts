@@ -55,7 +55,7 @@ function makeFakeRuntime(responses: string[]): {
     async generate(opts: LlmGenerateOpts): Promise<LlmGenerateResult> {
       calls.push({ systemPrompt: opts.systemPrompt, userPrompt: opts.userPrompt });
       const text = responses[i++] ?? "";
-      return { text, approxOutputTokens: Math.ceil(text.length / 4) };
+      return { text, approxOutputTokens: Math.ceil(text.length / 4), modelId: opts.modelId };
     },
   };
   return { runtime, calls };

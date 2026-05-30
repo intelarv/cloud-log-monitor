@@ -9,6 +9,7 @@ import {
 } from "@workspace/db";
 import { maybeEmitAlertFromLedger } from "./alerts";
 import { maybeEnqueueReviewFromLedger } from "./agents/supervisor";
+import { dispatchAlertFromLedger } from "./channels";
 
 // Single arbitrary 64-bit key for the ledger writer advisory lock. Only one
 // process can hold this lock at a time; serializes all ledger writes across
@@ -84,6 +85,16 @@ export async function appendLedger(
       maybeEnqueueReviewFromLedger(row);
     } catch {
       // Same best-effort guarantee as alerting; the ledger row is durable.
+    }
+    // M6: post-commit fan-out to configured notification channels (Slack /
+    // webhook). Fire-and-forget — adapter HTTP calls cannot block ledger
+    // writes. Self-recursion is guarded inside `dispatchAlertFromLedger`
+    // (channel.* events do not re-dispatch). Inert if no channel adapters
+    // are configured.
+    try {
+      dispatchAlertFromLedger(row);
+    } catch {
+      // Same best-effort guarantee.
     }
     return row;
   });

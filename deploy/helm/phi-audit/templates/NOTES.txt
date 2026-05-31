@@ -1,0 +1,52 @@
+phi-audit installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Verify rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "phi-audit.api.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "phi-audit.dashboard.fullname" . }}
+
+Reach the API healthz (port-forward, no Ingress required):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "phi-audit.api.fullname" . }} 8080:80
+  curl http://localhost:8080/api/healthz
+
+{{- if .Values.ingress.enabled }}
+
+Ingress: https://{{ .Values.ingress.host }}
+  /     → dashboard
+  /api  → api-server
+{{- else }}
+
+Ingress is disabled. Set ingress.enabled=true + ingress.host to expose
+the dashboard externally.
+{{- end }}
+
+Selected runtime:
+  LLM provider:   {{ default "(default: gemini-replit — dev only, no BAA)" .Values.llm.provider }}
+  Embedder:       {{ default "(default: featurehash — dev only)" .Values.embedder.provider }}
+  Log source:     {{ if .Values.logSource.enabled }}{{ .Values.logSource.type }}{{ else }}(none — set logSource.enabled=true){{ end }}
+  Supervisor:     {{ if .Values.supervisor.enabled }}ENABLED (daily token budget: {{ .Values.supervisor.dailyTokenBudget }}){{ else }}disabled{{ end }}
+  Channels:       slack={{ .Values.channels.slack.enabled }} webhook={{ .Values.channels.webhook.enabled }}
+
+{{- if eq .Values.secrets.sessionSecret.existingSecret .Values.secrets.notarizationSecret.existingSecret }}
+
+!! WARNING: secrets.sessionSecret.existingSecret and
+!!          secrets.notarizationSecret.existingSecret point at the SAME Secret.
+!! Per threat_model.md §23.2, the notarization key MUST live in a separate
+!! trust zone (different KMS, different cloud account / project / tenant).
+!! Co-locating them defeats the external-notarization half of the
+!! tamper-evidence guarantee. This is acceptable in dev only.
+{{- end }}
+
+NEXT-STEP CHECKLIST (production):
+  [ ] NOTARIZATION_SECRET lives in a KMS key in a SEPARATE cloud account
+      from SESSION_SECRET (threat_model.md §23.2). The chart enforces a
+      different K8s Secret name; you also need a different backing KMS.
+  [ ] DB role used by the app has NO ledger UPDATE/DELETE grant (ENABLE
+      ALWAYS triggers will refuse, but defense-in-depth: grant it at the
+      role level too).
+  [ ] Cloud KMS keys are per-tenant if multi-tenant.
+  [ ] Ingress is HTTPS-only with the cloud's managed cert; HTTP→HTTPS redirect on.
+  [ ] CNI enforces NetworkPolicy (Calico/Cilium/etc.). Egress rules below
+      are inert otherwise.
+  [ ] After first install, `kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "phi-audit.api.fullname" . }}`
+      should show "LLM runtime initialized" with the expected provider and
+      "Ledger chain verification ok: true".

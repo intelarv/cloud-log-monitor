@@ -1,0 +1,75 @@
+{{- if .Values.networkPolicy.enabled }}
+# Egress allow-list per threat_model.md §EoP: agents make outbound network
+# calls only via explicit tool handlers; raw HTTP from agent runtimes must
+# be blocked at network policy. The chart applies:
+#   - DNS to kube-dns (UDP+TCP 53)
+#   - 443/TCP to `networkPolicy.egress.allowedExternalCidrs` (cloud APIs)
+#   - 5432/TCP intra-cluster (only when database.sidecar.enabled=false; with
+#     a sidecar the app talks to localhost and the sidecar handles egress)
+#   - operator-supplied `extraEgressRules` appended verbatim (FQDN policies,
+#     specific service CIDRs, additional ports)
+# Egress NetworkPolicy is enforced ONLY by CNIs that support it (Calico,
+# Cilium, etc.). With a non-enforcing CNI this object is informational.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phi-audit.api.fullname" . }}-egress
+  labels:
+    {{- include "phi-audit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "phi-audit.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  policyTypes: [Egress]
+  egress:
+    # DNS — every cluster.
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    # Cloud API egress — 443/TCP to the operator-configured CIDR set. Default
+    # is 0.0.0.0/0 (open egress on 443) which works out-of-the-box for every
+    # cloud LLM/secret-store/log-source endpoint; narrow this to VPC-endpoint
+    # / PrivateLink / PSC CIDRs in production.
+    {{- with .Values.networkPolicy.egress.allowedExternalCidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { port: 443, protocol: TCP }
+    {{- end }}
+    {{- if not .Values.database.sidecar.enabled }}
+    # Postgres 5432/TCP to in-cluster pods (only when no DB sidecar — with a
+    # sidecar the app uses 127.0.0.1:5432 and the sidecar handles external
+    # egress on its own ports). Narrow `podSelector` to your DB pod labels
+    # in production if Postgres runs in-cluster, or add an ipBlock egress
+    # for the managed-DB endpoint in extraEgressRules.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { port: 5432, protocol: TCP }
+    {{- else }}
+    # DB-sidecar egress. cloud-sql-proxy needs 3307/TCP to the Cloud SQL
+    # data plane (in addition to 443 for the admin API, already covered by
+    # allowedExternalCidrs above). RDS IAM token sidecars need 5432/TCP to
+    # the RDS endpoint. Both go to the same allowed CIDRs as the cloud APIs.
+    {{- with .Values.networkPolicy.egress.allowedExternalCidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { port: 3307, protocol: TCP }   # cloud-sql-proxy data plane (GCP)
+        - { port: 5432, protocol: TCP }   # RDS / Azure DB direct (AWS/Azure)
+    {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.extraEgressRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,22 @@
+apiVersion: v2
+name: phi-audit
+description: |
+  PHI/PII Log Audit — cloud-agnostic agentic system that ingests cloud-provider
+  logs, detects PHI/PII/secrets, maintains a tamper-evident audit ledger, and
+  exposes a chat-over-audit dashboard for healthcare compliance analysts.
+
+  This chart is the cloud-agnostic baseline (M9.1). Cloud-specific values
+  files live alongside this Chart.yaml: values-aws.yaml, values-gcp.yaml,
+  values-azure.yaml. See deploy/README.md for the deployment workflow.
+type: application
+version: 0.1.0
+appVersion: "M8+cloud-llm"
+kubeVersion: ">=1.27.0-0"
+maintainers:
+  - name: PHI Audit Maintainers
+keywords:
+  - phi
+  - compliance
+  - hipaa
+  - audit
+  - cloud-agnostic

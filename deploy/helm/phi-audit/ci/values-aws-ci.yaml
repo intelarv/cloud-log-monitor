@@ -1,0 +1,24 @@
+image:
+  api:       { repository: example.dkr.ecr.us-east-1.amazonaws.com/phi-audit-api,       tag: sha-deadbeef }
+  dashboard: { repository: example.dkr.ecr.us-east-1.amazonaws.com/phi-audit-dashboard, tag: sha-deadbeef }
+
+secrets:
+  sessionSecret:       { existingSecret: phi-audit-session }
+  notarizationSecret:  { existingSecret: phi-audit-notarization }
+
+database:
+  existingSecret: phi-audit-db
+
+ingress:
+  host: phi-audit.ci.example.com
+
+logSource:
+  cloudwatch:
+    tenantId: ci-tenant
+    logGroups: ["/aws/lambda/billing-svc"]
+    region: us-east-1
+
+serviceAccount:
+  api:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/phi-audit-api-ci

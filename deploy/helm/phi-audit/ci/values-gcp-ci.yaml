@@ -1,0 +1,28 @@
+image:
+  api:       { repository: us-central1-docker.pkg.dev/example/phi-audit/api,       tag: sha-deadbeef }
+  dashboard: { repository: us-central1-docker.pkg.dev/example/phi-audit/dashboard, tag: sha-deadbeef }
+
+secrets:
+  sessionSecret:       { existingSecret: phi-audit-session }
+  notarizationSecret:  { existingSecret: phi-audit-notarization }
+
+llm:
+  gcp:
+    projectId: phi-audit-ci
+
+database:
+  existingSecret: phi-audit-db
+  sidecar:
+    args:
+      - "--auto-iam-authn"
+      - "phi-audit-ci:us-central1:phi-audit"
+      - "--port=5432"
+      - "--health-check"
+
+ingress:
+  host: phi-audit.ci.example.com
+
+serviceAccount:
+  api:
+    annotations:
+      iam.gke.io/gcp-service-account: phi-audit-api@phi-audit-ci.iam.gserviceaccount.com

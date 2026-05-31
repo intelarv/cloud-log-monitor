@@ -1,0 +1,21 @@
+image:
+  api:       { repository: example.azurecr.io/phi-audit-api,       tag: sha-deadbeef }
+  dashboard: { repository: example.azurecr.io/phi-audit-dashboard, tag: sha-deadbeef }
+
+# Azure overlay keeps Session and Notarization in two CSI-mounted Secrets
+# pulled from two different Key Vaults — but for CI we just need two names.
+secrets:
+  sessionSecret:       { existingSecret: phi-audit-session }
+  notarizationSecret:  { existingSecret: phi-audit-notarization }
+  llmSecret:           { existingSecret: phi-audit-llm }
+
+database:
+  existingSecret: phi-audit-db
+
+ingress:
+  host: phi-audit.ci.example.com
+
+serviceAccount:
+  api:
+    annotations:
+      azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000000

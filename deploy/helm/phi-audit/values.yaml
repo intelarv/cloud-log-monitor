@@ -1,0 +1,229 @@
+# Cloud-agnostic defaults. Override per cloud via values-{aws,gcp,azure}.yaml.
+# Anything marked REQUIRED MUST be set in the overlay or the chart will fail.
+
+# ----------------------------------------------------------------------------
+# Images. Bring-your-own-registry — the chart deliberately doesn't ship images.
+# Build with deploy/docker/{api-server,dashboard}.Dockerfile and push to your
+# own registry, then point image.repository at it.
+# ----------------------------------------------------------------------------
+image:
+  api:
+    repository: ""            # REQUIRED, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/phi-audit-api
+    tag: ""                   # REQUIRED — pin to an immutable SHA tag in production
+    pullPolicy: IfNotPresent
+  dashboard:
+    repository: ""            # REQUIRED
+    tag: ""                   # REQUIRED
+    pullPolicy: IfNotPresent
+  pullSecrets: []             # e.g. [{ name: regcred }]
+
+# ----------------------------------------------------------------------------
+# Replica counts + autoscaling. supervisor uses an in-process queue so do not
+# scale api blindly — see HPA notes in deploy/README.md.
+# ----------------------------------------------------------------------------
+# Azure Workload Identity helper. When true, the chart adds the
+# `azure.workload.identity/use: "true"` label to the api pod AND ServiceAccount
+# (required for the AKS workload-identity webhook to inject the projected
+# token). Set in values-azure.yaml.
+azureWorkloadIdentity:
+  enabled: false
+
+api:
+  replicaCount: 2
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1,    memory: 1Gi   }
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Topology spread by default — keep api pods on distinct nodes.
+  topologySpread:
+    enabled: true
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+dashboard:
+  replicaCount: 2
+  resources:
+    requests: { cpu: 50m,  memory: 64Mi  }
+    limits:   { cpu: 200m, memory: 128Mi }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+# ----------------------------------------------------------------------------
+# Service accounts. Each cloud's IAM-for-pods needs an annotation:
+#   AWS:   eks.amazonaws.com/role-arn = arn:aws:iam::...:role/...
+#   GCP:   iam.gke.io/gcp-service-account = sa@project.iam.gserviceaccount.com
+#   Azure: azure.workload.identity/client-id = <client-id>  (+ pod label)
+# ----------------------------------------------------------------------------
+serviceAccount:
+  api:
+    create: true
+    name: ""                  # defaults to <release>-api
+    annotations: {}
+    labels: {}
+  dashboard:
+    create: true
+    name: ""                  # defaults to <release>-dashboard
+    annotations: {}
+
+# ----------------------------------------------------------------------------
+# Database. Two ways to wire credentials:
+#  (a) existingSecret — operator-managed Secret (External Secrets Operator, CSI
+#      driver from cloud secret store, manually-created Secret). Recommended.
+#  (b) databaseUrl — plain string straight in values. Dev/test only.
+#
+# sidecar.enabled provisions an extra container next to api-server for
+# IAM-authenticated DB connections (cloud-sql-proxy on GCP, RDS IAM token
+# sidecar on AWS). When enabled, the app talks to 127.0.0.1:5432 inside the
+# pod and the sidecar handles the cloud-IAM dance to the actual DB endpoint.
+# Azure managed identity is direct (no proxy) — leave sidecar disabled there.
+# ----------------------------------------------------------------------------
+database:
+  existingSecret: ""          # name of Secret with key `database-url` (preferred)
+  existingSecretKey: database-url
+  databaseUrl: ""             # ONLY if existingSecret is empty (dev/test)
+  sidecar:
+    enabled: false
+    name: db-proxy
+    image: ""                 # e.g. gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.13.0
+    args: []                  # provider-specific; see values-{aws,gcp}.yaml
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits:   { cpu: 200m, memory: 128Mi }
+    # When sidecar is on, the api connects to localhost. The Secret's
+    # `database-url` should use host=127.0.0.1 in that case.
+
+# ----------------------------------------------------------------------------
+# Required app secrets. The chart deliberately splits SESSION_SECRET and
+# NOTARIZATION_SECRET into TWO separate Secret references so an operator can
+# mount each from a different KMS / cloud account / Key Vault — that's the
+# structural enforcement of threat_model §23.2 ("notarization key held in a
+# separate trust zone"). Co-locating them defeats the second-half tamper-
+# evidence guarantee. If you must point both at the same Secret in dev, set
+# notarizationSecret = sessionSecret; the chart issues a NOTES warning then.
+#
+# Expected key in `sessionSecret`:        session-secret  (≥32 chars)
+# Expected key in `notarizationSecret`:   notarization-secret  (≥16 chars)
+# Channels / Azure-OpenAI / Slack creds live in the channel-secret / llm-secret
+# Secrets when their feature is enabled (see channels + llm sections below).
+# ----------------------------------------------------------------------------
+secrets:
+  sessionSecret:
+    existingSecret: ""        # REQUIRED — Secret with key `session-secret`
+    key: session-secret
+  notarizationSecret:
+    existingSecret: ""        # REQUIRED — DIFFERENT Secret from sessionSecret per §23.2
+    key: notarization-secret
+  # Optional bundle for channel + LLM secrets. Defaults to sessionSecret's
+  # Secret name for backwards compat when the operator doesn't split them.
+  channelSecret:
+    existingSecret: ""        # defaults to sessionSecret.existingSecret
+  llmSecret:
+    existingSecret: ""        # defaults to sessionSecret.existingSecret
+
+# ----------------------------------------------------------------------------
+# LLM runtime selection. See replit.md "Run & Operate" for the precedence
+# rules (LLM_PROVIDER > DEPLOYMENT_TARGET > default).
+# ----------------------------------------------------------------------------
+llm:
+  # Either set `provider` directly or let `deploymentTarget` pick.
+  # provider: "bedrock" | "vertex" | "azure-openai" | "gemini-replit"
+  provider: ""
+  deploymentTarget: ""        # "aws" | "gcp" | "azure" | "local"
+  defaultModel: ""            # LLM_DEFAULT_MODEL — operator-pinned model id
+  phiGuard: true              # PHI rescan on every outbound prompt
+  # Provider-specific config (only the one matching `provider` is consumed).
+  aws:
+    region: ""                # AWS_REGION (Bedrock + Titan embedder)
+  gcp:
+    projectId: ""             # GCP_PROJECT_ID — REQUIRED when provider=vertex
+    location: us-central1     # GCP_LOCATION
+  azure:
+    apiVersion: ""            # AZURE_OPENAI_API_VERSION (optional override)
+
+# Embedder selection (mirrors LLM).
+embedder:
+  provider: ""                # "bedrock" | "vertex" | "azure-openai" | "tei" | "featurehash"
+  model: ""
+  dim: 256
+  tei:
+    endpoint: ""
+
+# ----------------------------------------------------------------------------
+# Cloud log source. Inert by default; enable per cloud values file.
+# ----------------------------------------------------------------------------
+logSource:
+  enabled: false
+  type: cloudwatch            # currently the only real adapter (M8)
+  cloudwatch:
+    tenantId: ""
+    logGroups: []             # list of log group names
+    region: ""
+    pollIntervalMs: 5000
+    lookbackMs: 300000
+
+# ----------------------------------------------------------------------------
+# Channel adapters. Inert by default.
+# ----------------------------------------------------------------------------
+channels:
+  rateLimitPerMinute: 30
+  slack:
+    enabled: false
+    minSeverity: warning      # warning | high | critical
+  webhook:
+    enabled: false
+    minSeverity: warning
+    allowedHosts: []          # CSV in env; chart joins them
+
+# ----------------------------------------------------------------------------
+# Supervisor (M5). Off by default — turn on per environment.
+# ----------------------------------------------------------------------------
+supervisor:
+  enabled: false
+  dailyTokenBudget: 1000000
+
+# ----------------------------------------------------------------------------
+# Ingress. Production runs behind a TLS-terminating Ingress with the cloud's
+# managed cert (ACM via ALB ingress / Google-managed cert / Front Door).
+# /api → api-server, / → dashboard.
+# ----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: ""               # e.g. "alb" | "gce" | "azure/application-gateway" | "nginx"
+  host: ""                    # REQUIRED, e.g. phi-audit.example.com
+  annotations: {}
+  tls:
+    enabled: true
+    secretName: ""            # cert-manager-managed Secret name, OR provider annotation
+
+# ----------------------------------------------------------------------------
+# Egress NetworkPolicy. Per threat_model §EoP: agents make outbound network
+# calls only via explicit tool handlers. This locks pod egress to DNS + the
+# DB endpoint + the configured cloud LLM/embedder endpoints + any channel
+# allow-list. Disable only if your cluster already enforces equivalent.
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  egress:
+    # Default egress baseline (applied by the chart in addition to DNS):
+    #   - All RFC1918 + cluster traffic on 443/TCP (intra-cluster mTLS, DB sidecar, in-cluster Vault).
+    #   - All non-RFC1918 traffic on 443/TCP (cloud APIs: Bedrock/Vertex/Azure-OpenAI/Secrets-Manager/Key-Vault/CloudWatch/etc).
+    #   - Postgres 5432/TCP only inside the cluster (the sidecar bridges out).
+    # This is a *baseline*, not a tight allow-list — production should narrow
+    # to specific cloud-API CIDRs or FQDN-egress (Cilium/Calico FQDN policy).
+    # When CNI doesn't support FQDN egress, narrow `allowedExternalCidrs` to
+    # your cloud's published service CIDR blocks instead of leaving 0.0.0.0/0.
+    allowedExternalCidrs:
+      - 0.0.0.0/0
+    extraEgressRules: []      # list of egress entries appended verbatim (FQDN policies, etc.)
+
+# Common labels applied to every workload.
+commonLabels: {}

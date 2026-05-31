@@ -1,0 +1,230 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "phi-audit.api.fullname" . }}
+  labels:
+    {{- include "phi-audit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.hpa.enabled }}
+  replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "phi-audit.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "phi-audit.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+        {{- if .Values.azureWorkloadIdentity.enabled }}
+        # Required pod label for the AKS workload-identity webhook to inject
+        # the projected service-account token + AZURE_* env. Without this
+        # label, Azure Workload Identity is silently inactive even when the
+        # ServiceAccount carries the client-id annotation.
+        azure.workload.identity/use: "true"
+        {{- end }}
+      {{- with .Values.api.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "phi-audit.api.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: "{{ .Values.image.api.repository }}:{{ .Values.image.api.tag }}"
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: NODE_ENV
+              value: production
+            - name: BASE_PATH
+              value: "/"
+            # ---- Required secrets (split per §23.2: session vs notarization
+            # in separate Secrets so an operator can mount each from a
+            # different KMS / cloud account / Key Vault).
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.sessionSecret.existingSecret }}
+                  key: {{ .Values.secrets.sessionSecret.key }}
+            - name: NOTARIZATION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.notarizationSecret.existingSecret }}
+                  key: {{ .Values.secrets.notarizationSecret.key }}
+            # ---- Database URL ----
+            {{- if .Values.database.existingSecret }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.existingSecretKey }}
+            {{- else }}
+            - name: DATABASE_URL
+              value: {{ .Values.database.databaseUrl | quote }}
+            {{- end }}
+            # ---- LLM runtime selection ----
+            {{- if .Values.llm.provider }}
+            - { name: LLM_PROVIDER,       value: {{ .Values.llm.provider | quote }} }
+            {{- end }}
+            {{- if .Values.llm.deploymentTarget }}
+            - { name: DEPLOYMENT_TARGET,  value: {{ .Values.llm.deploymentTarget | quote }} }
+            {{- end }}
+            {{- if .Values.llm.defaultModel }}
+            - { name: LLM_DEFAULT_MODEL,  value: {{ .Values.llm.defaultModel | quote }} }
+            {{- end }}
+            # ---- Provider-specific cloud env (only the one matching .Values.llm.provider) ----
+            {{- if .Values.llm.aws.region }}
+            - { name: AWS_REGION,         value: {{ .Values.llm.aws.region | quote }} }
+            {{- end }}
+            {{- if eq .Values.llm.provider "vertex" }}
+            - { name: GCP_PROJECT_ID,     value: {{ required "llm.gcp.projectId is required for vertex" .Values.llm.gcp.projectId | quote }} }
+            - { name: GCP_LOCATION,       value: {{ .Values.llm.gcp.location | quote }} }
+            {{- else if eq .Values.embedder.provider "vertex" }}
+            - { name: GCP_PROJECT_ID,     value: {{ required "llm.gcp.projectId is required for vertex embedder" .Values.llm.gcp.projectId | quote }} }
+            - { name: GCP_LOCATION,       value: {{ .Values.llm.gcp.location | quote }} }
+            {{- end }}
+            {{- if eq .Values.llm.provider "azure-openai" }}
+            - name: AZURE_OPENAI_ENDPOINT
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.llmSecretName" . }}, key: azure-openai-endpoint } }
+            - name: AZURE_OPENAI_API_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.llmSecretName" . }}, key: azure-openai-api-key } }
+            - name: AZURE_OPENAI_DEPLOYMENT
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.llmSecretName" . }}, key: azure-openai-deployment } }
+            {{- if .Values.llm.azure.apiVersion }}
+            - { name: AZURE_OPENAI_API_VERSION, value: {{ .Values.llm.azure.apiVersion | quote }} }
+            {{- end }}
+            {{- end }}
+            # ---- Embedder ----
+            {{- if .Values.embedder.provider }}
+            - { name: EMBEDDING_PROVIDER, value: {{ .Values.embedder.provider | quote }} }
+            {{- end }}
+            {{- if .Values.embedder.model }}
+            - { name: EMBEDDING_MODEL,    value: {{ .Values.embedder.model | quote }} }
+            {{- end }}
+            - { name: EMBEDDING_DIM,      value: {{ .Values.embedder.dim | quote }} }
+            {{- if .Values.embedder.tei.endpoint }}
+            - { name: TEI_ENDPOINT,       value: {{ .Values.embedder.tei.endpoint | quote }} }
+            {{- end }}
+            # ---- Cloud log source ----
+            {{- if .Values.logSource.enabled }}
+            - { name: LOG_SOURCE,                  value: {{ .Values.logSource.type | quote }} }
+            {{- if eq .Values.logSource.type "cloudwatch" }}
+            - { name: CLOUDWATCH_TENANT_ID,        value: {{ .Values.logSource.cloudwatch.tenantId | quote }} }
+            - { name: CLOUDWATCH_LOG_GROUPS,       value: {{ join "," .Values.logSource.cloudwatch.logGroups | quote }} }
+            - { name: CLOUDWATCH_POLL_INTERVAL_MS, value: {{ .Values.logSource.cloudwatch.pollIntervalMs | quote }} }
+            - { name: CLOUDWATCH_LOOKBACK_MS,      value: {{ .Values.logSource.cloudwatch.lookbackMs | quote }} }
+            {{- if and (not .Values.llm.aws.region) .Values.logSource.cloudwatch.region }}
+            - { name: AWS_REGION,                  value: {{ .Values.logSource.cloudwatch.region | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            # ---- Channels ----
+            - { name: CHANNEL_RATE_LIMIT_PER_MINUTE, value: {{ .Values.channels.rateLimitPerMinute | quote }} }
+            {{- if .Values.channels.slack.enabled }}
+            - name: CHANNEL_SLACK_WEBHOOK_URL
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-slack-webhook-url } }
+            - { name: CHANNEL_SLACK_MIN_SEVERITY, value: {{ .Values.channels.slack.minSeverity | quote }} }
+            {{- end }}
+            {{- if .Values.channels.webhook.enabled }}
+            - name: CHANNEL_WEBHOOK_URL
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-webhook-url } }
+            - name: CHANNEL_WEBHOOK_SECRET
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-webhook-secret } }
+            - { name: CHANNEL_WEBHOOK_ALLOWED_HOSTS, value: {{ join "," .Values.channels.webhook.allowedHosts | quote }} }
+            - { name: CHANNEL_WEBHOOK_MIN_SEVERITY,  value: {{ .Values.channels.webhook.minSeverity | quote }} }
+            {{- end }}
+            # ---- Supervisor ----
+            {{- if .Values.supervisor.enabled }}
+            - { name: AGENT_SUPERVISOR_ENABLED, value: "1" }
+            - { name: AGENT_DAILY_TOKEN_BUDGET, value: {{ .Values.supervisor.dailyTokenBudget | quote }} }
+            {{- end }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /api/healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /api/healthz, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+        {{- if .Values.database.sidecar.enabled }}
+        # ----------------------------------------------------------------
+        # DB connectivity sidecar. The api container connects to localhost
+        # and this sidecar terminates the cloud-IAM auth to the real DB
+        # endpoint. Used on GCP (cloud-sql-proxy) and optionally AWS
+        # (rds-iam-auth-token). Disabled on Azure (managed identity is
+        # direct, no proxy needed) per values-azure.yaml.
+        # ----------------------------------------------------------------
+        - name: {{ .Values.database.sidecar.name }}
+          image: {{ .Values.database.sidecar.image }}
+          args:
+            {{- toYaml .Values.database.sidecar.args | nindent 12 }}
+          resources:
+            {{- toYaml .Values.database.sidecar.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }
+      {{- with .Values.api.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.api.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "phi-audit.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: api
+      {{- end }}

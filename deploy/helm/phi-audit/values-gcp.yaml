@@ -1,0 +1,73 @@
+# GCP overlay. Pair with deploy/helm/phi-audit/values.yaml.
+# Assumes GKE + Cloud SQL Postgres 15+ + Vertex AI + Secret Manager.
+
+llm:
+  provider: vertex
+  defaultModel: gemini-1.5-flash
+  phiGuard: true
+  gcp:
+    projectId: ""             # REQUIRED — set per environment; chart fails fast if empty
+    location: us-central1
+
+embedder:
+  provider: vertex
+  model: text-embedding-005
+  dim: 256
+
+# Vertex + Cloud SQL access via Workload Identity. The GSA bound to this KSA
+# needs roles/aiplatform.user + roles/cloudsql.client + roles/secretmanager.secretAccessor.
+serviceAccount:
+  api:
+    annotations:
+      # iam.gke.io/gcp-service-account: phi-audit-api@<PROJECT>.iam.gserviceaccount.com
+      {}
+
+# Cloud SQL Auth Proxy sidecar — IAM auth, no static password ever in cluster.
+# App connects to 127.0.0.1:5432; sidecar tunnels to the Cloud SQL instance.
+# The existingSecret only needs to hold the `database-url` string with
+# host=127.0.0.1; no password is required when IAM auth is on.
+database:
+  existingSecret: phi-audit-db
+  existingSecretKey: database-url
+  sidecar:
+    enabled: true
+    name: cloud-sql-proxy
+    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.13.0
+    # REQUIRED — set per environment. Chart fails fast if this list is
+    # empty or contains `--help` (placeholder values that would exit-0
+    # the sidecar and silently break the DB path).
+    args: []
+    # Example:
+    #   args:
+    #     - "--auto-iam-authn"
+    #     - "<PROJECT>:<REGION>:<INSTANCE>"
+    #     - "--port=5432"
+    #     - "--health-check"
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits:   { cpu: 200m, memory: 128Mi }
+
+logSource:
+  enabled: false              # GCP Cloud Logging adapter deferred (see M8 deferred list)
+
+ingress:
+  className: gce
+  annotations:
+    kubernetes.io/ingress.class: gce
+    # networking.gke.io/managed-certificates: phi-audit-cert
+    # kubernetes.io/ingress.global-static-ip-name: phi-audit-ip
+
+networkPolicy:
+  enabled: true
+  egress:
+    # GCP service endpoints (Vertex, Cloud SQL Admin, Secret Manager) don't
+    # have stable CIDRs. Production should either:
+    #   - use Private Service Connect endpoints and narrow allowedExternalCidrs
+    #     to the PSC IP range, OR
+    #   - run Cilium and add a FQDN policy in extraEgressRules for
+    #     <region>-aiplatform.googleapis.com, sqladmin.googleapis.com,
+    #     secretmanager.googleapis.com.
+    # The cloud-sql-proxy sidecar makes outbound on 3307 to the Cloud SQL
+    # admin API; that's covered by allowedExternalCidrs:443 once you route
+    # via PSC, or by the open 0.0.0.0/0:443 baseline from values.yaml.
+    extraEgressRules: []

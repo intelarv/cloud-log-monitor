@@ -1,0 +1,60 @@
+# Azure overlay. Pair with deploy/helm/phi-audit/values.yaml.
+# Assumes AKS + Azure Database for PostgreSQL Flexible Server (PG 15+,
+# pgvector via `azure.extensions` allow-list) + Azure OpenAI + Key Vault.
+#
+# Per user direction: Azure uses password from Key Vault (no sidecar).
+# Azure managed identity to Azure OpenAI is direct via Workload Identity;
+# the Postgres password rides through Secrets Store CSI Driver.
+
+llm:
+  provider: azure-openai
+  defaultModel: ""            # Azure deployment name, not model id
+  phiGuard: true
+
+embedder:
+  provider: azure-openai
+  model: text-embedding-3-small
+  dim: 256
+
+# Turn on the chart's Azure WI helper: adds the
+# `azure.workload.identity/use: "true"` label to both api ServiceAccount AND
+# api pod (the AKS WI webhook keys off the pod label).
+azureWorkloadIdentity:
+  enabled: true
+
+serviceAccount:
+  api:
+    annotations:
+      # azure.workload.identity/client-id: <USER_ASSIGNED_MI_CLIENT_ID>
+      {}
+
+# Password-from-secret pattern. The Secret is populated by Secrets Store CSI
+# Driver from Azure Key Vault — recommended over plain K8s Secret.
+# Required keys in Key Vault: phi-audit-db-url, phi-audit-session-secret,
+# phi-audit-notarization-secret, phi-audit-azure-openai-key.
+database:
+  existingSecret: phi-audit-db
+  existingSecretKey: database-url
+  sidecar:
+    enabled: false            # explicit per direction
+
+logSource:
+  enabled: false              # Azure Monitor adapter deferred
+
+ingress:
+  className: azure-application-gateway
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    # appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    # appgw.ingress.kubernetes.io/appgw-ssl-certificate: phi-audit-cert
+
+networkPolicy:
+  enabled: true
+  egress:
+    # Azure endpoints (Azure OpenAI, Azure DB for PostgreSQL, Key Vault)
+    # don't have stable CIDRs. Production should either:
+    #   - use Private Endpoints + narrow allowedExternalCidrs to the PE CIDR, OR
+    #   - run Cilium and add FQDN policies in extraEgressRules for
+    #     <your-resource>.openai.azure.com, <your-server>.postgres.database.azure.com,
+    #     <your-vault>.vault.azure.net.
+    extraEgressRules: []

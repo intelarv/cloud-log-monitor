@@ -1,0 +1,70 @@
+# AWS overlay. Pair with deploy/helm/phi-audit/values.yaml.
+# Assumes EKS + RDS Postgres 15+ (pgvector 0.8) + Bedrock + Secrets Manager.
+
+llm:
+  provider: bedrock
+  defaultModel: anthropic.claude-3-5-haiku-20241022-v1:0
+  phiGuard: true
+  aws:
+    region: us-east-1         # REQUIRED — used by Bedrock + Titan embedder
+
+embedder:
+  provider: bedrock
+  model: amazon.titan-embed-text-v2:0
+  dim: 256
+
+# Bedrock + CloudWatch + Secrets Manager access goes through IRSA. The role
+# ARN is set per environment.
+serviceAccount:
+  api:
+    annotations:
+      # eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT>:role/<PHI_AUDIT_API_ROLE>
+      {}
+
+# Database via RDS IAM auth using a sidecar that mints + refreshes the auth
+# token. Two common patterns:
+#   1) aws-rds-iam-auth-token-generator sidecar (writes token to a tmpfs
+#      volume that the app reads as the password). Requires app coop.
+#   2) RDS Proxy in front of the DB + Secrets Manager-managed password +
+#      External Secrets Operator → K8s Secret. No app changes. Recommended.
+# The values below default to pattern (2): existingSecret managed by ESO.
+# Flip sidecar.enabled to true and fill in `args` if you go with pattern (1).
+database:
+  existingSecret: phi-audit-db
+  existingSecretKey: database-url
+  sidecar:
+    enabled: false
+    # Example for pattern (1):
+    # image: public.ecr.aws/aws-containers/rds-iam-auth-token:latest
+    # args: ["--region=us-east-1", "--host=<rds-endpoint>", "--user=phiaudit", "--token-file=/var/run/db/token"]
+
+logSource:
+  enabled: true
+  type: cloudwatch
+  cloudwatch:
+    region: us-east-1
+    # tenantId + logGroups MUST be set per environment
+
+ingress:
+  className: alb
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:<ACCOUNT>:certificate/<UUID>
+
+networkPolicy:
+  enabled: true
+  egress:
+    # AWS service endpoints (Bedrock, Secrets Manager, CloudWatch Logs, RDS)
+    # don't have stable CIDRs. Production should either:
+    #   - use VPC endpoints (PrivateLink) for each service and narrow this
+    #     to the VPC endpoint CIDRs, OR
+    #   - run Cilium and add a FQDN policy in `extraEgressRules` for
+    #     bedrock-runtime.<region>.amazonaws.com, secretsmanager.<region>.amazonaws.com,
+    #     logs.<region>.amazonaws.com, and the RDS endpoint hostname.
+    # Default below leaves 0.0.0.0/0:443 (from values.yaml) — overwrite
+    # allowedExternalCidrs once you've inventoried the VPC endpoint CIDRs.
+    extraEgressRules: []

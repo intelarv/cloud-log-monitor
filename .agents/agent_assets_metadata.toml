@@ -72,3 +72,15 @@ id = "e3lGzUgIy_ygRmcHy3o7C"
 uri = "file://exports/phi-audit-project.tar.gz"
 type = "unspecified"
 title = "phi-audit-project.tar.gz (1.9 MB, source only)"
+
+[[outputs]]
+id = "8gPip7AihVCdztIIfPAch"
+uri = "file://exports/phi-audit-project.zip"
+type = "unspecified"
+title = "phi-audit-project.zip (2.6 MB, source only)"
+
+[[outputs]]
+id = "o-rydJbvONbKTNEJyaV40"
+uri = "file://exports/project-source.zip"
+type = "unspecified"
+title = "Project source (zip)"

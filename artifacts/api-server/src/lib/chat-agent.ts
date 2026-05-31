@@ -179,7 +179,9 @@ function extractToolCall(
   return null;
 }
 
-function extractCitations(text: string): string[] {
+// Exported for the M11 eval suite (citation-correctness): observation only,
+// no behavior change. Parses inline `[F:<id>]` citation markers.
+export function extractCitations(text: string): string[] {
   const set = new Set<string>();
   const re = /\[F:([A-Za-z0-9_-]+)\]/g;
   let m: RegExpExecArray | null;

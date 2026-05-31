@@ -1,0 +1,353 @@
+{{- if .Values.evalGate.nightly.enabled }}
+{{- $e := .Values.evalGate.nightly }}
+# Nightly AI-backed eval gate. Runs `pnpm run eval:gate:llm` (EVAL_LLM=1) on a
+# schedule against the live DB + configured cloud LLM runtime. Uses the
+# `eval`-target image (full workspace + vitest), NOT the slim api runtime image.
+# Reuses the api ServiceAccount + the same DATABASE_URL / SESSION_SECRET /
+# NOTARIZATION_SECRET / LLM + embedder config the api Deployment uses.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "phi-audit.fullname" . }}-eval-nightly
+  labels:
+    {{- include "phi-audit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: eval-gate
+spec:
+  schedule: {{ $e.schedule | quote }}
+  {{- if $e.timeZone }}
+  timeZone: {{ $e.timeZone | quote }}
+  {{- end }}
+  concurrencyPolicy: {{ $e.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ $e.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $e.failedJobsHistoryLimit }}
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "phi-audit.labels" . | nindent 8 }}
+        app.kubernetes.io/component: eval-gate
+    spec:
+      backoffLimit: {{ $e.backoffLimit }}
+      activeDeadlineSeconds: {{ $e.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "phi-audit.labels" . | nindent 12 }}
+            app.kubernetes.io/component: eval-gate
+            {{- if .Values.azureWorkloadIdentity.enabled }}
+            azure.workload.identity/use: "true"
+            {{- end }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "phi-audit.api.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile: { type: RuntimeDefault }
+          {{- if .Values.database.sidecar.enabled }}
+          # ----------------------------------------------------------------
+          # DB connectivity sidecar (same as the api Deployment: cloud-sql-proxy
+          # on GCP, optional rds-iam-auth-token on AWS). The eval container
+          # connects to localhost and this terminates cloud-IAM auth to the
+          # real DB endpoint. Declared as a NATIVE sidecar (initContainer with
+          # restartPolicy: Always) — unlike the long-running Deployment, a Job
+          # must terminate, and a native sidecar is auto-stopped by the kubelet
+          # once the `eval` container exits (otherwise the proxy would keep the
+          # pod Running until activeDeadlineSeconds and the run would "fail").
+          # Native sidecars are GA as of k8s 1.29.
+          # ----------------------------------------------------------------
+          initContainers:
+            - name: {{ .Values.database.sidecar.name }}
+              image: {{ .Values.database.sidecar.image }}
+              restartPolicy: Always
+              args:
+                {{- toYaml .Values.database.sidecar.args | nindent 16 }}
+              resources:
+                {{- toYaml .Values.database.sidecar.resources | nindent 16 }}
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+          {{- end }}
+          containers:
+            - name: eval
+              image: "{{ $e.image.repository }}:{{ $e.image.tag }}"
+              imagePullPolicy: {{ $e.image.pullPolicy }}
+              env:
+                - name: NODE_ENV
+                  value: production
+                # ---- Nightly hard-fail floor for the live (non-deterministic) suites ----
+                {{- if $e.llmMinScore }}
+                - { name: EVAL_LLM_MIN_SCORE, value: {{ $e.llmMinScore | quote }} }
+                {{- end }}
+                # ---- Which run outcomes alert the channel(s): fail|warn|always ----
+                {{- if $e.notifyOn }}
+                - { name: EVAL_NOTIFY_ON, value: {{ $e.notifyOn | quote }} }
+                {{- end }}
+                # ---- Required secrets (same split as the api Deployment, §23.2) ----
+                - name: SESSION_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.sessionSecret.existingSecret }}
+                      key: {{ .Values.secrets.sessionSecret.key }}
+                - name: NOTARIZATION_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.notarizationSecret.existingSecret }}
+                      key: {{ .Values.secrets.notarizationSecret.key }}
+                # ---- Database URL ----
+                {{- if .Values.database.existingSecret }}
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.existingSecret }}
+                      key: {{ .Values.database.existingSecretKey }}
+                {{- else }}
+                - name: DATABASE_URL
+                  value: {{ .Values.database.databaseUrl | quote }}
+                {{- end }}
+                # ---- LLM runtime selection (the live suites need a real runtime) ----
+                {{- if .Values.llm.provider }}
+                - { name: LLM_PROVIDER,       value: {{ .Values.llm.provider | quote }} }
+                {{- end }}
+                {{- if .Values.llm.deploymentTarget }}
+                - { name: DEPLOYMENT_TARGET,  value: {{ .Values.llm.deploymentTarget | quote }} }
+                {{- end }}
+                {{- if .Values.llm.defaultModel }}
+                - { name: LLM_DEFAULT_MODEL,  value: {{ .Values.llm.defaultModel | quote }} }
+                {{- end }}
+                {{- if .Values.llm.aws.region }}
+                - { name: AWS_REGION,         value: {{ .Values.llm.aws.region | quote }} }
+                {{- end }}
+                {{- if eq .Values.llm.provider "vertex" }}
+                - { name: GCP_PROJECT_ID,     value: {{ required "llm.gcp.projectId is required for vertex" .Values.llm.gcp.projectId | quote }} }
+                - { name: GCP_LOCATION,       value: {{ .Values.llm.gcp.location | quote }} }
+                {{- else if eq .Values.embedder.provider "vertex" }}
+                - { name: GCP_PROJECT_ID,     value: {{ required "llm.gcp.projectId is required for vertex embedder" .Values.llm.gcp.projectId | quote }} }
+                - { name: GCP_LOCATION,       value: {{ .Values.llm.gcp.location | quote }} }
+                {{- end }}
+                {{- if eq .Values.llm.provider "azure-openai" }}
+                - name: AZURE_OPENAI_ENDPOINT
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.llmSecretName" . }}, key: azure-openai-endpoint } }
+                - name: AZURE_OPENAI_API_KEY
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.llmSecretName" . }}, key: azure-openai-api-key } }
+                - name: AZURE_OPENAI_DEPLOYMENT
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.llmSecretName" . }}, key: azure-openai-deployment } }
+                {{- if .Values.llm.azure.apiVersion }}
+                - { name: AZURE_OPENAI_API_VERSION, value: {{ .Values.llm.azure.apiVersion | quote }} }
+                {{- end }}
+                {{- end }}
+                # ---- Embedder (citation-live retrieval embeds query text) ----
+                {{- if .Values.embedder.provider }}
+                - { name: EMBEDDING_PROVIDER, value: {{ .Values.embedder.provider | quote }} }
+                {{- end }}
+                {{- if .Values.embedder.model }}
+                - { name: EMBEDDING_MODEL,    value: {{ .Values.embedder.model | quote }} }
+                {{- end }}
+                - { name: EMBEDDING_DIM,      value: {{ .Values.embedder.dim | quote }} }
+                {{- if .Values.embedder.tei.endpoint }}
+                - { name: TEI_ENDPOINT,       value: {{ .Values.embedder.tei.endpoint | quote }} }
+                {{- end }}
+                # ---- Channels (so a hard-fail can alert the team; same config +
+                #      severity gating as the api Deployment's finding alerts).
+                #      Inert when neither channel is enabled. ----
+                {{- if .Values.channels.slack.enabled }}
+                - name: CHANNEL_SLACK_WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-slack-webhook-url } }
+                - { name: CHANNEL_SLACK_MIN_SEVERITY, value: {{ .Values.channels.slack.minSeverity | quote }} }
+                {{- end }}
+                {{- if .Values.channels.webhook.enabled }}
+                - name: CHANNEL_WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-webhook-url } }
+                - name: CHANNEL_WEBHOOK_SECRET
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-webhook-secret } }
+                - { name: CHANNEL_WEBHOOK_ALLOWED_HOSTS, value: {{ join "," .Values.channels.webhook.allowedHosts | quote }} }
+                - { name: CHANNEL_WEBHOOK_MIN_SEVERITY,  value: {{ .Values.channels.webhook.minSeverity | quote }} }
+                {{- end }}
+                {{- if .Values.channels.pagerduty.enabled }}
+                - name: CHANNEL_PAGERDUTY_ROUTING_KEY
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-pagerduty-routing-key } }
+                - { name: CHANNEL_PAGERDUTY_MIN_SEVERITY, value: {{ .Values.channels.pagerduty.minSeverity | quote }} }
+                {{- if .Values.channels.pagerduty.eventsUrl }}
+                - { name: CHANNEL_PAGERDUTY_EVENTS_URL,   value: {{ .Values.channels.pagerduty.eventsUrl | quote }} }
+                {{- end }}
+                {{- end }}
+                # ---- External dead-man's-switch ping (cluster-down coverage).
+                #      When set, each completed --record run GETs this URL so an
+                #      EXTERNAL uptime monitor pages on-call if the whole cluster
+                #      goes dark and the nightly job never runs — the one case the
+                #      in-cluster heartbeat checker can't see. URL carries a
+                #      per-check token → from a Secret. Inert when unset.
+                #      See deploy/README.md "External leg". ----
+                {{- if $e.heartbeatPing.existingSecret }}
+                - name: HEARTBEAT_PING_URL
+                  valueFrom: { secretKeyRef: { name: {{ $e.heartbeatPing.existingSecret }}, key: {{ $e.heartbeatPing.key }} } }
+                {{- if $e.heartbeatPing.timeoutMs }}
+                - { name: HEARTBEAT_PING_TIMEOUT_MS, value: {{ $e.heartbeatPing.timeoutMs | quote }} }
+                {{- end }}
+                {{- end }}
+              resources:
+                {{- toYaml $e.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                capabilities: { drop: ["ALL"] }
+          {{- with $e.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $e.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $e.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}
+{{- if .Values.evalGate.heartbeat.enabled }}
+{{- $h := .Values.evalGate.heartbeat }}
+{{- $e := .Values.evalGate.nightly }}
+---
+# Dead-man's switch for the nightly eval gate. The nightly CronJob above stamps
+# a heartbeat row (via eval-gate-llm.sh → heartbeat.mjs --record) on EVERY
+# completed run. This more-frequent CronJob runs `heartbeat.mjs --check`: if the
+# last stamp is older than EVAL_HEARTBEAT_MAX_AGE_MINUTES it pages on-call
+# through the SAME CHANNEL_* config + severity gating as the eval run alerts —
+# closing the "the nightly job silently stopped running, so produced no message
+# at all" gap. Reuses the same `eval`-target image (it carries heartbeat.mjs +
+# pg) and the same DB connectivity (sidecar) as the nightly job, but needs no
+# LLM/embedder config. NOTE: both CronJobs run in-cluster, so a total
+# cluster/scheduler outage silences the checker too — layer an external uptime
+# ping for that failure mode (see deploy/README.md).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "phi-audit.fullname" . }}-eval-heartbeat
+  labels:
+    {{- include "phi-audit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: eval-gate-heartbeat
+spec:
+  schedule: {{ $h.schedule | quote }}
+  {{- if $h.timeZone }}
+  timeZone: {{ $h.timeZone | quote }}
+  {{- end }}
+  concurrencyPolicy: {{ $h.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ $h.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $h.failedJobsHistoryLimit }}
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "phi-audit.labels" . | nindent 8 }}
+        app.kubernetes.io/component: eval-gate-heartbeat
+    spec:
+      backoffLimit: {{ $h.backoffLimit }}
+      activeDeadlineSeconds: {{ $h.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "phi-audit.labels" . | nindent 12 }}
+            app.kubernetes.io/component: eval-gate-heartbeat
+            {{- if .Values.azureWorkloadIdentity.enabled }}
+            azure.workload.identity/use: "true"
+            {{- end }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "phi-audit.api.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile: { type: RuntimeDefault }
+          {{- if .Values.database.sidecar.enabled }}
+          # Same native DB sidecar as the nightly job — the checker reads the
+          # heartbeat row over localhost; the native sidecar (initContainer w/
+          # restartPolicy: Always) auto-stops once the check container exits so
+          # the Job terminates.
+          initContainers:
+            - name: {{ .Values.database.sidecar.name }}
+              image: {{ .Values.database.sidecar.image }}
+              restartPolicy: Always
+              args:
+                {{- toYaml .Values.database.sidecar.args | nindent 16 }}
+              resources:
+                {{- toYaml .Values.database.sidecar.resources | nindent 16 }}
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+          {{- end }}
+          containers:
+            - name: eval-heartbeat
+              # Defaults to the nightly eval image (carries heartbeat.mjs + pg);
+              # override evalGate.heartbeat.image.* to pin a different one.
+              image: "{{ ($h.image.repository | default $e.image.repository) }}:{{ ($h.image.tag | default $e.image.tag) }}"
+              imagePullPolicy: {{ $h.image.pullPolicy }}
+              command: ["node", "artifacts/api-server/evals/heartbeat.mjs", "--check"]
+              env:
+                - name: NODE_ENV
+                  value: production
+                # ---- How stale (minutes) the last nightly stamp may be before paging ----
+                - { name: EVAL_HEARTBEAT_MAX_AGE_MINUTES, value: {{ $h.maxAgeMinutes | quote }} }
+                {{- if $h.name }}
+                - { name: EVAL_HEARTBEAT_NAME, value: {{ $h.name | quote }} }
+                {{- end }}
+                # ---- Database URL (same secret/value as the nightly job) ----
+                {{- if .Values.database.existingSecret }}
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.existingSecret }}
+                      key: {{ .Values.database.existingSecretKey }}
+                {{- else }}
+                - name: DATABASE_URL
+                  value: {{ .Values.database.databaseUrl | quote }}
+                {{- end }}
+                # ---- Channels: a stale heartbeat pages through the SAME config +
+                #      severity gating as finding/eval alerts. Inert when unset. ----
+                {{- if .Values.channels.slack.enabled }}
+                - name: CHANNEL_SLACK_WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-slack-webhook-url } }
+                - { name: CHANNEL_SLACK_MIN_SEVERITY, value: {{ .Values.channels.slack.minSeverity | quote }} }
+                {{- end }}
+                {{- if .Values.channels.webhook.enabled }}
+                - name: CHANNEL_WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-webhook-url } }
+                - name: CHANNEL_WEBHOOK_SECRET
+                  valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-webhook-secret } }
+                - { name: CHANNEL_WEBHOOK_ALLOWED_HOSTS, value: {{ join "," .Values.channels.webhook.allowedHosts | quote }} }
+                - { name: CHANNEL_WEBHOOK_MIN_SEVERITY,  value: {{ .Values.channels.webhook.minSeverity | quote }} }
+                {{- end }}
+              resources:
+                {{- toYaml $h.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                capabilities: { drop: ["ALL"] }
+          {{- with $h.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $h.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $h.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

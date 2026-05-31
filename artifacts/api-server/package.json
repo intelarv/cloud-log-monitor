@@ -8,7 +8,9 @@
     "build": "node ./build.mjs",
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "eval": "rm -rf evals/results && vitest run --config vitest.eval.config.ts && node evals/gate.mjs",
+    "eval:update": "rm -rf evals/results && vitest run --config vitest.eval.config.ts && node evals/gate.mjs --update"
   },
   "dependencies": {
     "@google/genai": "^1.52.0",
@@ -32,6 +34,7 @@
     "@vitest/coverage-v8": "^4.1.7",
     "esbuild": "0.27.3",
     "esbuild-plugin-pino": "^2.3.3",
+    "pg": "^8.20.0",
     "pino-pretty": "^13.1.3",
     "thread-stream": "3.1.0",
     "vitest": "^4.1.7"

@@ -138,4 +138,14 @@ Fail-fast validation. Required values that have no safe default.
 {{- if eq (len .Values.logSource.cloudwatch.logGroups) 0 -}}{{- fail "logSource.cloudwatch.logGroups is required when logSource.enabled=true" -}}{{- end -}}
 {{- if not .Values.logSource.cloudwatch.region -}}{{- fail "logSource.cloudwatch.region is required when logSource.enabled=true" -}}{{- end -}}
 {{- end -}}
+{{/* Nightly eval gate needs its own (eval-target) image — the slim api runtime
+     image has no pnpm/vitest and cannot run the suites. */}}
+{{- if .Values.evalGate.nightly.enabled -}}
+{{- if not .Values.evalGate.nightly.image.repository -}}
+{{- fail "evalGate.nightly.image.repository is required when evalGate.nightly.enabled=true (build with: docker build -f deploy/docker/api-server.Dockerfile --target eval -t <registry>/phi-audit-eval:<sha> .)" -}}
+{{- end -}}
+{{- if not .Values.evalGate.nightly.image.tag -}}
+{{- fail "evalGate.nightly.image.tag is required when evalGate.nightly.enabled=true — pin to an immutable SHA tag" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}

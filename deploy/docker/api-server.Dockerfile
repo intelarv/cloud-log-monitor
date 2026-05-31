@@ -35,6 +35,35 @@ RUN pnpm run typecheck:libs \
 RUN pnpm --filter @workspace/api-server deploy --prod /repo/deploy-out
 
 # ---------------------------------------------------------------------------
+# Optional CI / nightly-eval image. Unlike the slim `runtime` stage below this
+# keeps the FULL workspace + devDependencies (pnpm, vitest, the eval suites)
+# so it can run `pnpm run eval:gate:llm`. This is NOT a production image —
+# build + push it under a separate tag and point the Helm CronJob
+# (evalGate.nightly in deploy/helm/phi-audit) at it:
+#
+#   docker build -f deploy/docker/api-server.Dockerfile --target eval \
+#     -t <registry>/phi-audit-eval:<sha> .
+#
+# At run time it needs DATABASE_URL + a configured LLM runtime (LLM_PROVIDER +
+# creds); the CronJob injects them from the same Secrets the API uses.
+# ---------------------------------------------------------------------------
+FROM builder AS eval
+WORKDIR /repo
+
+# Non-root, matching the runtime image. The builder created /repo as root; hand
+# it to the unprivileged user so the eval run can write evals/results (a cache).
+RUN groupadd --system --gid 10001 phiaudit \
+ && useradd  --system --uid 10001 --gid phiaudit --home-dir /repo --shell /usr/sbin/nologin phiaudit \
+ && chown -R phiaudit:phiaudit /repo
+USER phiaudit
+
+ENV NODE_ENV=production \
+    NODE_OPTIONS="--enable-source-maps"
+
+# EVAL_LLM=1 is set inside eval-gate-llm.sh; floor via EVAL_LLM_MIN_SCORE env.
+CMD ["pnpm", "run", "eval:gate:llm"]
+
+# ---------------------------------------------------------------------------
 
 FROM node:${NODE_VERSION} AS runtime
 WORKDIR /app

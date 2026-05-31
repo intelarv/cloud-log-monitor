@@ -294,6 +294,20 @@ CREATE TRIGGER ledger_checkpoints_no_truncate
   BEFORE TRUNCATE ON ledger_checkpoints
   FOR EACH STATEMENT EXECUTE FUNCTION ledger_checkpoints_append_only();
 ALTER TABLE ledger_checkpoints ENABLE ALWAYS TRIGGER ledger_checkpoints_no_truncate;
+
+-- M8: per-source ingest cursor table. Unlike ledger_checkpoints, this is
+-- MUTABLE — the cursor advances on every successful poll. It carries no
+-- audit-evidence weight (the audit anchor for ingested findings is the
+-- finding.created ledger event, which is locked down). Created here for
+-- the same reason as ledger_checkpoints: keep the schema source of truth
+-- in setup-sql for first-boot ordering, mirrored in
+-- lib/db/src/schema/log-source-checkpoints.ts.
+CREATE TABLE IF NOT EXISTS log_source_checkpoints (
+  source_name text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  last_event_ts bigint NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 `;
 }
 

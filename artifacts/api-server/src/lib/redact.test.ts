@@ -1,10 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { SAFE_REFUSAL, scanForPhi } from "./redact";
+import { BENIGN_FIXTURES } from "../evals/fixtures/phi";
 
 describe("scanForPhi", () => {
   it("returns no hits for benign text", () => {
     expect(scanForPhi("There are 3 critical findings open.")).toEqual([]);
     expect(scanForPhi("")).toEqual([]);
+  });
+
+  // Precision control set: realistic operational log lines that look
+  // numeric/structured/proper-noun-like but contain no PHI. This shares the
+  // exact corpus used by the on-demand detector eval (BENIGN_FIXTURES) so a
+  // future regex tweak that re-introduces a false positive fails fast in the
+  // normal `pnpm test` run, not just in the eval gate.
+  describe("benign precision corpus (shared with detector eval)", () => {
+    it.each(BENIGN_FIXTURES)(
+      "produces zero detector hits for $id: $text",
+      ({ text }) => {
+        expect(scanForPhi(text)).toEqual([]);
+      },
+    );
   });
 
   describe("PHI detectors", () => {

@@ -18,6 +18,7 @@ import type { AlertSeverity } from "../alerts";
 import { logger } from "../logger";
 import { createSlackAdapter } from "./adapters/slack";
 import { createWebhookAdapter } from "./adapters/webhook";
+import { createPagerDutyAdapter } from "./adapters/pagerduty";
 import type { ChannelAdapter } from "./types";
 
 const SEVERITY_RANK: Record<AlertSeverity, number> = {
@@ -48,6 +49,12 @@ const WebhookEnvSchema = z.object({
   CHANNEL_WEBHOOK_SECRET: z.string().min(16).optional(),
   CHANNEL_WEBHOOK_ALLOWED_HOSTS: z.string().optional(),
   CHANNEL_WEBHOOK_MIN_SEVERITY: SeveritySchema.optional(),
+});
+
+const PagerDutyEnvSchema = z.object({
+  CHANNEL_PAGERDUTY_ROUTING_KEY: z.string().min(1).optional(),
+  CHANNEL_PAGERDUTY_EVENTS_URL: z.string().url().optional(),
+  CHANNEL_PAGERDUTY_MIN_SEVERITY: SeveritySchema.optional(),
 });
 
 /** Build the channel configuration from `process.env`. Inert if no
@@ -104,6 +111,34 @@ export function buildChannelsFromEnv(env: NodeJS.ProcessEnv = process.env): Chan
     logger.warn(
       { err: webhookParsed.error.message },
       "webhook channel env invalid; skipping adapter",
+    );
+  }
+
+  const pagerdutyParsed = PagerDutyEnvSchema.safeParse(env);
+  if (pagerdutyParsed.success) {
+    const e = pagerdutyParsed.data;
+    if (e.CHANNEL_PAGERDUTY_ROUTING_KEY) {
+      try {
+        out.push({
+          adapter: createPagerDutyAdapter({
+            routingKey: e.CHANNEL_PAGERDUTY_ROUTING_KEY,
+            ...(e.CHANNEL_PAGERDUTY_EVENTS_URL
+              ? { eventsUrl: e.CHANNEL_PAGERDUTY_EVENTS_URL }
+              : {}),
+          }),
+          minSeverity: e.CHANNEL_PAGERDUTY_MIN_SEVERITY ?? "warning",
+        });
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          "pagerduty adapter construction failed; not enabled",
+        );
+      }
+    }
+  } else {
+    logger.warn(
+      { err: pagerdutyParsed.error.message },
+      "pagerduty channel env invalid; skipping adapter",
     );
   }
 

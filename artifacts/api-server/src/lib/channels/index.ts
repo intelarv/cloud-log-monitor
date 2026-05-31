@@ -17,3 +17,9 @@ export {
   signWebhookBody,
   verifyWebhookSignature,
 } from "./adapters/webhook";
+export {
+  createPagerDutyAdapter,
+  toPagerDutySeverity,
+  pagerDutyDedupKey,
+  PAGERDUTY_EVENTS_URL,
+} from "./adapters/pagerduty";

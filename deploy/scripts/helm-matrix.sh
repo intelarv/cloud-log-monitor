@@ -91,7 +91,100 @@ done
 # ---------------------------------------------------------------------------
 # 3. fail-fast validators (negative cases)
 # ---------------------------------------------------------------------------
+heading "[2b/3] nightly eval CronJob (positive)"
+# Enabling evalGate.nightly with a valid eval image must render a CronJob.
+EVAL_OUT="$OUT_DIR/aws-eval.yaml"
+if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+    -f "$CHART_DIR/values.yaml" \
+    -f "$CHART_DIR/values-aws.yaml" \
+    -f "$CI_DIR/values-aws-ci.yaml" \
+    --set evalGate.nightly.enabled=true \
+    --set evalGate.nightly.image.repository=example.dkr.ecr.us-east-1.amazonaws.com/phi-audit-eval \
+    --set evalGate.nightly.image.tag=sha-deadbeef \
+    --set evalGate.nightly.llmMinScore=0.5 >"$EVAL_OUT" 2>"$OUT_DIR/aws-eval.err"; then
+  grep -q '^kind: CronJob' "$EVAL_OUT" || fail "eval-cronjob: no CronJob in render"
+  grep -q 'EVAL_LLM_MIN_SCORE' "$EVAL_OUT" || fail "eval-cronjob: llmMinScore not wired to env"
+  pass "render: aws + evalGate.nightly → CronJob present"
+else
+  cat "$OUT_DIR/aws-eval.err"
+  fail "render: aws + evalGate.nightly"
+fi
+# Disabled by default: no CronJob in the standard render.
+if grep -q '^kind: CronJob' "$OUT_DIR/aws.yaml"; then
+  fail "eval-cronjob: CronJob rendered while evalGate.nightly disabled"
+fi
+pass "default: no CronJob when evalGate.nightly disabled"
+
+# Sidecar-mode (GCP cloud-sql-proxy): the CronJob must carry the same DB
+# connectivity sidecar as the api Deployment, declared as a NATIVE sidecar
+# (initContainer + restartPolicy: Always) so the Job can still terminate.
+EVAL_GCP_OUT="$OUT_DIR/gcp-eval.yaml"
+if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+    -f "$CHART_DIR/values.yaml" \
+    -f "$CHART_DIR/values-gcp.yaml" \
+    -f "$CI_DIR/values-gcp-ci.yaml" \
+    --set evalGate.nightly.enabled=true \
+    --set evalGate.nightly.image.repository=us-docker.pkg.dev/example/phi-audit/phi-audit-eval \
+    --set evalGate.nightly.image.tag=sha-deadbeef >"$EVAL_GCP_OUT" 2>"$OUT_DIR/gcp-eval.err"; then
+  CRONJOB_DOC=$(awk '/^# Source: phi-audit\/templates\/eval-cronjob.yaml/{f=1} f{print} /^# Source/{if(f && $0 !~ /eval-cronjob/)exit}' "$EVAL_GCP_OUT")
+  grep -q '^kind: CronJob' "$EVAL_GCP_OUT" || fail "eval-cronjob(gcp): no CronJob in render"
+  printf '%s' "$CRONJOB_DOC" | grep -q 'initContainers:' || fail "eval-cronjob(gcp): sidecar missing from CronJob"
+  printf '%s' "$CRONJOB_DOC" | grep -q 'restartPolicy: Always' || fail "eval-cronjob(gcp): sidecar not a native (Always-restart) sidecar"
+  pass "render: gcp + evalGate.nightly → CronJob carries native DB sidecar"
+else
+  cat "$OUT_DIR/gcp-eval.err"
+  fail "render: gcp + evalGate.nightly"
+fi
+
+# Heartbeat dead-man's-switch CronJob: enabling evalGate.heartbeat must render a
+# SECOND CronJob (the --check job) that (a) reuses the nightly eval image, (b)
+# carries the same native DB sidecar (GCP cloud-sql-proxy) so it can terminate,
+# and (c) wires the channel config so a stale heartbeat can page on-call. Render
+# on the gcp overlay (DB sidecar on) with channels + heartbeat enabled.
+EVAL_HB_OUT="$OUT_DIR/gcp-eval-heartbeat.yaml"
+if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+    -f "$CHART_DIR/values.yaml" \
+    -f "$CHART_DIR/values-gcp.yaml" \
+    -f "$CI_DIR/values-gcp-ci.yaml" \
+    --set evalGate.nightly.image.repository=us-docker.pkg.dev/example/phi-audit/phi-audit-eval \
+    --set evalGate.nightly.image.tag=sha-deadbeef \
+    --set evalGate.heartbeat.enabled=true \
+    --set channels.slack.enabled=true \
+    --set channels.webhook.enabled=true >"$EVAL_HB_OUT" 2>"$OUT_DIR/gcp-eval-heartbeat.err"; then
+  # Isolate just the eval-cronjob.yaml render, then narrow to the heartbeat doc
+  # (the second `kind: CronJob` — nightly is disabled here, so it's the only one,
+  # but match by name to stay robust if that changes).
+  HB_DOC=$(awk '/name: phi-audit-eval-heartbeat$/{f=1} f && /^# Source:/{exit} f{print}' "$EVAL_HB_OUT")
+  grep -q '^  name: phi-audit-eval-heartbeat$' "$EVAL_HB_OUT" || fail "eval-heartbeat: heartbeat CronJob not rendered"
+  grep -q '^kind: CronJob' "$EVAL_HB_OUT" || fail "eval-heartbeat: no CronJob in render"
+  # Disabled nightly → only the heartbeat CronJob should be present.
+  grep -q '^  name: phi-audit-eval-nightly$' "$EVAL_HB_OUT" && fail "eval-heartbeat: nightly CronJob rendered while disabled"
+  printf '%s' "$HB_DOC" | grep -q 'heartbeat.mjs' || fail "eval-heartbeat: --check command not wired"
+  printf '%s' "$HB_DOC" | grep -q 'EVAL_HEARTBEAT_MAX_AGE_MINUTES' || fail "eval-heartbeat: maxAgeMinutes not wired to env"
+  printf '%s' "$HB_DOC" | grep -q 'phi-audit/phi-audit-eval:sha-deadbeef' || fail "eval-heartbeat: nightly image not reused"
+  printf '%s' "$HB_DOC" | grep -q 'initContainers:' || fail "eval-heartbeat: native DB sidecar missing"
+  printf '%s' "$HB_DOC" | grep -q 'restartPolicy: Always' || fail "eval-heartbeat: sidecar not a native (Always-restart) sidecar"
+  printf '%s' "$HB_DOC" | grep -q 'CHANNEL_SLACK_WEBHOOK_URL' || fail "eval-heartbeat: slack channel not wired"
+  printf '%s' "$HB_DOC" | grep -q 'CHANNEL_WEBHOOK_URL' || fail "eval-heartbeat: webhook channel not wired"
+  pass "render: gcp + evalGate.heartbeat → heartbeat CronJob (sidecar + channels) present"
+else
+  cat "$OUT_DIR/gcp-eval-heartbeat.err"
+  fail "render: gcp + evalGate.heartbeat"
+fi
+# Disabled by default: no heartbeat CronJob in the standard render.
+if grep -q '^  name: phi-audit-eval-heartbeat$' "$OUT_DIR/gcp.yaml"; then
+  fail "eval-heartbeat: CronJob rendered while evalGate.heartbeat disabled"
+fi
+pass "default: no heartbeat CronJob when evalGate.heartbeat disabled"
+
 heading "[3/3] negative cases (fail-fast validators must trip)"
+
+# Nightly eval enabled without an eval image.
+expect_fail "eval-missing-image" "evalGate.nightly.image.repository is required" \
+  -f "$CHART_DIR/values.yaml" \
+  -f "$CHART_DIR/values-aws.yaml" \
+  -f "$CI_DIR/values-aws-ci.yaml" \
+  --set evalGate.nightly.enabled=true
 
 # Missing image tag.
 expect_fail "missing-image-tag" "image.api.tag is required" \

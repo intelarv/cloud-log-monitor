@@ -25,6 +25,7 @@ Selected runtime:
   Log source:     {{ if .Values.logSource.enabled }}{{ .Values.logSource.type }}{{ else }}(none — set logSource.enabled=true){{ end }}
   Supervisor:     {{ if .Values.supervisor.enabled }}ENABLED (daily token budget: {{ .Values.supervisor.dailyTokenBudget }}){{ else }}disabled{{ end }}
   Channels:       slack={{ .Values.channels.slack.enabled }} webhook={{ .Values.channels.webhook.enabled }}
+  Nightly eval:   {{ if .Values.evalGate.nightly.enabled }}ENABLED (schedule: {{ .Values.evalGate.nightly.schedule }}{{ if .Values.evalGate.nightly.llmMinScore }}, hard-fail floor: {{ .Values.evalGate.nightly.llmMinScore }}{{ else }}, scores as warnings{{ end }}){{ else }}disabled (set evalGate.nightly.enabled=true + eval image){{ end }}
 
 {{- if eq .Values.secrets.sessionSecret.existingSecret .Values.secrets.notarizationSecret.existingSecret }}
 

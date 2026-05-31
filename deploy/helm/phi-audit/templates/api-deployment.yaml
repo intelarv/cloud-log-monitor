@@ -157,6 +157,14 @@ spec:
             - { name: CHANNEL_WEBHOOK_ALLOWED_HOSTS, value: {{ join "," .Values.channels.webhook.allowedHosts | quote }} }
             - { name: CHANNEL_WEBHOOK_MIN_SEVERITY,  value: {{ .Values.channels.webhook.minSeverity | quote }} }
             {{- end }}
+            {{- if .Values.channels.pagerduty.enabled }}
+            - name: CHANNEL_PAGERDUTY_ROUTING_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.channelSecretName" . }}, key: channel-pagerduty-routing-key } }
+            - { name: CHANNEL_PAGERDUTY_MIN_SEVERITY, value: {{ .Values.channels.pagerduty.minSeverity | quote }} }
+            {{- if .Values.channels.pagerduty.eventsUrl }}
+            - { name: CHANNEL_PAGERDUTY_EVENTS_URL,   value: {{ .Values.channels.pagerduty.eventsUrl | quote }} }
+            {{- end }}
+            {{- end }}
             # ---- Supervisor ----
             {{- if .Values.supervisor.enabled }}
             - { name: AGENT_SUPERVISOR_ENABLED, value: "1" }

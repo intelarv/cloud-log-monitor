@@ -182,6 +182,14 @@ channels:
     enabled: false
     minSeverity: warning
     allowedHosts: []          # CSV in env; chart joins them
+  # PagerDuty Events API v2. The routing (integration) key is the secret —
+  # store it in the channelSecret under key `channel-pagerduty-routing-key`.
+  # eventsUrl defaults to the global endpoint; set the EU endpoint
+  # (https://events.eu.pagerduty.com/v2/enqueue) for EU accounts.
+  pagerduty:
+    enabled: false
+    minSeverity: warning
+    eventsUrl: ""             # optional override; empty → global endpoint
 
 # ----------------------------------------------------------------------------
 # Supervisor (M5). Off by default — turn on per environment.
@@ -189,6 +197,103 @@ channels:
 supervisor:
   enabled: false
   dailyTokenBudget: 1000000
+
+# ----------------------------------------------------------------------------
+# Nightly eval gate (the credentialed AI-backed quality suites). Off by default.
+# When enabled, a CronJob runs `pnpm run eval:gate:llm` on a schedule. It needs
+# the eval image (built from the `eval` target of
+# deploy/docker/api-server.Dockerfile — NOT the slim api runtime image, which
+# has no pnpm/vitest) and reuses the api ServiceAccount + the same
+# DATABASE_URL / SESSION_SECRET / NOTARIZATION_SECRET / LLM + embedder config,
+# so the live suites hit the same DB + cloud LLM runtime the app uses.
+#
+# The per-change gate (deploy/scripts/eval-gate.sh) stays credential-free; only
+# this scheduled job needs secrets.
+# ----------------------------------------------------------------------------
+evalGate:
+  nightly:
+    enabled: false
+    schedule: "0 3 * * *"       # 03:00 cluster-local, nightly (cron syntax)
+    timeZone: ""                # optional IANA TZ (K8s >=1.27 CronJob.spec.timeZone)
+    image:
+      repository: ""            # REQUIRED when enabled — the `eval`-target image
+      tag: ""                   # REQUIRED when enabled — pin to an immutable SHA
+      pullPolicy: IfNotPresent
+    # Absolute hard-fail floor (0..1) for the non-deterministic LLM suites.
+    # Empty → live-suite scores are surfaced as warnings only (the job still
+    # hard-fails on execution errors + deterministic regressions). Set e.g.
+    # "0.5" to page on catastrophic live-agent regressions without flaky
+    # delta-based paging. Passed through as EVAL_LLM_MIN_SCORE.
+    llmMinScore: ""
+    # Which run outcomes post to the configured channel(s). Passed through as
+    # EVAL_NOTIFY_ON. fail (default) = only hard-fails post (high severity);
+    # warn = also post passing-with-warnings runs (warning severity); always =
+    # also post an all-green confirmation (warning severity). Warning/clean runs
+    # map to "warning" so CHANNEL_*_MIN_SEVERITY gating still applies. Empty →
+    # the notifier's own default (fail).
+    notifyOn: ""
+    # External dead-man's-switch ping (cluster-down coverage). Each completed
+    # nightly --record run hits this URL with a plain GET so an EXTERNAL uptime
+    # monitor (healthchecks.io, Cronitor, etc.) pages on-call if the whole
+    # cluster goes dark and the nightly job never runs — the one failure mode the
+    # in-cluster heartbeat checker can't see (it can't report the cluster it
+    # lives in is down). The URL carries a per-check token, so treat it as a
+    # secret: store it in a Secret and reference it here (same secretKeyRef
+    # pattern as the CHANNEL_* webhook URLs). Inert when existingSecret is empty.
+    # Passed through as HEARTBEAT_PING_URL. See deploy/README.md "External leg".
+    heartbeatPing:
+      existingSecret: ""        # Secret holding the ping URL; empty → no external ping
+      key: heartbeat-ping-url   # key within that Secret
+      # Optional request timeout (ms) for the ping; empty → 10000 default.
+      # Passed through as HEARTBEAT_PING_TIMEOUT_MS.
+      timeoutMs: ""
+    concurrencyPolicy: Forbid   # don't overlap runs if one overruns its window
+    activeDeadlineSeconds: 1800 # kill a hung run after 30m
+    backoffLimit: 0             # one shot per schedule; history keeps the logs
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits:   { cpu: 1,    memory: 1Gi   }
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
+  # --------------------------------------------------------------------------
+  # Dead-man's switch for the nightly gate above. The nightly job stamps a
+  # heartbeat on EVERY completed run; this lighter, more-frequent CronJob pages
+  # on-call (through the SAME CHANNEL_* config + severity gating) when that
+  # stamp goes stale — i.e. the nightly job silently stopped running and
+  # produced no other alert (image pull failure, schedule disabled, cluster
+  # issue). Off by default; enable alongside the nightly gate. Reuses the
+  # nightly `eval`-target image + the DB sidecar; needs no LLM/embedder config.
+  # NOTE: in-cluster — a total cluster outage silences the checker too; layer
+  # an external uptime ping for that case (see deploy/README.md).
+  # --------------------------------------------------------------------------
+  heartbeat:
+    enabled: false
+    schedule: "0 */6 * * *"     # every 6h (detection latency for a missed night)
+    timeZone: ""                # optional IANA TZ
+    # Max age (minutes) of the last nightly stamp before paging. Must exceed one
+    # nightly interval + run duration + grace; default 26h tolerates the 24h
+    # cadence. Passed through as EVAL_HEARTBEAT_MAX_AGE_MINUTES.
+    maxAgeMinutes: 1560
+    name: "nightly"             # heartbeat key; matches the nightly job's stamp
+    image:
+      repository: ""            # empty → reuse evalGate.nightly.image.repository
+      tag: ""                   # empty → reuse evalGate.nightly.image.tag
+      pullPolicy: IfNotPresent
+    concurrencyPolicy: Forbid
+    activeDeadlineSeconds: 120  # a heartbeat read is quick
+    backoffLimit: 0
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits:   { cpu: 200m, memory: 128Mi }
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
 
 # ----------------------------------------------------------------------------
 # Ingress. Production runs behind a TLS-terminating Ingress with the cloud's

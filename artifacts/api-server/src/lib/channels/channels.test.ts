@@ -17,6 +17,11 @@ import {
   createWebhookAdapter,
 } from "./adapters/webhook";
 import { createSlackAdapter } from "./adapters/slack";
+import {
+  createPagerDutyAdapter,
+  pagerDutyDedupKey,
+  toPagerDutySeverity,
+} from "./adapters/pagerduty";
 import type { ChannelAdapter, ChannelEnvelope, DispatchResult } from "./types";
 
 const TENANT = "00000000-0000-0000-0000-00000000c6a6";
@@ -253,6 +258,102 @@ describe("slack adapter", () => {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+});
+
+describe("pagerduty adapter", () => {
+  it("maps severity onto the PagerDuty enum (high → error)", () => {
+    expect(toPagerDutySeverity("warning")).toBe("warning");
+    expect(toPagerDutySeverity("high")).toBe("error");
+    expect(toPagerDutySeverity("critical")).toBe("critical");
+  });
+
+  it("derives a stable dedup key from tenant + event + subject", () => {
+    const base: ChannelEnvelope = {
+      severity: "critical",
+      eventType: "ledger.chain_invalid",
+      tenantId: TENANT,
+      ledgerSeq: 5,
+      ledgerHashShort: "abc",
+      subjectType: "ledger",
+      subjectId: "scope=24h",
+      occurredAt: new Date(0).toISOString(),
+    };
+    const key = pagerDutyDedupKey(base);
+    expect(key).toBe(`phi-audit/${TENANT}/ledger.chain_invalid/ledger/scope=24h`);
+    // Same subject + event → same incident; only the seq changes.
+    expect(pagerDutyDedupKey({ ...base, ledgerSeq: 99 })).toBe(key);
+  });
+
+  it("posts an Events API v2 trigger with metadata-only custom_details", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 202 }));
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      const adapter = createPagerDutyAdapter({ routingKey: "R0UT1NGK3Y00000000000000000000" });
+      const res = await adapter.send({
+        severity: "critical",
+        eventType: "ledger.chain_invalid",
+        tenantId: TENANT,
+        ledgerSeq: 42,
+        ledgerHashShort: "abcdef0123456789",
+        subjectType: "ledger",
+        subjectId: "scope=24h",
+        occurredAt: new Date(0).toISOString(),
+      });
+      expect(res.ok).toBe(true);
+      expect(res.statusCode).toBe(202);
+      const args = fetchMock.mock.calls[0]!;
+      expect(args[0]).toBe("https://events.pagerduty.com/v2/enqueue");
+      const body = JSON.parse((args[1] as RequestInit).body as string);
+      expect(body.routing_key).toBe("R0UT1NGK3Y00000000000000000000");
+      expect(body.event_action).toBe("trigger");
+      expect(body.payload.severity).toBe("critical");
+      expect(body.payload.summary).toContain("ledger.chain_invalid");
+      expect(body.dedup_key).toBe(
+        `phi-audit/${TENANT}/ledger.chain_invalid/ledger/scope=24h`,
+      );
+      // custom_details is metadata only — no payload/actor/detector fields.
+      expect(body.payload.custom_details).toEqual({
+        ledger_seq: 42,
+        ledger_hash_short: "abcdef0123456789",
+        subject_type: "ledger",
+        subject_id: "scope=24h",
+      });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("returns ok=false on non-2xx and never throws", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("nope", { status: 429 }));
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      const adapter = createPagerDutyAdapter({ routingKey: "R0UT1NGK3Y00000000000000000000" });
+      const res = await adapter.send({
+        severity: "warning",
+        eventType: "x",
+        tenantId: null,
+        ledgerSeq: 1,
+        ledgerHashShort: "h",
+        subjectType: null,
+        subjectId: null,
+        occurredAt: new Date(0).toISOString(),
+      });
+      expect(res.ok).toBe(false);
+      expect(res.statusCode).toBe(429);
+      expect(res.err).toMatch(/429/);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("throws at construction on a missing routing key or malformed events URL", () => {
+    expect(() => createPagerDutyAdapter({ routingKey: "" })).toThrow(/routingKey is required/);
+    expect(() =>
+      createPagerDutyAdapter({ routingKey: "k", eventsUrl: "not-a-url" }),
+    ).toThrow();
   });
 });
 

@@ -8,7 +8,9 @@
     "typecheck:libs": "tsc --build",
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
     "helm:matrix": "bash deploy/scripts/helm-matrix.sh",
-    "tf:fmt": "bash deploy/scripts/tf-fmt-check.sh"
+    "tf:fmt": "bash deploy/scripts/tf-fmt-check.sh",
+    "eval:gate": "bash deploy/scripts/eval-gate.sh",
+    "eval:gate:llm": "bash deploy/scripts/eval-gate-llm.sh"
   },
   "private": true,
   "devDependencies": {

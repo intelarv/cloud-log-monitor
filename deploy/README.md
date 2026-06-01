@@ -320,6 +320,30 @@ instead.
 | **GCP** | Workload Identity → Vertex (no key) | Cloud SQL Auth Proxy sidecar w/ `--auto-iam-authn` | **On** — `gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.13.0` | NOTARIZATION_SECRET in a separate GCP project |
 | **Azure** | Workload Identity → Azure OpenAI; API key still required by SDK shape | Password from Key Vault via Secrets Store CSI Driver | **Off** — per direction; managed identity to Azure DB is direct | NOTARIZATION_SECRET in a separate Azure tenant or separate Key Vault w/ separate access policy |
 
+## Lexical search backend (M10.1)
+
+The lexical (BM25) leg of hybrid retrieval is pluggable via `SEARCH_PROVIDER`:
+
+- **`postgres`** (default) — Postgres FTS `search_tsv` generated column. Zero extra infra; the dev/early-milestone path. The semantic (pgvector) leg and RRF fusion are identical regardless of provider.
+- **`opensearch`** (production) — routes the lexical leg to a managed OpenSearch cluster. Requires `OPENSEARCH_ENDPOINT` (+ optional `OPENSEARCH_INDEX_PREFIX`, `OPENSEARCH_USERNAME`/`OPENSEARCH_PASSWORD`). The SDK (`@opensearch-project/opensearch`) is lazy-loaded; operators must add it before enabling: `pnpm --filter @workspace/api-server add @opensearch-project/opensearch`.
+
+There is **no `DEPLOYMENT_TARGET` shortcut** for search (unlike the embedder/LLM): OpenSearch always needs an explicit endpoint, so a bare cloud target must not silently flip the lexical leg off Postgres. Set `SEARCH_PROVIDER=opensearch` explicitly.
+
+PHI safety: only the redacted projection (snippet/classification/severity/source) plus `tenant_id` is mirrored to OpenSearch — raw PHI never reaches the searchable tier (`threat_model.md §Information Disclosure`). Every query carries a mandatory `tenant_id` term-filter for RLS-equivalent tenant scoping. The index is reconciled at boot (after embedding backfill) and updated best-effort on ingest; a search-backend outage degrades retrieval to the vector leg and never fails ingest.
+
+## Raw-evidence store (M10.2 / M10.3)
+
+Where unredacted raw evidence (PHI / secrets) is persisted is pluggable via `RAW_EVIDENCE_PROVIDER`, behind a `RawEvidenceStore` seam (`raw-evidence-store.ts`) that mirrors the embedder/search factory+registry:
+
+- **`database`** (default) — raw stays inline in the `findings.raw_evidence` jsonb column (`{first, latest}` occurrence snapshots). Zero extra infra; the dev/early-milestone path.
+- **`s3`** (AWS WORM) — each occurrence is written as a NEW immutable S3 object under Object Lock. Requires `RAW_EVIDENCE_S3_BUCKET` + `AWS_REGION` (+ optional `RAW_EVIDENCE_S3_PREFIX` default `raw-evidence`, `RAW_EVIDENCE_OBJECT_LOCK_MODE=COMPLIANCE|GOVERNANCE` default `COMPLIANCE`, `RAW_EVIDENCE_RETENTION_DAYS` default `2555` = 7y). The bucket MUST be created with Object Lock enabled. SDK lazy-loaded; add it first: `pnpm --filter @workspace/api-server add @aws-sdk/client-s3`.
+- **`gcs`** (GCP WORM) — requires `RAW_EVIDENCE_GCS_BUCKET` (+ optional `RAW_EVIDENCE_GCS_PREFIX`). WORM is enforced by an operator-provisioned **locked bucket retention policy** (the application writer role deliberately cannot weaken retention per `threat_model.md §Tampering`). Auth via ADC. Add the SDK first: `pnpm --filter @workspace/api-server add @google-cloud/storage`.
+- **`azure-blob`** (Azure WORM) — requires `RAW_EVIDENCE_AZURE_CONTAINER` + `RAW_EVIDENCE_AZURE_CONNECTION_STRING` (+ optional `RAW_EVIDENCE_AZURE_PREFIX`). WORM is enforced by an operator-provisioned **locked container immutability policy**. Add the SDK first: `pnpm --filter @workspace/api-server add @azure/storage-blob`.
+
+There is **no `DEPLOYMENT_TARGET` shortcut** (same reasoning as search): moving raw PHI to an object store is always explicit — every store needs a bucket/container, and a bare cloud target must never silently start writing unredacted PHI to an unprovisioned location.
+
+How it works: when an external store is active, ingest writes each occurrence's raw payload as an immutable object (key `<prefix>/<tenant>/<finding>/<uuid>.json`) and records `{first, latest}` object URIs in the new `findings.raw_evidence_ref` jsonb column; the `raw_evidence` column stays NULL. The break-glass read path (`GET /api/admin/findings/:id/raw`) resolves the ref through the store, which re-validates tenancy + bucket on the URI before fetching. PHI safety: `raw_evidence_ref` is excluded from `findingSafeColumns` (compile-time gate) and the `findings_redacted` view, so it is reachable only via the step-up-gated break-glass endpoint — exactly like `raw_evidence`. A failed external write leaves the finding committed but the ref NULL (logged at error level); break-glass then reports `raw_unresolved` rather than fabricating a payload. The schema column is additive (`ADD COLUMN IF NOT EXISTS`); switching providers is forward-only (objects already written under one provider are not migrated).
+
 ## HPA caveat
 
 The agent supervisor (M5) uses an **in-process queue** with `CONCURRENCY=2` per pod. Scaling api replicas multiplies effective concurrency. The HPA defaults (min=2, max=6) yield 4–12 concurrent agent jobs cluster-wide; tune `AGENT_DAILY_TOKEN_BUDGET` accordingly. If you need single-writer semantics for the supervisor (e.g. exactly-N model calls per finding regardless of replica count), the right fix is to externalize the queue (Temporal / Kafka) — not to pin replica=1 (you lose HA).

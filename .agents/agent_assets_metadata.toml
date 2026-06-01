@@ -84,3 +84,15 @@ id = "o-rydJbvONbKTNEJyaV40"
 uri = "file://exports/project-source.zip"
 type = "unspecified"
 title = "Project source (zip)"
+
+[[outputs]]
+id = "-fvOE5ZudOz_XDSWB0Uq5"
+uri = "file://exports/project-source.tar.gz"
+type = "unspecified"
+title = "Project source (tar.gz)"
+
+[[outputs]]
+id = "6rACtFqQyxDB8vpaDxkMU"
+uri = "file://exports/project-files.zip"
+type = "unspecified"
+title = "PHI Audit — Project Source Files"

@@ -1,2 +1,1 @@
-- [Nightly eval hard-fail](nightly-eval-hardfail.md) — live AI eval suites page on absolute `EVAL_LLM_MIN_SCORE` floor, not score delta (non-deterministic → delta flaps).
-- [DB sidecar in Helm Jobs](helm-job-db-sidecar.md) — Jobs/CronJobs needing the DB proxy must declare it as a native sidecar (initContainer + restartPolicy: Always) or the Job never terminates.
+- [Cloud-pluggable seams](cloud-pluggable-seams.md) — factory+`*_PROVIDER` pattern for embedder/search/raw-evidence; no DEPLOYMENT_TARGET shortcut for endpoint/PHI movers; honest raw_unresolved.

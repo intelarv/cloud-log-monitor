@@ -1,1 +1,1 @@
-- [Cloud-pluggable seams](cloud-pluggable-seams.md) — factory+`*_PROVIDER` pattern for embedder/search/raw-evidence; no DEPLOYMENT_TARGET shortcut for endpoint/PHI movers; honest raw_unresolved.
+- [Agent harness invariants](agent-harness.md) — chat loop degrades (never errors/leaks raw tool_call JSON); loop is DI'd for offline tests; per-call+per-tool timeouts mandatory.

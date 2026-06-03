@@ -26,15 +26,14 @@ import { withTenant } from "../db-context";
 import { appendLedger } from "../ledger";
 import { scanForPhi } from "../redact";
 import {
-  runTriageAgent,
   triageAgentIdentity,
   type TriageVerdict,
 } from "./triage";
 import {
-  runVerifierAgent,
   verifierAgentIdentity,
   type VerifierVerdict,
 } from "./verifier";
+import { getAgentInvoker } from "../a2a";
 
 // Concurrency = 2 keeps the LLM cost bounded and avoids storms on bulk
 // ingest replays. Production with a real queue would size this from
@@ -256,7 +255,8 @@ async function reviewOne(job: ReviewJob): Promise<void> {
     // -----------------------------------------------------------------
     // Triage step.
     // -----------------------------------------------------------------
-    const t = await runTriageAgent(finding);
+    const invoker = getAgentInvoker();
+    const t = await invoker.triage(finding);
     triage = t.verdict;
     chargeBudget(t.approxOutputTokens);
 
@@ -329,7 +329,7 @@ async function reviewOne(job: ReviewJob): Promise<void> {
     // -----------------------------------------------------------------
     // Verifier step.
     // -----------------------------------------------------------------
-    const v = await runVerifierAgent(finding, triage);
+    const v = await invoker.verify(finding, triage);
     verifier = v.verdict;
     chargeBudget(v.approxOutputTokens);
 

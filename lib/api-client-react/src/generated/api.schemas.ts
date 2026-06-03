@@ -307,6 +307,14 @@ export interface BreakGlassApprovalInput {
   approval_note: string;
 }
 
+export interface BreakGlassRevokeInput {
+  /**
+     * @minLength 1
+     * @maxLength 2000
+     */
+  reason?: string;
+}
+
 export interface BreakGlassGrant {
   id: string;
   tenant_id: string;
@@ -338,6 +346,58 @@ export interface FindingRawEvidence {
   two_person_approved: boolean;
   /** @nullable */
   approver_user_id: string | null;
+}
+
+export type ResolveFindingInputStatus = typeof ResolveFindingInputStatus[keyof typeof ResolveFindingInputStatus];
+
+
+export const ResolveFindingInputStatus = {
+  resolved: 'resolved',
+  false_positive: 'false_positive',
+} as const;
+
+export interface ResolveFindingInput {
+  status: ResolveFindingInputStatus;
+}
+
+export type ResolveFindingResultStatus = typeof ResolveFindingResultStatus[keyof typeof ResolveFindingResultStatus];
+
+
+export const ResolveFindingResultStatus = {
+  resolved: 'resolved',
+  false_positive: 'false_positive',
+} as const;
+
+export interface ResolveFindingResult {
+  finding_id: string;
+  status: ResolveFindingResultStatus;
+  transitioned: boolean;
+  revoked_grants: number;
+}
+
+export interface ReopenFindingInput {
+  /**
+     * Optional free-text reason explaining why the closed finding is being
+  reopened. Scanned by the same content policy as resolve/revoke
+  justifications before it lands in the immutable audit ledger.
+
+     * @minLength 1
+     * @maxLength 2000
+     */
+  reason?: string;
+}
+
+export type ReopenFindingResultStatus = typeof ReopenFindingResultStatus[keyof typeof ReopenFindingResultStatus];
+
+
+export const ReopenFindingResultStatus = {
+  open: 'open',
+} as const;
+
+export interface ReopenFindingResult {
+  finding_id: string;
+  status: ReopenFindingResultStatus;
+  transitioned: boolean;
 }
 
 export interface IngestReplayResult {
@@ -388,6 +448,12 @@ after_seq?: number;
  * @maximum 500
  */
 limit?: number;
+/**
+ * Filter to a single human actor's entries (the actor's id). Used by the "show me everything this analyst did" pivot so a reviewer sees the actor's complete trail, server-filtered and paginated, instead of only entries that happen to be in the most-recent window.
+
+ * @minLength 1
+ */
+actor?: string;
 };
 
 export type ListLedgerCheckpointsParams = {

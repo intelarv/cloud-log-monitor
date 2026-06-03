@@ -135,6 +135,35 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /findings/{id}/history:
+    get:
+      operationId: getFindingHistory
+      tags: [findings]
+      summary: |
+        Audit-ledger history for a single finding (most-recent-first). Returns
+        every ledger entry whose subject is this finding — resolve / reopen
+        transitions and break-glass grant / approve / revoke events — including
+        the free-text reason where one was recorded. Tenant-scoped; redacted
+        payloads only (free text was content-policy scanned at write time).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Finding history (ledger events)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/LedgerEntry" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /chat/sessions:
     get:
       operationId: listChatSessions
@@ -222,6 +251,14 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: actor
+          in: query
+          description: >
+            Filter to a single human actor's entries (the actor's id). Used by
+            the "show me everything this analyst did" pivot so a reviewer sees
+            the actor's complete trail, server-filtered and paginated, instead
+            of only entries that happen to be in the most-recent window.
+          schema: { type: string, minLength: 1 }
       responses:
         "200":
           description: Ledger page
@@ -387,6 +424,57 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /admin/break-glass/grants/{id}/revoke:
+    post:
+      operationId: revokeBreakGlassGrant
+      tags: [admin]
+      summary: |
+        Revoke a break-glass grant before its TTL elapses. Requires a fresh
+        step-up cookie. The requester or any other analyst in the same tenant
+        may revoke. Already-revoked grants return 409; expired grants return
+        410.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BreakGlassRevokeInput" }
+      responses:
+        "200":
+          description: Grant revoked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BreakGlassGrant" }
+        "400":
+          description: Invalid input or rejected reason text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated or step-up missing
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Grant not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "409":
+          description: Grant already revoked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "410":
+          description: Grant expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /admin/break-glass/pending-approvals:
     get:
       operationId: listPendingBreakGlassApprovals
@@ -424,6 +512,90 @@ paths:
               schema: { $ref: "#/components/schemas/FindingRawEvidence" }
         "403":
           description: No active grant, or pending second-person approval
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Finding not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/findings/{id}/resolve:
+    post:
+      operationId: resolveFinding
+      tags: [admin]
+      summary: |
+        Close out a finding by marking it resolved or false positive. Any
+        active break-glass grants for the finding are auto-revoked so raw-PHI
+        access ends with the incident. Idempotent: re-resolving a finding
+        already in the target state is a no-op. Requires session only.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolveFindingInput" }
+      responses:
+        "200":
+          description: Resolve result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResolveFindingResult" }
+        "400":
+          description: Invalid input
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Finding not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/findings/{id}/reopen:
+    post:
+      operationId: reopenFinding
+      tags: [admin]
+      summary: |
+        Reopen a finding that was closed in error, transitioning it from a
+        resolved / false_positive state back to "open". Unlike resolve, this
+        does NOT auto-revoke break-glass grants. Idempotent: reopening a
+        finding already open is a no-op. Accepts an optional free-text reason
+        (scanned by the content policy) recorded in the audit ledger. Requires
+        session only.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReopenFindingInput" }
+      responses:
+        "200":
+          description: Reopen result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReopenFindingResult" }
+        "400":
+          description: Invalid input or reason rejected by content policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
@@ -784,6 +956,14 @@ components:
           minLength: 10
           maxLength: 2000
 
+    BreakGlassRevokeInput:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+
     BreakGlassGrant:
       type: object
       required:
@@ -839,6 +1019,47 @@ components:
             - type: "null"
         two_person_approved: { type: boolean }
         approver_user_id: { type: ["string", "null"] }
+
+    ResolveFindingInput:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [resolved, false_positive]
+
+    ResolveFindingResult:
+      type: object
+      required: [finding_id, status, transitioned, revoked_grants]
+      properties:
+        finding_id: { type: string }
+        status:
+          type: string
+          enum: [resolved, false_positive]
+        transitioned: { type: boolean }
+        revoked_grants: { type: integer }
+
+    ReopenFindingInput:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: |
+            Optional free-text reason explaining why the closed finding is being
+            reopened. Scanned by the same content policy as resolve/revoke
+            justifications before it lands in the immutable audit ledger.
+
+    ReopenFindingResult:
+      type: object
+      required: [finding_id, status, transitioned]
+      properties:
+        finding_id: { type: string }
+        status:
+          type: string
+          enum: [open]
+        transitioned: { type: boolean }
 
     IngestReplayResult:
       type: object

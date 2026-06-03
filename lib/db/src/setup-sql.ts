@@ -58,6 +58,16 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- threat_model.md §Info Disclosure.
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS raw_evidence jsonb;
 
+-- M10.2/M10.3: pointer to raw evidence held in an EXTERNAL WORM object store
+-- (S3 Object Lock / GCS retention / Azure Blob immutability) when
+-- RAW_EVIDENCE_PROVIDER selects a non-database store. Holds {first, latest}
+-- object URIs; NULL when raw stays inline in raw_evidence (database store).
+-- Like raw_evidence it is NOT in the findings_redacted view — only the
+-- step-up-gated /admin/findings/:id/raw endpoint reads it (and resolves it back
+-- to the payload through the configured store). See threat_model.md §Info
+-- Disclosure / §Tampering (WORM tier).
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS raw_evidence_ref jsonb;
+
 -- M5: multi-agent supervisor review state. Added idempotently so a DB
 -- seeded under earlier milestones upgrades cleanly. Existing rows default
 -- to 'pending' so the supervisor will eventually pick them up on the next
@@ -215,6 +225,15 @@ SELECT
   last_seen_at,
   occurrence_count
 FROM findings;
+
+-- Expression index backing the server-side actor pivot in routes/ledger.ts
+-- ("show me everything this analyst did"). The filtered list query matches on
+-- tenant_id + (actor->>'id') (with a kind = 'human' recheck); without this
+-- functional index the predicate degrades to a scan within the tenant on a
+-- large ledger. Mirrors index("ledger_actor_id_idx") in schema/ledger.ts so a
+-- first boot (setup-sql) and a drizzle push converge on the same index.
+CREATE INDEX IF NOT EXISTS ledger_actor_id_idx
+  ON ledger_entries (tenant_id, ((actor->>'id')));
 
 -- Append-only enforcement for the ledger. This trigger function rejects any
 -- UPDATE or DELETE against ledger_entries with a clear error code so callers

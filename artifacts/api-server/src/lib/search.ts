@@ -4,6 +4,11 @@ type Finding = FindingSafe;
 import { withTenant } from "./db-context";
 import { toPgVectorLiteral, type Embedder } from "./embeddings";
 import { getEmbedder } from "./embedder-config";
+import {
+  getSearchProvider,
+  type LexicalSearchProvider,
+} from "./search-config";
+import { logger } from "./logger";
 
 // ---------------------------------------------------------------------------
 // Hybrid retrieval over findings
@@ -77,28 +82,6 @@ export function rrfFuse(
     .sort((a, b) => b.score - a.score || a.finding_id.localeCompare(b.finding_id));
 }
 
-async function bm25Search(
-  tenantId: string,
-  query: string,
-  limit: number,
-): Promise<RetrievalHit[]> {
-  return withTenant(tenantId, async (tx) => {
-    // `websearch_to_tsquery` parses Google-style queries; empty/no-match
-    // queries return zero rows rather than erroring.
-    const rows = await tx.execute<{ id: string }>(sql`
-      SELECT id
-      FROM findings
-      WHERE tenant_id = ${tenantId}
-        AND search_tsv @@ websearch_to_tsquery('english', ${query})
-      ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('english', ${query})) DESC,
-               last_seen_at DESC,
-               id
-      LIMIT ${limit}
-    `);
-    return rows.rows.map((r, i) => ({ finding_id: r.id, rank: i + 1 }));
-  });
-}
-
 async function vectorSearch(
   tenantId: string,
   embedding: readonly number[],
@@ -141,16 +124,30 @@ export async function hybridSearchFindings(
     topK?: number;
     perRetrieverLimit?: number;
     embedder?: Embedder;
+    searchProvider?: LexicalSearchProvider;
   } = {},
 ): Promise<HybridSearchResult> {
   const topK = opts.topK ?? 10;
   const perRetrieverLimit = opts.perRetrieverLimit ?? 20;
   const embedder = opts.embedder ?? getEmbedder();
+  const lexical = opts.searchProvider ?? getSearchProvider();
 
   const embedding = await embedder.embed(query);
 
+  // The lexical leg is allowed to degrade. A managed search backend
+  // (OpenSearch) is a separate failure domain from Postgres; if it is down or
+  // slow, retrieval falls back to the vector leg rather than failing the whole
+  // chat turn. The Postgres lexical provider shares the DB connection, so its
+  // failures are effectively DB failures and the vector leg would fail too —
+  // this fallback only meaningfully kicks in for external providers.
   const [bm25, vec] = await Promise.all([
-    bm25Search(tenantId, query, perRetrieverLimit),
+    lexical.search(tenantId, query, perRetrieverLimit).catch((err) => {
+      logger.warn(
+        { err, provider: lexical.name, tenant_id: tenantId },
+        "lexical search leg failed; degrading to vector-only retrieval",
+      );
+      return [] as readonly RetrievalHit[];
+    }),
     vectorSearch(tenantId, embedding, perRetrieverLimit),
   ]);
 
@@ -264,4 +261,52 @@ export async function backfillEmbeddings(opts: {
     });
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// External lexical-index reconciliation
+// ---------------------------------------------------------------------------
+//
+// Called at boot after the embedding backfill. When the active lexical
+// provider maintains its own external index (OpenSearch), this bulk-mirrors
+// every existing finding's REDACTED safe projection into that index so a
+// freshly-pointed cluster (or one that missed mid-run writes) converges.
+// For the Postgres provider it is a no-op (the generated tsv is always in
+// sync). Reads go through the safe projection — raw evidence is never read
+// here, so PHI cannot reach the searchable tier.
+export async function reconcileSearchIndex(
+  opts: { searchProvider?: LexicalSearchProvider } = {},
+): Promise<{ indexed: number; skipped: boolean }> {
+  const provider = opts.searchProvider ?? getSearchProvider();
+  if (!provider.maintainsExternalIndex) return { indexed: 0, skipped: true };
+
+  const { db } = await import("@workspace/db");
+  const tenantRows = await db.execute<{ tenant_id: string }>(
+    sql`SELECT DISTINCT tenant_id FROM findings`,
+  );
+
+  let indexed = 0;
+  for (const { tenant_id } of tenantRows.rows) {
+    await withTenant(tenant_id, async (tx) => {
+      const rows = await tx
+        .select(findingSafeColumns)
+        .from(findingsTable)
+        .where(eq(findingsTable.tenantId, tenant_id));
+      for (const r of rows) {
+        const ev = r.redactedEvidence as { snippet?: string };
+        await provider.indexFinding({
+          findingId: r.id,
+          tenantId: tenant_id,
+          classification: r.classification,
+          subclass: r.subclass,
+          severity: r.severity,
+          source: r.source,
+          snippet: ev.snippet ?? "",
+        });
+        indexed += 1;
+      }
+    });
+  }
+  logger.info({ provider: provider.name, indexed }, "Search index reconcile complete");
+  return { indexed, skipped: false };
 }

@@ -129,8 +129,8 @@ router.post(
     const inputPhiHits = scanForPhi(parsed.data.content);
     if (inputPhiHits.length > 0) {
       const sse0 = new SseStream(res);
-      const ts = () => new Date().toISOString();
-      sse0.send({ type: "session_started", session_id: sessionId, ts: ts() });
+      const runId0 = `run_${randomUUID()}`;
+      sse0.runStarted(sessionId, runId0);
       const refuseMessageId = `cm_${randomUUID()}`;
       const findingId = `F-INPUT-PHI-${randomUUID().slice(0, 8)}`;
       await withTenant(tenantId, async (tx) =>
@@ -173,26 +173,9 @@ router.post(
           detectors: inputPhiHits.map((h) => h.detector),
         },
       });
-      sse0.send({
-        type: "ledger_appended",
-        seq: refLedger.seq,
-        event_type: refLedger.eventType,
-        hash: refLedger.hash,
-        ts: ts(),
-      });
-      sse0.send({
-        type: "agent_message_delta",
-        message_id: refuseMessageId,
-        delta: SAFE_REFUSAL,
-        ts: ts(),
-      });
-      sse0.send({
-        type: "agent_message_complete",
-        message_id: refuseMessageId,
-        citations: [],
-        ts: ts(),
-      });
-      sse0.send({ type: "done", ts: ts() });
+      sse0.ledgerAppended(refLedger);
+      sse0.assistantMessage(refuseMessageId, SAFE_REFUSAL, []);
+      sse0.runFinished(sessionId, runId0);
       sse0.close();
       return;
     }
@@ -219,9 +202,9 @@ router.post(
 
     // Open SSE stream.
     const sse = new SseStream(res);
-    const now = () => new Date().toISOString();
+    const runId = `run_${randomUUID()}`;
 
-    sse.send({ type: "session_started", session_id: sessionId, ts: now() });
+    sse.runStarted(sessionId, runId);
 
     // Persist user message + ledger entry.
     const userMessageId = `cm_${randomUUID()}`;
@@ -236,12 +219,7 @@ router.post(
         agentIdentity: null,
       }),
     );
-    sse.send({
-      type: "user_message",
-      message_id: userMessageId,
-      content: parsed.data.content,
-      ts: now(),
-    });
+    sse.userMessage(userMessageId, parsed.data.content);
 
     const contentHash = createHash("sha256")
       .update(parsed.data.content)
@@ -262,15 +240,9 @@ router.post(
         content_length: parsed.data.content.length,
       },
     });
-    sse.send({
-      type: "ledger_appended",
-      seq: userLedger.seq,
-      event_type: userLedger.eventType,
-      hash: userLedger.hash,
-      ts: now(),
-    });
+    sse.ledgerAppended(userLedger);
 
-    sse.send({ type: "agent_thinking", ts: now() });
+    sse.stepStarted("agent_thinking");
 
     const agentMessageId = `cm_${randomUUID()}`;
     let result;
@@ -286,22 +258,13 @@ router.post(
         // single delta. (ARCHITECTURE.md §23.1, threat model §Info Disclosure.)
         onDelta: undefined,
         onToolCall: (info) => {
-          sse.send({
-            type: "tool_call",
-            call_id: info.call_id,
-            tool: info.name,
-            args: info.args,
-            ts: now(),
-          });
+          sse.toolCall(info.call_id, info.name, info.args);
         },
         onToolResult: (info) => {
-          sse.send({
-            type: "tool_result",
-            call_id: info.call_id,
+          sse.toolResult(`tm_${randomUUID()}`, info.call_id, {
             ok: info.ok,
             result: info.result,
             error: info.error,
-            ts: now(),
           });
         },
       });
@@ -310,12 +273,7 @@ router.post(
       // client — error text can contain provider details or user-derived
       // content. (threat model §Info Disclosure.)
       req.log.error({ err }, "agent error");
-      sse.send({
-        type: "error",
-        error: "agent_error",
-        ts: now(),
-      });
-      sse.send({ type: "done", ts: now() });
+      sse.runError("agent_error");
       sse.close();
       return;
     }
@@ -377,13 +335,7 @@ router.post(
           hits: detectorBreakdown,
         },
       });
-      sse.send({
-        type: "ledger_appended",
-        seq: phiLedger.seq,
-        event_type: phiLedger.eventType,
-        hash: phiLedger.hash,
-        ts: now(),
-      });
+      sse.ledgerAppended(phiLedger);
     }
 
     // Persist agent message + ledger entry for the turn itself.
@@ -400,21 +352,10 @@ router.post(
     );
 
     // Output was buffered in runChatTurn (no token deltas sent). Emit the
-    // post-scan final text as a single delta so the UI renders it. If the
-    // PHI scan triggered a replacement, this delta is SAFE_REFUSAL.
-    sse.send({
-      type: "agent_message_delta",
-      message_id: agentMessageId,
-      delta: finalText,
-      ts: now(),
-    });
-
-    sse.send({
-      type: "agent_message_complete",
-      message_id: agentMessageId,
-      citations: finalCitations,
-      ts: now(),
-    });
+    // post-scan final text as a single AG-UI text message (START→CONTENT→END)
+    // so the UI renders it. If the PHI scan triggered a replacement, this text
+    // is SAFE_REFUSAL.
+    sse.assistantMessage(agentMessageId, finalText, finalCitations);
 
     const turnLedger = await appendLedger({
       tenantId,
@@ -443,17 +384,25 @@ router.post(
         phi_in_output_hits: phiHits.length,
         tool_versions: result.agent_identity.tool_versions,
         preloaded_finding_ids: result.preloaded_finding_ids,
+        // Harness telemetry (threat model §DoS): record when a turn fell back
+        // to a deterministic answer and the approximate output-token cost, so
+        // an auditor can see degraded turns and cost trends from the ledger.
+        degraded: result.degraded,
+        ...(result.degrade_reason
+          ? { degrade_reason: result.degrade_reason }
+          : {}),
+        approx_output_tokens: result.approx_output_tokens,
       },
     });
-    sse.send({
-      type: "ledger_appended",
-      seq: turnLedger.seq,
-      event_type: turnLedger.eventType,
-      hash: turnLedger.hash,
-      ts: now(),
-    });
+    sse.ledgerAppended(turnLedger);
 
-    sse.send({ type: "done", ts: now() });
+    // RUN_FINISHED carries the harness telemetry (threat model §DoS) so a
+    // client can surface degraded turns and approximate cost without a refetch.
+    sse.runFinished(sessionId, runId, {
+      degraded: result.degraded,
+      ...(result.degrade_reason ? { degrade_reason: result.degrade_reason } : {}),
+      approx_output_tokens: result.approx_output_tokens,
+    });
     sse.close();
   },
 );

@@ -1,160 +1,194 @@
 import { describe, expect, it } from "vitest";
-import { AguiEventSchema, type AguiEvent } from "./sse";
+import type { Response } from "express";
+import { EventType } from "@ag-ui/core";
+import { SseStream } from "./sse";
 
-// Contract test: every AG-UI event variant the server emits MUST parse cleanly
-// through AguiEventSchema. SseStream.send() runs .parse() on the wire path,
-// so any drift between a route's emitted shape and the schema would manifest
-// as a runtime exception inside a streaming response. This suite locks the
-// producer side: if a route adds a new event type or changes a field, either
-// the schema is updated or this test fails first.
-//
-// The fixtures below are intentionally enumerated by hand rather than
-// generated — they mirror every sse.send() call site in routes/chat.ts so
-// review surfaces drift at the diff level too.
+// Producer contract test: SseStream is the single wire path for the chat route,
+// and it now speaks the official AG-UI event vocabulary (@ag-ui/core) encoded
+// via the official SSE encoder (@ag-ui/encoder). This suite locks the producer
+// side — it drives every semantic helper the chat route calls and asserts the
+// emitted events carry the right AG-UI `type` and fields. If a helper drifts,
+// this fails before a malformed event ever reaches a streaming response.
 
-const ts = "2026-05-21T00:00:00.000Z";
+interface CapturedEvent {
+  type: string;
+  [k: string]: unknown;
+}
 
-const FIXTURES: AguiEvent[] = [
-  // routes/chat.ts: session_started (both refusal path and normal path)
-  { type: "session_started", session_id: "cs_abc", ts },
+function fakeRes(): { res: Response; writes: string[]; headers: Record<string, string> } {
+  const writes: string[] = [];
+  const headers: Record<string, string> = {};
+  const res = {
+    setHeader(name: string, value: string) {
+      headers[name] = value;
+    },
+    flushHeaders() {},
+    on() {},
+    write(chunk: string) {
+      writes.push(chunk);
+      return true;
+    },
+    end() {},
+  } as unknown as Response;
+  return { res, writes, headers };
+}
 
-  // routes/chat.ts: user_message
-  {
-    type: "user_message",
-    message_id: "cm_user_1",
-    content: "List the critical findings",
-    ts,
-  },
-
-  // routes/chat.ts: agent_thinking
-  { type: "agent_thinking", ts },
-
-  // routes/chat.ts: tool_call (from runChatTurn.onToolCall)
-  {
-    type: "tool_call",
-    call_id: "tc_abc",
-    tool: "get_finding",
-    args: { id: "F-001" },
-    ts,
-  },
-
-  // routes/chat.ts: tool_result (ok=true)
-  {
-    type: "tool_result",
-    call_id: "tc_abc",
-    ok: true,
-    result: { id: "F-001", severity: "high" },
-    ts,
-  },
-
-  // routes/chat.ts: tool_result (ok=false, with error)
-  {
-    type: "tool_result",
-    call_id: "tc_abc",
-    ok: false,
-    error: "tool_not_allowed",
-    ts,
-  },
-
-  // routes/chat.ts: agent_message_delta (post-scan final)
-  {
-    type: "agent_message_delta",
-    message_id: "cm_agent_1",
-    delta: "The critical findings are: [F:F-CANARY]",
-    ts,
-  },
-
-  // routes/chat.ts: agent_message_complete (with citations)
-  {
-    type: "agent_message_complete",
-    message_id: "cm_agent_1",
-    citations: ["F-CANARY", "F-001"],
-    ts,
-  },
-
-  // routes/chat.ts: agent_message_complete (no citations — refusal path)
-  {
-    type: "agent_message_complete",
-    message_id: "cm_refusal_1",
-    citations: [],
-    ts,
-  },
-
-  // routes/chat.ts: ledger_appended (user_turn, agent_turn, input_phi_refused)
-  {
-    type: "ledger_appended",
-    seq: 42,
-    event_type: "chat.user_turn",
-    hash: "deadbeef".padEnd(64, "0"),
-    ts,
-  },
-
-  // routes/chat.ts: error (sanitized agent_error)
-  { type: "error", error: "agent_error", ts },
-
-  // routes/chat.ts: done
-  { type: "done", ts },
-];
-
-describe("AguiEventSchema", () => {
-  for (const fx of FIXTURES) {
-    it(`accepts ${fx.type}`, () => {
-      const parsed = AguiEventSchema.parse(fx);
-      expect(parsed.type).toBe(fx.type);
-      // Round-trip JSON to catch any non-serializable field shapes; the wire
-      // path stringifies via JSON.stringify(parsed).
-      const wire = JSON.parse(JSON.stringify(parsed));
-      expect(AguiEventSchema.parse(wire)).toEqual(parsed);
-    });
+// @ag-ui/encoder emits `data: <json>\n\n`; heartbeats are `: ...` comment lines.
+function parseEvents(writes: string[]): CapturedEvent[] {
+  const events: CapturedEvent[] = [];
+  for (const w of writes) {
+    for (const frame of w.split("\n\n")) {
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
+      if (!dataLine) continue;
+      events.push(JSON.parse(dataLine.slice(6)) as CapturedEvent);
+    }
   }
+  return events;
+}
 
-  it("rejects an unknown event type", () => {
-    expect(() =>
-      AguiEventSchema.parse({ type: "unknown_event", ts } as unknown),
-    ).toThrow();
+describe("SseStream (AG-UI producer contract)", () => {
+  it("sets the AG-UI SSE content type", () => {
+    const { res, headers } = fakeRes();
+    new SseStream(res);
+    expect(headers["Content-Type"]).toBe("text/event-stream");
   });
 
-  it("rejects a known type with a missing required field", () => {
-    expect(() =>
-      AguiEventSchema.parse({ type: "ledger_appended", seq: 1, ts } as unknown),
-    ).toThrow();
-    expect(() =>
-      AguiEventSchema.parse({
-        type: "agent_message_delta",
-        message_id: "x",
-        ts,
-      } as unknown),
-    ).toThrow();
+  it("emits RUN_STARTED with threadId + runId", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.runStarted("cs_abc", "run_1");
+    const [ev] = parseEvents(writes);
+    expect(ev).toMatchObject({
+      type: EventType.RUN_STARTED,
+      threadId: "cs_abc",
+      runId: "run_1",
+    });
   });
 
-  it("rejects a known type with a wrong field type", () => {
-    expect(() =>
-      AguiEventSchema.parse({
-        type: "ledger_appended",
-        seq: "not-a-number",
-        event_type: "x",
-        hash: "x",
-        ts,
-      } as unknown),
-    ).toThrow();
-    expect(() =>
-      AguiEventSchema.parse({
-        type: "agent_message_complete",
-        message_id: "x",
-        citations: "F-001",
-        ts,
-      } as unknown),
-    ).toThrow();
+  it("emits RUN_FINISHED with optional result", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.runFinished("cs_abc", "run_1", { degraded: true, approx_output_tokens: 12 });
+    const [ev] = parseEvents(writes);
+    expect(ev).toMatchObject({
+      type: EventType.RUN_FINISHED,
+      threadId: "cs_abc",
+      runId: "run_1",
+      result: { degraded: true, approx_output_tokens: 12 },
+    });
   });
 
-  it("rejects 'tool_result' missing ok flag", () => {
-    expect(() =>
-      AguiEventSchema.parse({
-        type: "tool_result",
-        call_id: "x",
-        result: {},
-        ts,
-      } as unknown),
-    ).toThrow();
+  it("emits RUN_ERROR with a sanitized message", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.runError("agent_error");
+    const [ev] = parseEvents(writes);
+    expect(ev).toMatchObject({ type: EventType.RUN_ERROR, message: "agent_error" });
+  });
+
+  it("emits STEP_STARTED for the thinking step", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.stepStarted("agent_thinking");
+    const [ev] = parseEvents(writes);
+    expect(ev).toMatchObject({
+      type: EventType.STEP_STARTED,
+      stepName: "agent_thinking",
+    });
+  });
+
+  it("emits an assistant message as START → CONTENT → END + citations CUSTOM", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.assistantMessage("cm_1", "The critical findings are: [F:F-CANARY]", [
+      "F-CANARY",
+    ]);
+    const evs = parseEvents(writes);
+    expect(evs.map((e) => e.type)).toEqual([
+      EventType.TEXT_MESSAGE_START,
+      EventType.TEXT_MESSAGE_CONTENT,
+      EventType.TEXT_MESSAGE_END,
+      EventType.CUSTOM,
+    ]);
+    expect(evs[0]).toMatchObject({ messageId: "cm_1", role: "assistant" });
+    expect(evs[1]).toMatchObject({
+      messageId: "cm_1",
+      delta: "The critical findings are: [F:F-CANARY]",
+    });
+    expect(evs[2]).toMatchObject({ messageId: "cm_1" });
+    expect(evs[3]).toMatchObject({
+      name: "citations",
+      value: { message_id: "cm_1", citations: ["F-CANARY"] },
+    });
+  });
+
+  it("emits a tool call as START → ARGS(json) → END", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.toolCall("tc_abc", "get_finding", { id: "F-001" });
+    const evs = parseEvents(writes);
+    expect(evs.map((e) => e.type)).toEqual([
+      EventType.TOOL_CALL_START,
+      EventType.TOOL_CALL_ARGS,
+      EventType.TOOL_CALL_END,
+    ]);
+    expect(evs[0]).toMatchObject({ toolCallId: "tc_abc", toolCallName: "get_finding" });
+    expect(JSON.parse(evs[1]!.delta as string)).toEqual({ id: "F-001" });
+    expect(evs[2]).toMatchObject({ toolCallId: "tc_abc" });
+  });
+
+  it("emits a tool result as TOOL_CALL_RESULT with json content (ok=true)", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.toolResult("tm_1", "tc_abc", { ok: true, result: { id: "F-001", severity: "high" } });
+    const [ev] = parseEvents(writes);
+    expect(ev).toMatchObject({
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: "tm_1",
+      toolCallId: "tc_abc",
+      role: "tool",
+    });
+    expect(JSON.parse(ev!.content as string)).toEqual({
+      ok: true,
+      result: { id: "F-001", severity: "high" },
+    });
+  });
+
+  it("emits a tool result with an error (ok=false)", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.toolResult("tm_2", "tc_abc", { ok: false, error: "tool_not_allowed" });
+    const [ev] = parseEvents(writes);
+    expect(JSON.parse(ev!.content as string)).toEqual({
+      ok: false,
+      error: "tool_not_allowed",
+    });
+  });
+
+  it("emits user_message + ledger_appended over CUSTOM", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.userMessage("cm_user_1", "List the critical findings");
+    sse.ledgerAppended({ seq: 42, eventType: "chat.user_turn", hash: "deadbeef".padEnd(64, "0") });
+    const evs = parseEvents(writes);
+    expect(evs[0]).toMatchObject({
+      type: EventType.CUSTOM,
+      name: "user_message",
+      value: { message_id: "cm_user_1", content: "List the critical findings" },
+    });
+    expect(evs[1]).toMatchObject({
+      type: EventType.CUSTOM,
+      name: "ledger_appended",
+      value: { seq: 42, event_type: "chat.user_turn" },
+    });
+  });
+
+  it("drops events after close()", () => {
+    const { res, writes } = fakeRes();
+    const sse = new SseStream(res);
+    sse.close();
+    sse.runStarted("cs_abc", "run_1");
+    expect(parseEvents(writes)).toHaveLength(0);
+    expect(sse.isClosed()).toBe(true);
   });
 });

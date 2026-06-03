@@ -1,22 +1,32 @@
 import React from "react";
 import Layout from "../components/layout";
-import { useGetFinding, useGetFindingRaw, getGetFindingQueryKey } from "@workspace/api-client-react";
+import {
+  useGetFinding,
+  useGetFindingRaw,
+  useGetFindingHistory,
+  getGetFindingQueryKey,
+  getGetFindingHistoryQueryKey,
+} from "@workspace/api-client-react";
 import { useParams, Link } from "wouter";
 import { SeverityBadge, StatusBadge } from "../components/severity-badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle } from "lucide-react";
-import { format } from "date-fns";
+import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle } from "lucide-react";
+import { safeTimestamp } from "../lib/format";
 import BreakGlassModal from "../components/break-glass-modal";
+import ResolveFindingModal from "../components/resolve-finding-modal";
+import ReopenFindingModal from "../components/reopen-finding-modal";
 import { ApiError } from "@workspace/api-client-react";
 
 export default function FindingDetail() {
   const { id } = useParams<{ id: string }>();
   const { data: finding, isLoading } = useGetFinding(id!, { query: { enabled: !!id, queryKey: getGetFindingQueryKey(id!) } });
-  
+
   const [showBreakGlass, setShowBreakGlass] = React.useState(false);
+  const [showResolve, setShowResolve] = React.useState(false);
+  const [showReopen, setShowReopen] = React.useState(false);
   const [rawEvidence, setRawEvidence] = React.useState<any>(null);
   const [rawError, setRawError] = React.useState<ApiError | null>(null);
   const [isPendingApproval, setIsPendingApproval] = React.useState(false);
@@ -89,19 +99,30 @@ export default function FindingDetail() {
             <p className="text-sm text-muted-foreground font-mono mt-1">Fingerprint: {finding.fingerprint}</p>
           </div>
           
-          <Button 
-            variant={rawEvidence ? "outline" : "destructive"} 
-            onClick={fetchRaw}
-            disabled={!!rawEvidence || isPendingApproval}
-          >
-            {rawEvidence ? (
-              <><Unlock className="h-4 w-4 mr-2" /> Raw Unlocked</>
-            ) : isPendingApproval ? (
-              <><AlertTriangle className="h-4 w-4 mr-2" /> Pending Approval</>
+          <div className="flex items-center gap-2">
+            {finding.status === "open" ? (
+              <Button variant="outline" onClick={() => setShowResolve(true)}>
+                <CheckCheck className="h-4 w-4 mr-2" /> Close Out
+              </Button>
             ) : (
-              <><Lock className="h-4 w-4 mr-2" /> Break Glass</>
+              <Button variant="outline" onClick={() => setShowReopen(true)}>
+                <RotateCcw className="h-4 w-4 mr-2" /> Reopen
+              </Button>
             )}
-          </Button>
+            <Button
+              variant={rawEvidence ? "outline" : "destructive"}
+              onClick={fetchRaw}
+              disabled={!!rawEvidence || isPendingApproval}
+            >
+              {rawEvidence ? (
+                <><Unlock className="h-4 w-4 mr-2" /> Raw Unlocked</>
+              ) : isPendingApproval ? (
+                <><AlertTriangle className="h-4 w-4 mr-2" /> Pending Approval</>
+              ) : (
+                <><Lock className="h-4 w-4 mr-2" /> Break Glass</>
+              )}
+            </Button>
+          </div>
         </div>
 
         {isPendingApproval && (
@@ -138,7 +159,7 @@ export default function FindingDetail() {
                       <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20">
                         RAW PHI/PII UNLOCKED
                       </Badge>
-                      <span className="text-xs text-muted-foreground">Expires {format(new Date(rawEvidence.grant_expires_at), "HH:mm:ss")}</span>
+                      <span className="text-xs text-muted-foreground">Expires {safeTimestamp(rawEvidence.grant_expires_at, "HH:mm:ss")}</span>
                     </div>
                     <pre className="p-4 bg-muted/50 rounded-md overflow-x-auto text-xs font-mono border border-destructive/20 text-foreground whitespace-pre-wrap">
                       {JSON.stringify(rawEvidence.raw_evidence, null, 2)}
@@ -167,6 +188,8 @@ export default function FindingDetail() {
                 )}
               </CardContent>
             </Card>
+
+            <FindingHistoryCard findingId={finding.id} />
           </div>
           
           <div className="space-y-6">
@@ -199,10 +222,10 @@ export default function FindingDetail() {
                   <div className="font-mono">{finding.occurrence_count}</div>
                   
                   <div className="text-muted-foreground">First Seen</div>
-                  <div className="font-mono text-xs">{format(new Date(finding.first_seen_at), "yyyy-MM-dd HH:mm:ss")}</div>
+                  <div className="font-mono text-xs">{safeTimestamp(finding.first_seen_at)}</div>
                   
                   <div className="text-muted-foreground">Last Seen</div>
-                  <div className="font-mono text-xs">{format(new Date(finding.last_seen_at), "yyyy-MM-dd HH:mm:ss")}</div>
+                  <div className="font-mono text-xs">{safeTimestamp(finding.last_seen_at)}</div>
                 </div>
               </CardContent>
             </Card>
@@ -234,6 +257,22 @@ export default function FindingDetail() {
           onOpenChange={setShowBreakGlass}
           findingId={finding.id}
           onSuccess={handleBreakGlassSuccess}
+        />
+      )}
+
+      {finding && (
+        <ResolveFindingModal
+          open={showResolve}
+          onOpenChange={setShowResolve}
+          findingId={finding.id}
+        />
+      )}
+
+      {finding && (
+        <ReopenFindingModal
+          open={showReopen}
+          onOpenChange={setShowReopen}
+          findingId={finding.id}
         />
       )}
     </Layout>
@@ -304,7 +343,7 @@ function AgentReviewCard({ finding }: AgentReviewCardProps) {
         </div>
         {finding.last_agent_review_at && (
           <CardDescription className="text-xs">
-            {format(new Date(finding.last_agent_review_at), "yyyy-MM-dd HH:mm:ss")}
+            {safeTimestamp(finding.last_agent_review_at)}
           </CardDescription>
         )}
       </CardHeader>
@@ -343,6 +382,149 @@ function AgentReviewCard({ finding }: AgentReviewCardProps) {
           </div>
         ) : (
           <p className="text-xs text-muted-foreground">No verifier verdict yet.</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Finding lifecycle timeline. Surfaces the finding's audit-ledger history inline
+// so a reviewer can understand the full incident lifecycle at a glance —
+// including *why* a closed finding was reopened (and resolve / revoke notes) —
+// without digging into the global Audit Ledger page. Most-recent-first, with the
+// actor and timestamp on every event. Free-text reasons here were already
+// content-policy scanned at write time, so they carry no raw PHI/secrets.
+// ---------------------------------------------------------------------------
+
+type HistoryEvent = {
+  seq: number;
+  ts: string;
+  event_type: string;
+  actor: Record<string, unknown>;
+  payload: Record<string, unknown>;
+};
+
+export function actorLabel(actor: Record<string, unknown>): string {
+  if (!actor || typeof actor !== "object") return "system";
+  return (
+    (actor.id as string) ||
+    (actor.sub as string) ||
+    (actor.kind as string) ||
+    "system"
+  );
+}
+
+export function eventMeta(eventType: string): {
+  label: string;
+  icon: React.ReactNode;
+  tone: string;
+} {
+  switch (eventType) {
+    case "finding.created":
+      return { label: "Finding created", icon: <PlusCircle className="h-4 w-4" />, tone: "text-muted-foreground bg-muted border-border" };
+    case "finding.resolved":
+      return { label: "Closed out", icon: <CheckCheck className="h-4 w-4" />, tone: "text-emerald-600 bg-emerald-500/10 border-emerald-500/20" };
+    case "finding.reopened":
+      return { label: "Reopened", icon: <RotateCcw className="h-4 w-4" />, tone: "text-blue-600 bg-blue-500/10 border-blue-500/20" };
+    case "break_glass.granted":
+      return { label: "Break-glass granted", icon: <KeyRound className="h-4 w-4" />, tone: "text-orange-600 bg-orange-500/10 border-orange-500/20" };
+    case "break_glass.approved":
+      return { label: "Break-glass approved", icon: <CheckCircle2 className="h-4 w-4" />, tone: "text-orange-600 bg-orange-500/10 border-orange-500/20" };
+    case "break_glass.revoked":
+      return { label: "Break-glass revoked", icon: <Ban className="h-4 w-4" />, tone: "text-orange-600 bg-orange-500/10 border-orange-500/20" };
+    case "break_glass.raw_phi_accessed":
+      return { label: "Raw PHI viewed", icon: <Eye className="h-4 w-4" />, tone: "text-destructive bg-destructive/10 border-destructive/20" };
+    case "break_glass.approval_denied_self_approval":
+      return { label: "Self-approval refused", icon: <ShieldAlert className="h-4 w-4" />, tone: "text-destructive bg-destructive/10 border-destructive/20" };
+    case "policy.text_field_rejected":
+      return { label: "Note rejected by policy", icon: <ShieldAlert className="h-4 w-4" />, tone: "text-destructive bg-destructive/10 border-destructive/20" };
+    default:
+      return { label: eventType, icon: <ShieldQuestion className="h-4 w-4" />, tone: "text-muted-foreground bg-muted border-border" };
+  }
+}
+
+// Pull the human-meaningful free-text note out of the payload, mapping each
+// event's note field to the one the reviewer cares about. Returns null when the
+// event carries no note.
+export function eventNote(eventType: string, payload: Record<string, unknown>): string | null {
+  const str = (v: unknown): string | null => (typeof v === "string" && v.trim().length > 0 ? v : null);
+  switch (eventType) {
+    case "finding.reopened":
+    case "break_glass.revoked":
+      return str(payload.reason);
+    case "break_glass.granted":
+      return str(payload.justification);
+    case "break_glass.approved":
+      return str(payload.approval_note);
+    default:
+      return str(payload.reason) ?? str(payload.justification) ?? str(payload.approval_note);
+  }
+}
+
+export function FindingHistoryCard({ findingId }: { findingId: string }) {
+  const { data: events, isLoading } = useGetFindingHistory(findingId, {
+    query: { queryKey: getGetFindingHistoryQueryKey(findingId) },
+  });
+  const list = Array.isArray(events) ? (events as HistoryEvent[]) : [];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><History className="h-4 w-4" /> History</CardTitle>
+        <CardDescription>Lifecycle of this finding from the audit ledger, most recent first.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <div className="space-y-3">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <Skeleton key={i} className="h-12 w-full" />
+            ))}
+          </div>
+        ) : list.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No recorded events yet.</p>
+        ) : (
+          <ol className="relative space-y-5 border-l border-border pl-6">
+            {list.map((ev, i) => {
+              const meta = eventMeta(ev.event_type);
+              const note = eventNote(ev.event_type, ev.payload ?? {});
+              const extra =
+                ev.event_type === "finding.resolved" && typeof ev.payload?.status === "string"
+                  ? (ev.payload.status as string)
+                  : ev.event_type === "break_glass.revoked" && ev.payload?.auto_revoked
+                    ? "auto-revoked"
+                    : null;
+              return (
+                <li key={ev.seq ?? i} className="relative">
+                  <span className={`absolute -left-[31px] flex h-6 w-6 items-center justify-center rounded-full border ${meta.tone}`}>
+                    {meta.icon}
+                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">{meta.label}</span>
+                    {extra && (
+                      <Badge variant="secondary" className="font-mono text-[10px]">{extra}</Badge>
+                    )}
+                    <Link
+                      href={`/ledger?seq=${ev.seq}`}
+                      className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                      title="View this event's full record in the Audit Ledger"
+                    >
+                      <span className="font-mono">#{ev.seq}</span>
+                      <ExternalLink className="h-3 w-3" />
+                    </Link>
+                  </div>
+                  <div className="text-xs text-muted-foreground mt-0.5">
+                    {actorLabel(ev.actor)} · {safeTimestamp(ev.ts)}
+                  </div>
+                  {note && (
+                    <p className="mt-1.5 text-xs text-foreground bg-muted/50 border rounded-md px-2.5 py-1.5 whitespace-pre-wrap">
+                      {note}
+                    </p>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
         )}
       </CardContent>
     </Card>

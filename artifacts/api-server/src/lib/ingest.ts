@@ -32,6 +32,14 @@ import { scanForPhi, redactInline, type PhiHit } from "./redact";
 import type { LogBus, LogHandler } from "./log-bus";
 import type { LogRecord } from "./log-source";
 import { logger } from "./logger";
+import {
+  getSearchProviderOrNull,
+  type LexicalSearchProvider,
+} from "./search-config";
+import {
+  getRawEvidenceStoreOrNull,
+  type RawEvidenceStore,
+} from "./raw-evidence-store";
 
 export const INGEST_DETECTOR_VERSION = "stage1@m3";
 
@@ -143,10 +151,13 @@ export interface IngestResult {
   redactionRegressions: number;
 }
 
-/** Injectable deps for tests. Defaults are the real scan + redact. */
+/** Injectable deps for tests. Defaults are the real scan + redact, and the
+ *  module-registered lexical search provider (or none). */
 export interface IngestDeps {
   scan?: typeof scanForPhi;
   redact?: typeof redactInline;
+  searchProvider?: LexicalSearchProvider | null;
+  rawEvidenceStore?: RawEvidenceStore | null;
 }
 
 /** Process a single `LogRecord`. Idempotent at the fingerprint level: a
@@ -160,6 +171,21 @@ export async function ingestRecord(
 ): Promise<IngestResult> {
   const scan = deps.scan ?? scanForPhi;
   const redact = deps.redact ?? redactInline;
+  // `undefined` → use the module-registered provider (or none); an explicit
+  // `null` disables mirroring (test path). Postgres' no-op provider is skipped
+  // below via `maintainsExternalIndex`.
+  const searchProvider =
+    deps.searchProvider === undefined
+      ? getSearchProviderOrNull()
+      : deps.searchProvider;
+  // Same convention: `undefined` → module-registered store (or none); explicit
+  // `null` forces the inline-DB path (test default). `external === true` selects
+  // the WORM two-phase write below; otherwise raw stays inline in `raw_evidence`.
+  const rawEvidenceStore =
+    deps.rawEvidenceStore === undefined
+      ? getRawEvidenceStoreOrNull()
+      : deps.rawEvidenceStore;
+  const externalRaw = rawEvidenceStore?.external ?? false;
 
   const result: IngestResult = {
     hits: 0,
@@ -313,25 +339,34 @@ export async function ingestRecord(
         // reconstruction (architect-flagged: "An analyst reviewing a
         // 6-month-old finding that just spiked will see only the latest
         // leak"). Latest snapshot also retained so an analyst can see
-        // what's currently arriving. Both are break-glass gated via the
-        // existing `raw_evidence` column.
-        const existingRaw = existingRow.rawEvidence as
-          | { first?: unknown; latest?: unknown; payload?: unknown }
-          | null;
-        const first =
-          (existingRaw && "first" in existingRaw && existingRaw.first) ||
-          // Migrate flat-shape (pre-fix) rows on first re-hit: treat the
-          // existing row as the first occurrence so we don't lose it.
-          (existingRaw && "payload" in existingRaw ? existingRaw : null) ||
-          occurrenceSnapshot;
+        // what's currently arriving. Both are break-glass gated.
+        //
+        // EXTERNAL store: raw lives in the WORM tier, not the column — leave
+        // `raw_evidence` untouched (NULL) and update only non-raw fields here;
+        // the {first,latest} object refs are written in tx-B after store.put,
+        // outside this lock (network I/O must not extend the advisory-lock
+        // hold). DB store: keep the inline first/latest merge (unchanged M3
+        // behavior).
+        const set: Record<string, unknown> = {
+          lastSeenAt: new Date(),
+          occurrenceCount: sql`${findingsTable.occurrenceCount} + 1`,
+          redactedEvidence,
+        };
+        if (!externalRaw) {
+          const existingRaw = existingRow.rawEvidence as
+            | { first?: unknown; latest?: unknown; payload?: unknown }
+            | null;
+          const first =
+            (existingRaw && "first" in existingRaw && existingRaw.first) ||
+            // Migrate flat-shape (pre-fix) rows on first re-hit: treat the
+            // existing row as the first occurrence so we don't lose it.
+            (existingRaw && "payload" in existingRaw ? existingRaw : null) ||
+            occurrenceSnapshot;
+          set["rawEvidence"] = { first, latest: occurrenceSnapshot };
+        }
         await tx
           .update(findingsTable)
-          .set({
-            lastSeenAt: new Date(),
-            occurrenceCount: sql`${findingsTable.occurrenceCount} + 1`,
-            redactedEvidence,
-            rawEvidence: { first, latest: occurrenceSnapshot },
-          })
+          .set(set)
           .where(eq(findingsTable.id, existingRow.id));
         return { id: existingRow.id, created: false };
       }
@@ -347,10 +382,14 @@ export async function ingestRecord(
         source: sourceStr,
         fingerprint: fp,
         redactedEvidence,
-        rawEvidence: {
-          first: occurrenceSnapshot,
-          latest: occurrenceSnapshot,
-        },
+        // EXTERNAL store: column stays NULL; raw_evidence_ref is set in tx-B.
+        // DB store: raw stays inline as the {first,latest} occurrence snapshot.
+        rawEvidence: externalRaw
+          ? null
+          : {
+              first: occurrenceSnapshot,
+              latest: occurrenceSnapshot,
+            },
         detectorVersion: INGEST_DETECTOR_VERSION,
         firstSeenAt: new Date(),
         lastSeenAt: new Date(),
@@ -393,6 +432,92 @@ export async function ingestRecord(
       // snapshots are the audit anchor for the leak. Per-occurrence ledger
       // entries at ingest volume would also blow up the chain (one entry per
       // log line) for no investigative gain.
+    }
+
+    // tx-B (external WORM store only): write this occurrence's raw payload as a
+    // NEW immutable object, then race-safely advance the finding's
+    // `raw_evidence_ref`. Done OUTSIDE the dedup advisory lock so the (possibly
+    // slow) object-store round-trip never serializes concurrent ingests of the
+    // same fingerprint. `first` is set-once via column-level COALESCE
+    // (first-writer-wins under concurrency), `latest` always advances to the
+    // newest object. Best-effort + LOUD: the finding is already committed (the
+    // leak is recorded); if the raw write fails we log at error level and leave
+    // `raw_evidence_ref` NULL — a later occurrence's COALESCE will re-seat
+    // `first`, and break-glass reports the raw as unresolved rather than
+    // silently fabricating one. We deliberately do NOT rethrow: tx-A is
+    // committed and a throw would only drive a bus retry that double-counts the
+    // occurrence.
+    if (externalRaw && rawEvidenceStore) {
+      try {
+        const uri = await rawEvidenceStore.put({
+          findingId: upsert.id,
+          tenantId: record.tenantId,
+          evidence: occurrenceSnapshot,
+        });
+        await withTenant(record.tenantId, async (tx) => {
+          await tx.execute(sql`
+            UPDATE findings
+            SET raw_evidence_ref = jsonb_build_object(
+              'first', COALESCE(raw_evidence_ref->'first', to_jsonb(${uri}::text)),
+              'latest', to_jsonb(${uri}::text)
+            )
+            WHERE id = ${upsert.id} AND tenant_id = ${record.tenantId}
+          `);
+        });
+      } catch (err) {
+        logger.error(
+          { err, finding_id: upsert.id, provider: rawEvidenceStore.name },
+          "external raw-evidence write failed; finding persisted WITHOUT retrievable raw evidence (raw_evidence_ref left null)",
+        );
+        // Proactive operator signal: durable raw-evidence capture to the WORM
+        // tier is degraded. The finding is committed (the leak is recorded),
+        // but its raw PHI is NOT being persisted to durable storage — today
+        // this only surfaced reactively at break-glass read time as
+        // `raw_unresolved`. For a compliance system, operators must learn
+        // *proactively* that raw PHI is not landing in the WORM tier, not
+        // discover it mid-incident. Ledger (and thus alert/channel route) the
+        // failure with provider + finding id + tenant only — NO PHI, no raw
+        // payload, no object URI. Only reachable when an external store is
+        // configured (the inline DB store can't fail this way).
+        await appendLedger({
+          tenantId: record.tenantId,
+          actor: { kind: "system", id: "ingest" },
+          eventType: "ingest.raw_evidence_store_failed",
+          subjectType: "finding",
+          subjectId: upsert.id,
+          payload: {
+            finding_id: upsert.id,
+            provider: rawEvidenceStore.name,
+            source: sourceStr,
+            error: err instanceof Error ? err.name : "unknown",
+          },
+        });
+      }
+    }
+
+    // Mirror the redacted projection into the external lexical index (created
+    // OR updated, so re-occurrences keep the indexed snippet fresh). Best
+    // effort: a search-backend outage must NEVER fail ingest — the finding is
+    // already committed to Postgres and the boot reconcile is the backstop.
+    // Postgres' no-op provider is skipped via `maintainsExternalIndex`. Only
+    // redacted fields are sent — raw PHI never reaches the searchable tier.
+    if (searchProvider?.maintainsExternalIndex) {
+      try {
+        await searchProvider.indexFinding({
+          findingId: upsert.id,
+          tenantId: record.tenantId,
+          classification,
+          subclass: dominant,
+          severity,
+          source: sourceStr,
+          snippet: capped.snippet,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, finding_id: upsert.id, provider: searchProvider.name },
+          "external search index upsert failed; finding persisted, reconcile will backfill",
+        );
+      }
     }
   }
 

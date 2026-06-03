@@ -26,6 +26,11 @@ import {
   enqueueReview,
 } from "./supervisor";
 import { parseStrictJson } from "./triage";
+import {
+  inProcessAgentInvoker,
+  __setAgentInvokerForTest,
+  __resetAgentInvokerForTest,
+} from "../a2a";
 import { z } from "zod/v4";
 
 // All tests in this file hit the real dev DB and scope every read to rows
@@ -121,11 +126,16 @@ async function currentHeadSeq(): Promise<number> {
 beforeEach(() => {
   __startSupervisorForTest();
   __resetSupervisorBudgetForTest();
+  // Keep the supervisor offline: route triage/verify through the in-process
+  // invoker (direct calls to runTriageAgent/runVerifierAgent, which use the
+  // injected fake LLM runtime) instead of the default A2A loopback client.
+  __setAgentInvokerForTest(inProcessAgentInvoker);
 });
 afterEach(async () => {
   await __drainSupervisorForTest(5000);
   __stopSupervisorForTest();
   __resetLlmRuntimeForTest();
+  __resetAgentInvokerForTest();
 });
 
 const HAPPY_TRIAGE = JSON.stringify({

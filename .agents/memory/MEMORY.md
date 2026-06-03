@@ -1,1 +1,3 @@
 - [Agent harness invariants](agent-harness.md) — chat loop degrades (never errors/leaks raw tool_call JSON); loop is DI'd for offline tests; per-call+per-tool timeouts mandatory.
+- [A2A + AG-UI protocol seams](a2a-agui-integration.md) — @a2a-js/sdk loopback agents + @ag-ui/encoder; SDK gotchas (Router mounting, Message-vs-Task), parse+strip redacted boundary, injectable invoker keeps tests offline.
+- [Dashboard render safety](dashboard-render-safety.md) — never feed raw timestamps to date-fns inline; use safeTimestamp/safeRelativeTime in src/lib/format.ts or a bad row white-screens the page.

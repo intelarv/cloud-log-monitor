@@ -301,20 +301,64 @@ export const PHI_FIXTURES: PhiFixture[] = [
     ],
   },
   {
-    // ISO-8601 date in a `dob` field. The date detector is deliberately
-    // slash-only (to avoid flagging the ISO timestamps that saturate ops logs),
-    // so this is an ACCEPTED miss recorded by the eval, not a fixable bug here.
+    // ISO-8601 date in a `dob` field. Caught by the M13.1 dob_date detector,
+    // which fires on ISO/textual dates only when birth-context-anchored, so the
+    // ISO `ts=` timestamps that saturate ops logs (benign-kv-1) stay unmatched.
     id: "json-6",
     shape: "json",
     text: '{"member_id":"M-2231","dob":"1981-03-14","plan":"gold"}',
+    phi: [{ sub: "1981-03-14", identifier: "date_of_birth" }],
+  },
+  {
+    // Textual DOB in prose, birth-context anchored.
+    id: "dob-1",
+    shape: "clean",
+    text: "Patient date of birth March 14, 1981 confirmed at intake.",
+    phi: [{ sub: "March 14, 1981", identifier: "date_of_birth" }],
+  },
+  {
+    // logfmt dash-MDY DOB.
+    id: "dob-2",
+    shape: "kv",
+    text: "enrollment member=M-77 dob=03-14-1981 plan=silver",
+    phi: [{ sub: "03-14-1981", identifier: "date_of_birth" }],
+  },
+  {
+    // IPv6 (full 8-group form). The ip_address detector is IPv4-only.
+    id: "ipv6-1",
+    shape: "kv",
+    text: "session client_ip=2001:0db8:85a3:0000:0000:8a2e:0370:7334 established",
     phi: [
-      {
-        sub: "1981-03-14",
-        identifier: "date",
-        knownGap:
-          "ISO-8601 dates are intentionally not matched (slash-only date detector) to avoid flagging routine log timestamps.",
-      },
+      { sub: "2001:0db8:85a3:0000:0000:8a2e:0370:7334", identifier: "ip_address" },
     ],
+  },
+  {
+    // IPv6 (`::`-compressed form).
+    id: "ipv6-2",
+    shape: "clean",
+    text: "Connection from fe80::1ff:fe23:4567:890a was logged.",
+    phi: [{ sub: "fe80::1ff:fe23:4567:890a", identifier: "ip_address" }],
+  },
+  {
+    // License plate, context-anchored.
+    id: "plate-1",
+    shape: "clean",
+    text: "Vehicle on file has license plate 7XYZ123 per the report.",
+    phi: [{ sub: "7XYZ123", identifier: "license_plate" }],
+  },
+  {
+    // Passport number, context-anchored.
+    id: "passport-1",
+    shape: "kv",
+    text: "traveler record passport=X1234567 country=US verified",
+    phi: [{ sub: "X1234567", identifier: "passport_number" }],
+  },
+  {
+    // DEA registration number — checksum-valid (AB1234563).
+    id: "dea-1",
+    shape: "clean",
+    text: "Prescriber DEA AB1234563 authorized the refill.",
+    phi: [{ sub: "AB1234563", identifier: "dea_number" }],
   },
 
   // ---------------------------------------------------------------------------

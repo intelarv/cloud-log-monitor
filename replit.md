@@ -28,7 +28,7 @@ Current milestone: **M13 deterministic slices complete** (detector coverage expa
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5, AG-UI SSE
+- API: Express 5; **AG-UI** (`@ag-ui/encoder` / `@ag-ui/core`) for UI↔agent SSE; **A2A** (`@a2a-js/sdk`) for agent↔agent (Supervisor → Triage/Verifier)
 - DB: PostgreSQL + Drizzle ORM, pgvector 0.8
 - Validation: Zod v4, `drizzle-zod`
 - API codegen: Orval (from OpenAPI spec)
@@ -38,6 +38,8 @@ Current milestone: **M13 deterministic slices complete** (detector coverage expa
 
 - API entry: `artifacts/api-server/src/index.ts` (bootstrap → embedding backfill → chain verify → start chain verifier + notarizer → wire ingest pipeline → listen)
 - Chat agent loop: `artifacts/api-server/src/lib/chat-agent.ts`
+- A2A agent-to-agent protocol (`@a2a-js/sdk`): `artifacts/api-server/src/lib/a2a/` — `protocol.ts` (Zod wire schemas + `AgentInvoker` seam + loopback paths), `auth.ts` (shared-secret bearer + `timingSafeEqual`, dev fallback from `SESSION_SECRET`+WARN), `cards.ts` (Triage/Verifier Agent Cards), `executors.ts` (Triage/Verifier `AgentExecutor`s that parse+strip the inbound finding then wrap `runTriageAgent`/`runVerifierAgent`), `server.ts` (`mountA2AAgents` — card + JSON-RPC routes under `/a2a/triage`,`/a2a/verify`, both behind `a2aAuthMiddleware`), `client.ts` (`A2AAgentInvoker` over loopback handling Message-or-Task results + `inProcessAgentInvoker` test seam + `getAgentInvoker()`). Supervisor calls agents only through `getAgentInvoker()`.
+- AG-UI SSE encoder seam (`@ag-ui/encoder`): `artifacts/api-server/src/lib/sse.ts` (emits official AG-UI `EventType` frames; PHI-safe write seam + heartbeat preserved); dashboard consumer: `artifacts/dashboard/src/pages/chat.tsx` (parses `EventType` from `@ag-ui/core`).
 - Tool registry (MCP-shaped): `artifacts/api-server/src/lib/tools.ts`
 - Hybrid retrieval (BM25 + vector + RRF; `reconcileSearchIndex` boot backfill): `artifacts/api-server/src/lib/search.ts`
 - Pluggable lexical search provider seam + config/factory/registry (M10.1, mirrors embedder-config): `artifacts/api-server/src/lib/search-config.ts` (`PostgresLexicalSearchProvider` default; `LexicalSearchProvider` interface)
@@ -94,6 +96,7 @@ Moved to `docs/ARCHITECTURE.md` **Appendix A — Implementation decisions log** 
 - Channel dispatch: 5 hard guarantees (outbound PHI hard gate, self-recursion guard, per-channel rate limit, webhook host allow-list + HMAC, adapter failure isolation).
 - Chat agent routes through `LlmAgentRuntime` seam (M9.5) so `LLM_PROVIDER` controls every cloud LLM call — chat included; native streaming on Bedrock/Vertex/Azure; `PhiGuardLlmRuntime.generateStream` scans multi-turn history at first `next()`; `agent_identity.model_id` records the runtime's effective `done.modelId`.
 - Agent loop is hardened + dependency-injected (`runAgentLoop` in `chat-agent.ts`, separated from DB retrieval): hard LLM-call + tool-handler timeouts (`with-timeout.ts`), bounded tool budget, per-turn output-token circuit breaker, bounded retry, duplicate-tool-call dedup, tool-result clamp. Any LLM failure / cost-cap / budget-exhaustion **degrades to a deterministic redacted finding summary** (threat model §DoS) — never an error page, never raw `tool_call` JSON to the user; `degraded`/`degrade_reason`/`approx_output_tokens` are ledgered on `chat.agent_turn`. Loop branches are unit-tested offline via injected fake runtime + tool executor.
+- Specialist agents (Triage, Verifier) speak the **official A2A protocol** (`@a2a-js/sdk`): Agent Cards + JSON-RPC `message/send`. The Supervisor calls them through the `AgentInvoker` seam — `A2AAgentInvoker` (loopback) in prod; `inProcessAgentInvoker` injected in tests, so the supervisor suite stays hermetic/offline. Only the redacted `FindingSafe` projection crosses the wire: executors **parse+strip** the inbound payload (Zod object parse drops unknown keys, so `rawEvidence`/`rawEvidenceRef` can't ride even if a caller smuggles them) and forward the validated output, never the raw cast. Returned rationale is re-scanned by `scanForPhi` before the ledger, and `agent_identity` is recorded — exactly as the prior in-process path. Endpoints are shared-secret bearer authed (`A2A_SHARED_SECRET`, dev fallback+WARN from `SESSION_SECRET`) and **loopback-only** (deliberately NOT in the proxy `/api` path table). The A2A `message/send` result may be a `Message` or a `Task`; the client handles both. UI↔agent chat now streams **official AG-UI events** via `@ag-ui/encoder` (`sse.ts`), consumed by the dashboard via `EventType` from `@ag-ui/core`.
 
 ## Product
 

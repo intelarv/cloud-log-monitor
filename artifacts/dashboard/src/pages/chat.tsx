@@ -6,15 +6,28 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MessageSquarePlus, Send, User, Bot, Loader2 } from "lucide-react";
-import { format } from "date-fns";
-import { Link } from "wouter";
+import { safeTimestamp } from "../lib/format";
+import { Link, useSearch } from "wouter";
 import { Badge } from "@/components/ui/badge";
+import { EventType } from "@ag-ui/core";
 
 export default function Chat() {
   const { data: sessions, refetch: refetchSessions } = useListChatSessions();
   const createSession = useCreateChatSession();
-  
-  const [activeSessionId, setActiveSessionId] = React.useState<string | null>(null);
+
+  // `?session=<id>` deep-links to a specific session (e.g. from a ledger entry
+  // whose subject is a chat session). Initialize the active session from it.
+  const search = useSearch();
+  const requestedSessionId = React.useMemo(
+    () => new URLSearchParams(search).get("session"),
+    [search],
+  );
+
+  const [activeSessionId, setActiveSessionId] = React.useState<string | null>(requestedSessionId);
+
+  React.useEffect(() => {
+    if (requestedSessionId) setActiveSessionId(requestedSessionId);
+  }, [requestedSessionId]);
   const [input, setInput] = React.useState("");
   const [streamingMessage, setStreamingMessage] = React.useState("");
   const [isStreaming, setIsStreaming] = React.useState(false);
@@ -88,16 +101,21 @@ export default function Chat() {
           const dataStr = dataLines.join("\n");
           try {
             const data = JSON.parse(dataStr);
-            if (data.type === "agent_message_delta") {
+            // Official AG-UI event vocabulary (@ag-ui/core EventType).
+            if (data.type === EventType.TEXT_MESSAGE_CONTENT) {
               setStreamingMessage((prev) => prev + (data.delta ?? ""));
-            } else if (data.type === "tool_call") {
-              const name = data.tool ?? data.name ?? "tool";
+            } else if (data.type === EventType.TOOL_CALL_START) {
+              const name = data.toolCallName ?? "tool";
               setStreamingMessage((prev) => prev + `\n_[called ${name}]_\n`);
-            } else if (data.type === "agent_message_complete" || data.type === "done") {
-              // assistant message persisted server-side; refetch picks it up
+            } else if (
+              data.type === EventType.RUN_FINISHED ||
+              data.type === EventType.RUN_ERROR
+            ) {
+              // Run is terminal; the assistant message was persisted
+              // server-side, so the history refetch in `finally` picks it up.
             }
           } catch (e) {
-            console.error("SSE parse error", e, dataStr);
+            console.error("AG-UI SSE parse error", e, dataStr);
           }
         }
       }
@@ -156,7 +174,7 @@ export default function Chat() {
                 >
                   {session.title || "Untitled Session"}
                   <div className="text-[10px] opacity-70 mt-1 font-mono">
-                    {format(new Date(session.created_at), "MMM d, HH:mm")}
+                    {safeTimestamp(session.created_at, "MMM d, HH:mm")}
                   </div>
                 </button>
               ))}
@@ -187,7 +205,7 @@ export default function Chat() {
                     </div>
                     <div className={`flex flex-col gap-1 max-w-[80%] ${msg.role === "user" ? "items-end" : "items-start"}`}>
                       <div className="text-xs text-muted-foreground font-mono">
-                        {msg.role === "user" ? "You" : "Agent"} • {format(new Date(msg.created_at), "HH:mm:ss")}
+                        {msg.role === "user" ? "You" : "Agent"} • {safeTimestamp(msg.created_at, "HH:mm:ss")}
                       </div>
                       <div className={`px-4 py-3 rounded-xl text-sm ${
                         msg.role === "user" 

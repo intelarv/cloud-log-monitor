@@ -7,6 +7,7 @@ import {
   uniqueIndex,
   index,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { z } from "zod/v4";
 
 export const ledgerEntriesTable = pgTable(
@@ -27,6 +28,11 @@ export const ledgerEntriesTable = pgTable(
     uniqueIndex("ledger_hash_uniq").on(t.hash),
     index("ledger_tenant_idx").on(t.tenantId),
     index("ledger_subject_idx").on(t.subjectType, t.subjectId),
+    // Expression index backing the server-side actor pivot in routes/ledger.ts
+    // ("show me everything this analyst did"): the query filters on
+    // `tenant_id` + `actor->>'id'` (with a `kind = 'human'` recheck). Without
+    // this index the filtered scan degrades on a large ledger within a tenant.
+    index("ledger_actor_id_idx").on(t.tenantId, sql`((${t.actor}->>'id'))`),
   ],
 );
 

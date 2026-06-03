@@ -3,8 +3,10 @@ import { logger } from "./lib/logger";
 import { bootstrap } from "@workspace/db";
 import { verifyChain } from "./lib/ledger";
 import { startChainVerifier } from "./lib/chain-verifier";
-import { backfillEmbeddings } from "./lib/search";
+import { backfillEmbeddings, reconcileSearchIndex } from "./lib/search";
 import { initEmbedderFromEnv } from "./lib/embedder-config";
+import { initSearchProviderFromEnv } from "./lib/search-config";
+import { initRawEvidenceStoreFromEnv } from "./lib/raw-evidence-store";
 import { initLlmRuntimeFromEnv } from "./lib/llm-runtime-config";
 import { hasDedicatedNotarizationSecret } from "./lib/notarization";
 import { startIngestPipeline } from "./lib/ingest";
@@ -37,6 +39,20 @@ async function main(): Promise<void> {
   // provider. See llm-runtime-config.ts.
   initLlmRuntimeFromEnv();
 
+  // Step 0.7: resolve the lexical (BM25) search provider from env. Default is
+  // Postgres FTS (dev/local); SEARCH_PROVIDER=opensearch routes the lexical
+  // retriever leg to a managed OpenSearch cluster. No DB access here, so this
+  // ordering vs bootstrap is flexible. See search-config.ts.
+  initSearchProviderFromEnv();
+
+  // Step 0.8: resolve the raw-evidence store from env. Default is the inline
+  // `raw_evidence` jsonb column (dev/local); RAW_EVIDENCE_PROVIDER=s3|gcs|
+  // azure-blob retargets unredacted PHI to a WORM object store (Object Lock /
+  // retention / immutability). No DEPLOYMENT_TARGET shortcut — moving raw PHI
+  // is always explicit (needs a bucket/container). No DB access here. See
+  // raw-evidence-store.ts.
+  initRawEvidenceStoreFromEnv();
+
   // Step 1: idempotent DB setup (RLS policies + findings_redacted view).
   // Safe to run every boot; CREATE OR REPLACE / DROP IF EXISTS make it so.
   // The embedding-column dim is passed through; if a pre-existing column has
@@ -50,6 +66,24 @@ async function main(): Promise<void> {
   // already converged. Uses the embedder registered in step 0.
   const emb = await backfillEmbeddings();
   logger.info(emb, "Embedding backfill complete");
+
+  // Step 1.6 (M10.1): reconcile the external lexical index. No-op for the
+  // Postgres provider (generated tsv is always in sync); for OpenSearch it
+  // bulk-mirrors every finding's redacted projection so a freshly-pointed
+  // cluster converges. Idempotent. Best-effort: an external search backend
+  // (OpenSearch) is a separate failure domain — if it is down at boot we must
+  // still come up and serve traffic. Hybrid search degrades to the vector leg
+  // until the backend recovers, and the next restart reconciles. The Postgres
+  // no-op cannot fail here, so this only shields external providers.
+  try {
+    const recon = await reconcileSearchIndex();
+    logger.info(recon, "Search index reconcile complete");
+  } catch (err) {
+    logger.warn(
+      { err },
+      "Search index reconcile failed at boot; continuing (hybrid search degrades to vector-only until the backend recovers and the next reconcile runs)",
+    );
+  }
 
   // Step 2: chain verification. The system's tamper-evidence claim depends
   // on this; if the chain is broken at boot, we refuse to start.

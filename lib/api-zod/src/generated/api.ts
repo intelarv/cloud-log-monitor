@@ -151,6 +151,33 @@ export const GetFindingResponse = zod.object({
 
 
 /**
+ * @summary Audit-ledger history for a single finding (most-recent-first). Returns
+every ledger entry whose subject is this finding — resolve / reopen
+transitions and break-glass grant / approve / revoke events — including
+the free-text reason where one was recorded. Tenant-scoped; redacted
+payloads only (free text was content-policy scanned at write time).
+
+ */
+export const GetFindingHistoryParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const GetFindingHistoryResponseItem = zod.object({
+  "seq": zod.number(),
+  "ts": zod.coerce.date(),
+  "tenant_id": zod.string().nullish(),
+  "actor": zod.record(zod.string(), zod.unknown()),
+  "event_type": zod.string(),
+  "subject_type": zod.string().nullish(),
+  "subject_id": zod.string().nullish(),
+  "payload": zod.record(zod.string(), zod.unknown()),
+  "prev_hash": zod.string(),
+  "hash": zod.string()
+})
+export const GetFindingHistoryResponse = zod.array(GetFindingHistoryResponseItem)
+
+
+/**
  * @summary List chat sessions for the current user.
  */
 export const ListChatSessionsResponseItem = zod.object({
@@ -233,9 +260,11 @@ export const listLedgerQueryLimitMax = 500;
 
 
 
+
 export const ListLedgerQueryParams = zod.object({
   "after_seq": zod.coerce.number().min(listLedgerQueryAfterSeqMin).optional(),
-  "limit": zod.coerce.number().min(1).max(listLedgerQueryLimitMax).default(listLedgerQueryLimitDefault)
+  "limit": zod.coerce.number().min(1).max(listLedgerQueryLimitMax).default(listLedgerQueryLimitDefault),
+  "actor": zod.coerce.string().min(1).optional().describe('Filter to a single human actor\'s entries (the actor\'s id). Used by the \"show me everything this analyst did\" pivot so a reviewer sees the actor\'s complete trail, server-filtered and paginated, instead of only entries that happen to be in the most-recent window.\n')
 })
 
 export const ListLedgerResponse = zod.object({
@@ -404,6 +433,42 @@ export const ApproveBreakGlassGrantResponse = zod.object({
 
 
 /**
+ * @summary Revoke a break-glass grant before its TTL elapses. Requires a fresh
+step-up cookie. The requester or any other analyst in the same tenant
+may revoke. Already-revoked grants return 409; expired grants return
+410.
+
+ */
+export const RevokeBreakGlassGrantParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const revokeBreakGlassGrantBodyReasonMax = 2000;
+
+
+
+export const RevokeBreakGlassGrantBody = zod.object({
+  "reason": zod.string().min(1).max(revokeBreakGlassGrantBodyReasonMax).optional()
+})
+
+export const RevokeBreakGlassGrantResponse = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "user_id": zod.string(),
+  "finding_id": zod.string(),
+  "justification": zod.string(),
+  "granted_at": zod.coerce.date(),
+  "expires_at": zod.coerce.date(),
+  "revoked_at": zod.coerce.date().nullable(),
+  "requires_second_approval": zod.boolean(),
+  "approver_user_id": zod.string().nullable(),
+  "approved_at": zod.coerce.date().nullable(),
+  "pending_approval": zod.boolean(),
+  "active": zod.boolean()
+})
+
+
+/**
  * @summary List grants pending second-person approval that the caller is
 eligible to approve (excludes grants the caller requested).
 
@@ -445,6 +510,57 @@ export const GetFindingRawResponse = zod.object({
   "raw_evidence": zod.union([zod.record(zod.string(), zod.unknown()),zod.null()]),
   "two_person_approved": zod.boolean(),
   "approver_user_id": zod.string().nullable()
+})
+
+
+/**
+ * @summary Close out a finding by marking it resolved or false positive. Any
+active break-glass grants for the finding are auto-revoked so raw-PHI
+access ends with the incident. Idempotent: re-resolving a finding
+already in the target state is a no-op. Requires session only.
+
+ */
+export const ResolveFindingParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const ResolveFindingBody = zod.object({
+  "status": zod.enum(['resolved', 'false_positive'])
+})
+
+export const ResolveFindingResponse = zod.object({
+  "finding_id": zod.string(),
+  "status": zod.enum(['resolved', 'false_positive']),
+  "transitioned": zod.boolean(),
+  "revoked_grants": zod.number()
+})
+
+
+/**
+ * @summary Reopen a finding that was closed in error, transitioning it from a
+resolved / false_positive state back to "open". Unlike resolve, this
+does NOT auto-revoke break-glass grants. Idempotent: reopening a
+finding already open is a no-op. Accepts an optional free-text reason
+(scanned by the content policy) recorded in the audit ledger. Requires
+session only.
+
+ */
+export const ReopenFindingParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const reopenFindingBodyReasonMax = 2000;
+
+
+
+export const ReopenFindingBody = zod.object({
+  "reason": zod.string().min(1).max(reopenFindingBodyReasonMax).optional().describe('Optional free-text reason explaining why the closed finding is being\nreopened. Scanned by the same content policy as resolve\/revoke\njustifications before it lands in the immutable audit ledger.\n')
+})
+
+export const ReopenFindingResponse = zod.object({
+  "finding_id": zod.string(),
+  "status": zod.enum(['open']),
+  "transitioned": zod.boolean()
 })
 
 

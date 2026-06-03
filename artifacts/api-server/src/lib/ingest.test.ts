@@ -5,6 +5,7 @@ import { ingestRecord, startIngestPipeline } from "./ingest";
 import { redactInline, scanForPhi } from "./redact";
 import { InMemoryLogBus } from "./log-bus";
 import type { LogRecord } from "./log-source";
+import type { RawEvidenceStore } from "./raw-evidence-store";
 
 // Tests in this file hit the real dev DB. They scope every read to rows
 // they themselves create (unique source ids / fingerprints) so the
@@ -333,6 +334,202 @@ describe("ingestRecord", () => {
     };
     expect(last.reason).toBe("sourceRecordId_invalid");
     expect(last.source_record_id_len).toBe(300);
+  });
+});
+
+describe("external raw-evidence store (two-phase write)", () => {
+  it("routes raw evidence to the external store and records a {first,latest} ref, leaving raw_evidence NULL", async () => {
+    // A fake external store captures the put and hands back a deterministic
+    // URI so we can assert the ingest two-phase write: tx-A persists the
+    // finding with raw_evidence NULL, tx-B seats raw_evidence_ref.
+    const puts: Array<{ findingId: string; tenantId: string; evidence: unknown }> =
+      [];
+    let n = 0;
+    const fakeStore: RawEvidenceStore = {
+      name: "fake-worm",
+      external: true,
+      async put(args) {
+        puts.push(args);
+        return `s3://fake/raw-evidence/${args.tenantId}/${args.findingId}/obj-${n++}.json`;
+      },
+      async get() {
+        throw new Error("not used in this test");
+      },
+    };
+
+    const name = `worm-${uniq()}`;
+    const rec1 = makeRecord({
+      sourceName: name,
+      sourceRecordId: "evt-a",
+      payload: "applicant_ssn=321-54-9876 status=new",
+    });
+    const r1 = await ingestRecord(rec1, { rawEvidenceStore: fakeStore });
+    expect(r1.findingsCreated).toBe(1);
+    expect(puts).toHaveLength(1);
+
+    const fp = `phi:ssn:fixture:${name}:v1`;
+    const afterFirst = await db
+      .select()
+      .from(findingsTable)
+      .where(
+        and(eq(findingsTable.tenantId, TENANT), eq(findingsTable.fingerprint, fp)),
+      );
+    expect(afterFirst).toHaveLength(1);
+    const f1 = afterFirst[0]!;
+    // External store active → inline column stays NULL.
+    expect(f1.rawEvidence).toBeNull();
+    const ref1 = f1.rawEvidenceRef as { first: string; latest: string };
+    expect(ref1.first).toMatch(/^s3:\/\/fake\/raw-evidence\/default\//);
+    expect(ref1.first).toBe(ref1.latest);
+
+    // Second occurrence: a NEW immutable object; `first` is pinned, `latest` advances.
+    const rec2 = makeRecord({
+      sourceName: name,
+      sourceRecordId: "evt-b",
+      payload: "applicant_ssn=321-54-9876 status=retry",
+    });
+    const r2 = await ingestRecord(rec2, { rawEvidenceStore: fakeStore });
+    expect(r2.findingsUpdated).toBe(1);
+    expect(puts).toHaveLength(2);
+
+    const afterSecond = await db
+      .select()
+      .from(findingsTable)
+      .where(
+        and(eq(findingsTable.tenantId, TENANT), eq(findingsTable.fingerprint, fp)),
+      );
+    const f2 = afterSecond[0]!;
+    expect(f2.rawEvidence).toBeNull();
+    const ref2 = f2.rawEvidenceRef as { first: string; latest: string };
+    expect(ref2.first).toBe(ref1.first); // first-writer-wins (COALESCE)
+    expect(ref2.latest).not.toBe(ref1.latest); // latest advanced
+    expect(puts[1]!.tenantId).toBe(TENANT);
+    expect(puts[1]!.findingId).toBe(f2.id);
+  });
+
+  it("does not block ingest when the external store put fails (finding persists, ref left NULL)", async () => {
+    const failingStore: RawEvidenceStore = {
+      name: "fake-worm-broken",
+      external: true,
+      async put() {
+        throw new Error("simulated WORM outage");
+      },
+      async get() {
+        throw new Error("not used");
+      },
+    };
+    const name = `wormfail-${uniq()}`;
+    const rec = makeRecord({
+      sourceName: name,
+      sourceRecordId: "evt-a",
+      payload: "applicant_ssn=765-43-2109 status=new",
+    });
+    const r = await ingestRecord(rec, { rawEvidenceStore: failingStore });
+    // The finding is still committed (raw write is best-effort, post-commit).
+    expect(r.findingsCreated).toBe(1);
+    const rows = await db
+      .select()
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.rawEvidence).toBeNull();
+    expect(rows[0]!.rawEvidenceRef).toBeNull();
+  });
+
+  it("emits an operator alert event (no PHI) when the external store put fails", async () => {
+    const failingStore: RawEvidenceStore = {
+      name: "fake-worm-alerting",
+      external: true,
+      async put() {
+        throw new Error("simulated WORM outage");
+      },
+      async get() {
+        throw new Error("not used");
+      },
+    };
+    const name = `wormalert-${uniq()}`;
+    const ssn = "765-43-2110";
+    const rec = makeRecord({
+      sourceName: name,
+      sourceRecordId: "evt-a",
+      payload: `applicant_ssn=${ssn} status=new`,
+    });
+    const r = await ingestRecord(rec, { rawEvidenceStore: failingStore });
+    expect(r.findingsCreated).toBe(1);
+
+    const findings = await db
+      .select({ id: findingsTable.id })
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(findings).toHaveLength(1);
+    const findingId = findings[0]!.id;
+
+    const events = await db
+      .select({
+        eventType: ledgerEntriesTable.eventType,
+        subjectId: ledgerEntriesTable.subjectId,
+        payload: ledgerEntriesTable.payload,
+      })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(ledgerEntriesTable.eventType, "ingest.raw_evidence_store_failed"),
+          eq(ledgerEntriesTable.subjectId, findingId),
+        ),
+      );
+    expect(events).toHaveLength(1);
+    const ev = events[0]!;
+    const payload = ev.payload as Record<string, unknown>;
+    expect(payload.provider).toBe("fake-worm-alerting");
+    expect(payload.finding_id).toBe(findingId);
+    // No PHI / raw payload anywhere in the ledger payload.
+    const payloadStr = JSON.stringify(payload);
+    expect(payloadStr).not.toContain(ssn);
+  });
+
+  it("does NOT emit the store-failure alert when the inline DB store is used", async () => {
+    // The inline DB store can't fail this way, so a successful inline ingest
+    // must never produce the operator alert event.
+    const name = `worminline-${uniq()}`;
+    const rec = makeRecord({
+      sourceName: name,
+      sourceRecordId: "evt-a",
+      payload: "applicant_ssn=765-43-2111 status=new",
+    });
+    const r = await ingestRecord(rec, { rawEvidenceStore: null });
+    expect(r.findingsCreated).toBe(1);
+
+    const findings = await db
+      .select({ id: findingsTable.id })
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(findings).toHaveLength(1);
+
+    const events = await db
+      .select({ seq: ledgerEntriesTable.seq })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(ledgerEntriesTable.eventType, "ingest.raw_evidence_store_failed"),
+          eq(ledgerEntriesTable.subjectId, findings[0]!.id),
+        ),
+      );
+    expect(events).toHaveLength(0);
   });
 });
 

@@ -134,6 +134,33 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // Loop-safe because this event is emitted from the source loop, never
   // from the alert dispatcher itself.
   "ingest.source_error": "warning",
+  // M10.2/M10.3: an external WORM raw-evidence write (`store.put`) failed at
+  // ingest. The finding still commits (the leak IS recorded), but its raw
+  // PHI did NOT land in durable storage and `raw_evidence_ref` stays NULL.
+  // High, not warning: for a compliance system, raw evidence silently not
+  // reaching the WORM tier is a degraded durable-capture condition that an
+  // operator must triage proactively — losing the raw payload is permanent
+  // for that occurrence, and today it would otherwise only surface
+  // reactively at break-glass read time as `raw_unresolved`. Not critical:
+  // no disclosure or ledger-integrity loss, and a single transient object-
+  // store blip is recoverable on the next occurrence's write. Inert when no
+  // external store is configured (the inline DB store can't fail this way).
+  // Loop-safe: emitted from the ingest path, never the alert dispatcher.
+  "ingest.raw_evidence_store_failed": "high",
+  // M10.2/M10.3 (read path): a break-glass raw-PHI read could NOT resolve the
+  // external WORM ref (store outage / misconfig / malformed ref) and fell back
+  // to the legacy inline `raw_evidence` copy. The analyst still saw the raw
+  // payload (no disclosure or audit gap — the access is ledgered either way),
+  // but the durable WORM tier is failing READS, which today is only discoverable
+  // by inspecting ledger payloads after the fact. High, not warning: a
+  // compliance system running in degraded durable-read mode is an operational
+  // condition on-call must triage proactively (it usually means the same outage
+  // is also dropping ingest WRITES); not critical because no PHI leaked and the
+  // read still succeeded from the inline mirror. Inert outside a mixed-state
+  // migration window (DB store never sets fallbackUsed). Loop-safe: emitted from
+  // the break-glass read handler, never the alert dispatcher. Payload carries
+  // finding id + store name + reason only (no raw PHI).
+  "break_glass.raw_fallback_used": "high",
 } as const;
 
 /** Event types that are legitimately emitted at high volume or as part of a
@@ -159,9 +186,25 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // approval are gated by step-up + the two-person rule.
   "break_glass.granted",
   "break_glass.approved",
+  // Early revocation of a grant before its TTL elapses (requester withdrawing
+  // their own grant, or an operator cutting one off). A legitimate lifecycle
+  // action that *reduces* exposure; the raw-PHI read it gates is the
+  // alertable event. Auditable in the ledger like grant/approve.
+  "break_glass.revoked",
   // Finding lifecycle — the notifier handles severity-based routing per
   // §291; not in scope of the alert hook.
   "finding.created",
+  // A finding transitioned to a resolved/closed state (resolved or
+  // false_positive). A routine triage outcome that *reduces* exposure (it also
+  // auto-revokes the finding's active break-glass grants); auditable in the
+  // ledger like the rest of the finding lifecycle. The auto-revoke it triggers
+  // is ledgered separately as `break_glass.revoked`.
+  "finding.resolved",
+  // A finding was reopened (transitioned from a closed state back to "open"),
+  // typically because it was closed in error. A routine triage correction;
+  // unlike resolve it does NOT touch break-glass access. Auditable in the
+  // ledger like the rest of the finding lifecycle.
+  "finding.reopened",
   // Ledger bootstrap. Fires once.
   "ledger.genesis",
   // M2: each successful notarization checkpoint creation. Routine signal

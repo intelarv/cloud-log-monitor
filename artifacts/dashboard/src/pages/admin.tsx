@@ -5,6 +5,7 @@ import {
   useListPendingBreakGlassApprovals, 
   useReplayIngestFixture,
   useApproveBreakGlassGrant,
+  useRevokeBreakGlassGrant,
   getListBreakGlassGrantsQueryKey,
   getListPendingBreakGlassApprovalsQueryKey,
   getListFindingsQueryKey,
@@ -16,8 +17,9 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { Play, Shield, Clock, CheckCircle2, AlertTriangle, Key, Activity } from "lucide-react";
-import { format, formatDistanceToNow, isPast } from "date-fns";
+import { Play, Shield, Clock, CheckCircle2, AlertTriangle, Key, Activity, Ban } from "lucide-react";
+import { isPast } from "date-fns";
+import { safeTimestamp, safeRelativeTime } from "../lib/format";
 import { useToast } from "@/hooks/use-toast";
 import StepUpModal from "../components/step-up-modal";
 import { Input } from "@/components/ui/input";
@@ -28,11 +30,14 @@ export default function Admin() {
   const { data: pendingApprovals, isLoading: loadingApprovals, refetch: refetchApprovals } = useListPendingBreakGlassApprovals();
   const replayIngest = useReplayIngestFixture();
   const approveGrant = useApproveBreakGlassGrant();
+  const revokeGrant = useRevokeBreakGlassGrant();
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
   const [approvingGrantId, setApprovingGrantId] = React.useState<string | null>(null);
+  const [revokingGrantId, setRevokingGrantId] = React.useState<string | null>(null);
   const [showStepUp, setShowStepUp] = React.useState(false);
+  const [stepUpReason, setStepUpReason] = React.useState("Approve break-glass grant");
 
   const handleReplay = async () => {
     try {
@@ -54,14 +59,76 @@ export default function Admin() {
 
   const handleApproveClick = (id: string) => {
     setApprovingGrantId(id);
+    setRevokingGrantId(null);
+    setStepUpReason("Approve break-glass grant");
+    setShowStepUp(true);
+  };
+
+  const handleRevokeClick = (id: string) => {
+    setRevokingGrantId(id);
+    setApprovingGrantId(null);
+    setStepUpReason("Revoke break-glass grant");
     setShowStepUp(true);
   };
 
   const handleStepUpSuccess = () => {
     setShowStepUp(false);
-    const note = prompt("Enter approval justification note (≥10 chars):");
-    if (note && approvingGrantId) {
-      submitApproval(approvingGrantId, note);
+    if (revokingGrantId) {
+      const reason = prompt("Optionally, why are you revoking this access? (leave blank to skip)");
+      submitRevoke(revokingGrantId, reason?.trim() || undefined);
+      return;
+    }
+    if (approvingGrantId) {
+      const note = prompt("Enter approval justification note (≥10 chars):");
+      if (note) {
+        submitApproval(approvingGrantId, note);
+      }
+    }
+  };
+
+  const submitRevoke = async (id: string, reason?: string) => {
+    try {
+      await revokeGrant.mutateAsync({ id, data: reason ? { reason } : {} });
+      toast({ title: "Grant revoked", description: "Raw-PHI access has been cut off." });
+      queryClient.invalidateQueries({ queryKey: getListBreakGlassGrantsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: getListPendingBreakGlassApprovalsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: getListLedgerQueryKey() });
+    } catch (e: any) {
+      if (e instanceof ApiError && e.status === 401) {
+        toast({
+          title: "Step-up required",
+          description: "Your step-up session expired. Click Revoke again.",
+          variant: "destructive",
+        });
+      } else if (e instanceof ApiError && e.status === 400) {
+        toast({
+          title: "Reason rejected",
+          description: "Your note was flagged by the content policy (possible PHI or secrets). The grant was not revoked — try again with a different note.",
+          variant: "destructive",
+        });
+      } else if (e instanceof ApiError && e.status === 409) {
+        toast({
+          title: "Already revoked",
+          description: "This grant has already been revoked.",
+          variant: "destructive",
+        });
+        queryClient.invalidateQueries({ queryKey: getListBreakGlassGrantsQueryKey() });
+      } else if (e instanceof ApiError && e.status === 410) {
+        toast({
+          title: "Grant expired",
+          description: "This grant has already expired — nothing left to cut off.",
+          variant: "destructive",
+        });
+        queryClient.invalidateQueries({ queryKey: getListBreakGlassGrantsQueryKey() });
+      } else {
+        toast({
+          title: "Revoke failed",
+          description: e?.message ?? String(e),
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setRevokingGrantId(null);
     }
   };
 
@@ -120,23 +187,29 @@ export default function Admin() {
                     <TableHead>Granted</TableHead>
                     <TableHead>Expires</TableHead>
                     <TableHead>Justification</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {activeGrants?.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={5} className="text-center text-muted-foreground py-6">
+                      <TableCell colSpan={6} className="text-center text-muted-foreground py-6">
                         No active grants.
                       </TableCell>
                     </TableRow>
                   ) : (
                     activeGrants?.map(grant => {
                       const expired = isPast(new Date(grant.expires_at));
+                      const revoked = grant.revoked_at !== null;
+                      const terminal = revoked || expired;
+                      const isRevoking = revokingGrantId === grant.id && revokeGrant.isPending;
                       return (
                         <TableRow key={grant.id} className="font-mono text-xs">
                           <TableCell>{grant.finding_id.substring(0,8)}</TableCell>
                           <TableCell>
-                            {grant.pending_approval ? (
+                            {revoked ? (
+                              <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20">Revoked</Badge>
+                            ) : grant.pending_approval ? (
                               <Badge variant="outline" className="bg-orange-500/10 text-orange-500 border-orange-500/20">Pending Approval</Badge>
                             ) : expired ? (
                               <Badge variant="outline" className="bg-muted text-muted-foreground">Expired</Badge>
@@ -146,12 +219,24 @@ export default function Admin() {
                               </Badge>
                             )}
                           </TableCell>
-                          <TableCell className="text-muted-foreground">{format(new Date(grant.granted_at), "HH:mm:ss")}</TableCell>
+                          <TableCell className="text-muted-foreground">{safeTimestamp(grant.granted_at, "HH:mm:ss")}</TableCell>
                           <TableCell className={expired ? "text-muted-foreground" : "text-foreground font-semibold"}>
-                            {expired ? "Expired" : formatDistanceToNow(new Date(grant.expires_at), { addSuffix: true })}
+                            {expired ? "Expired" : safeRelativeTime(grant.expires_at)}
                           </TableCell>
                           <TableCell className="max-w-[200px] truncate" title={grant.justification}>
                             {grant.justification}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-destructive hover:text-destructive hover:bg-destructive/10 border-destructive/20 disabled:opacity-40"
+                              disabled={terminal || isRevoking}
+                              onClick={() => handleRevokeClick(grant.id)}
+                            >
+                              <Ban className="h-3 w-3 mr-1" />
+                              {revoked ? "Revoked" : isRevoking ? "Revoking..." : "Revoke"}
+                            </Button>
                           </TableCell>
                         </TableRow>
                       );
@@ -232,7 +317,7 @@ export default function Admin() {
         open={showStepUp} 
         onOpenChange={setShowStepUp}
         onSuccess={handleStepUpSuccess}
-        reason="Approve break-glass grant"
+        reason={stepUpReason}
       />
     </Layout>
   );

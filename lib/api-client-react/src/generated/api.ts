@@ -25,6 +25,7 @@ import type {
   BreakGlassApprovalInput,
   BreakGlassGrant,
   BreakGlassGrantInput,
+  BreakGlassRevokeInput,
   ChatMessage,
   ChatMessageInput,
   ChatSession,
@@ -35,12 +36,17 @@ import type {
   HealthStatus,
   IngestReplayResult,
   LedgerCheckpointsPage,
+  LedgerEntry,
   LedgerPage,
   LedgerVerifyResult,
   ListFindingsParams,
   ListLedgerCheckpointsParams,
   ListLedgerParams,
   LoginInput,
+  ReopenFindingInput,
+  ReopenFindingResult,
+  ResolveFindingInput,
+  ResolveFindingResult,
   Session,
   StepUpInput,
   StepUpResult,
@@ -507,6 +513,93 @@ export function useGetFinding<TData = Awaited<ReturnType<typeof getFinding>>, TE
  ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
 
   const queryOptions = getGetFindingQueryOptions(id,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getGetFindingHistoryUrl = (id: string,) => {
+
+
+
+
+  return `/api/findings/${id}/history`
+}
+
+/**
+ * @summary Audit-ledger history for a single finding (most-recent-first). Returns
+every ledger entry whose subject is this finding — resolve / reopen
+transitions and break-glass grant / approve / revoke events — including
+the free-text reason where one was recorded. Tenant-scoped; redacted
+payloads only (free text was content-policy scanned at write time).
+
+ */
+export const getFindingHistory = async (id: string, options?: RequestInit): Promise<LedgerEntry[]> => {
+
+  return customFetch<LedgerEntry[]>(getGetFindingHistoryUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetFindingHistoryQueryKey = (id: string,) => {
+    return [
+    `/api/findings/${id}/history`
+    ] as const;
+    }
+
+
+export const getGetFindingHistoryQueryOptions = <TData = Awaited<ReturnType<typeof getFindingHistory>>, TError = ErrorType<ErrorResponse>>(id: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getFindingHistory>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetFindingHistoryQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getFindingHistory>>> = ({ signal }) => getFindingHistory(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: !!(id), ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getFindingHistory>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetFindingHistoryQueryResult = NonNullable<Awaited<ReturnType<typeof getFindingHistory>>>
+export type GetFindingHistoryQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Audit-ledger history for a single finding (most-recent-first). Returns
+every ledger entry whose subject is this finding — resolve / reopen
+transitions and break-glass grant / approve / revoke events — including
+the free-text reason where one was recorded. Tenant-scoped; redacted
+payloads only (free text was content-policy scanned at write time).
+
+ */
+
+export function useGetFindingHistory<TData = Awaited<ReturnType<typeof getFindingHistory>>, TError = ErrorType<ErrorResponse>>(
+ id: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getFindingHistory>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetFindingHistoryQueryOptions(id,options)
 
   const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
 
@@ -1378,6 +1471,86 @@ export const useApproveBreakGlassGrant = <TError = ErrorType<ErrorResponse>,
       return useMutation(getApproveBreakGlassGrantMutationOptions(options));
     }
 
+export const getRevokeBreakGlassGrantUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/break-glass/grants/${id}/revoke`
+}
+
+/**
+ * @summary Revoke a break-glass grant before its TTL elapses. Requires a fresh
+step-up cookie. The requester or any other analyst in the same tenant
+may revoke. Already-revoked grants return 409; expired grants return
+410.
+
+ */
+export const revokeBreakGlassGrant = async (id: string,
+    breakGlassRevokeInput?: BreakGlassRevokeInput, options?: RequestInit): Promise<BreakGlassGrant> => {
+
+  return customFetch<BreakGlassGrant>(getRevokeBreakGlassGrantUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      breakGlassRevokeInput,)
+  }
+);}
+
+
+
+
+export const getRevokeBreakGlassGrantMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeBreakGlassGrant>>, TError,{id: string;data?: BodyType<BreakGlassRevokeInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof revokeBreakGlassGrant>>, TError,{id: string;data?: BodyType<BreakGlassRevokeInput>}, TContext> => {
+
+const mutationKey = ['revokeBreakGlassGrant'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof revokeBreakGlassGrant>>, {id: string;data?: BodyType<BreakGlassRevokeInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  revokeBreakGlassGrant(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RevokeBreakGlassGrantMutationResult = NonNullable<Awaited<ReturnType<typeof revokeBreakGlassGrant>>>
+    export type RevokeBreakGlassGrantMutationBody = BodyType<BreakGlassRevokeInput> | undefined
+    export type RevokeBreakGlassGrantMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Revoke a break-glass grant before its TTL elapses. Requires a fresh
+step-up cookie. The requester or any other analyst in the same tenant
+may revoke. Already-revoked grants return 409; expired grants return
+410.
+
+ */
+export const useRevokeBreakGlassGrant = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeBreakGlassGrant>>, TError,{id: string;data?: BodyType<BreakGlassRevokeInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof revokeBreakGlassGrant>>,
+        TError,
+        {id: string;data?: BodyType<BreakGlassRevokeInput>},
+        TContext
+      > => {
+      return useMutation(getRevokeBreakGlassGrantMutationOptions(options));
+    }
+
 export const getListPendingBreakGlassApprovalsUrl = () => {
 
 
@@ -1541,6 +1714,170 @@ export function useGetFindingRaw<TData = Awaited<ReturnType<typeof getFindingRaw
 
 
 
+
+export const getResolveFindingUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/findings/${id}/resolve`
+}
+
+/**
+ * @summary Close out a finding by marking it resolved or false positive. Any
+active break-glass grants for the finding are auto-revoked so raw-PHI
+access ends with the incident. Idempotent: re-resolving a finding
+already in the target state is a no-op. Requires session only.
+
+ */
+export const resolveFinding = async (id: string,
+    resolveFindingInput: ResolveFindingInput, options?: RequestInit): Promise<ResolveFindingResult> => {
+
+  return customFetch<ResolveFindingResult>(getResolveFindingUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      resolveFindingInput,)
+  }
+);}
+
+
+
+
+export const getResolveFindingMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resolveFinding>>, TError,{id: string;data: BodyType<ResolveFindingInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof resolveFinding>>, TError,{id: string;data: BodyType<ResolveFindingInput>}, TContext> => {
+
+const mutationKey = ['resolveFinding'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof resolveFinding>>, {id: string;data: BodyType<ResolveFindingInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  resolveFinding(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ResolveFindingMutationResult = NonNullable<Awaited<ReturnType<typeof resolveFinding>>>
+    export type ResolveFindingMutationBody = BodyType<ResolveFindingInput>
+    export type ResolveFindingMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Close out a finding by marking it resolved or false positive. Any
+active break-glass grants for the finding are auto-revoked so raw-PHI
+access ends with the incident. Idempotent: re-resolving a finding
+already in the target state is a no-op. Requires session only.
+
+ */
+export const useResolveFinding = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resolveFinding>>, TError,{id: string;data: BodyType<ResolveFindingInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof resolveFinding>>,
+        TError,
+        {id: string;data: BodyType<ResolveFindingInput>},
+        TContext
+      > => {
+      return useMutation(getResolveFindingMutationOptions(options));
+    }
+
+export const getReopenFindingUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/findings/${id}/reopen`
+}
+
+/**
+ * @summary Reopen a finding that was closed in error, transitioning it from a
+resolved / false_positive state back to "open". Unlike resolve, this
+does NOT auto-revoke break-glass grants. Idempotent: reopening a
+finding already open is a no-op. Accepts an optional free-text reason
+(scanned by the content policy) recorded in the audit ledger. Requires
+session only.
+
+ */
+export const reopenFinding = async (id: string,
+    reopenFindingInput?: ReopenFindingInput, options?: RequestInit): Promise<ReopenFindingResult> => {
+
+  return customFetch<ReopenFindingResult>(getReopenFindingUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      reopenFindingInput,)
+  }
+);}
+
+
+
+
+export const getReopenFindingMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof reopenFinding>>, TError,{id: string;data?: BodyType<ReopenFindingInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof reopenFinding>>, TError,{id: string;data?: BodyType<ReopenFindingInput>}, TContext> => {
+
+const mutationKey = ['reopenFinding'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof reopenFinding>>, {id: string;data?: BodyType<ReopenFindingInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  reopenFinding(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ReopenFindingMutationResult = NonNullable<Awaited<ReturnType<typeof reopenFinding>>>
+    export type ReopenFindingMutationBody = BodyType<ReopenFindingInput> | undefined
+    export type ReopenFindingMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Reopen a finding that was closed in error, transitioning it from a
+resolved / false_positive state back to "open". Unlike resolve, this
+does NOT auto-revoke break-glass grants. Idempotent: reopening a
+finding already open is a no-op. Accepts an optional free-text reason
+(scanned by the content policy) recorded in the audit ledger. Requires
+session only.
+
+ */
+export const useReopenFinding = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof reopenFinding>>, TError,{id: string;data?: BodyType<ReopenFindingInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof reopenFinding>>,
+        TError,
+        {id: string;data?: BodyType<ReopenFindingInput>},
+        TContext
+      > => {
+      return useMutation(getReopenFindingMutationOptions(options));
+    }
 
 export const getReplayIngestFixtureUrl = () => {
 

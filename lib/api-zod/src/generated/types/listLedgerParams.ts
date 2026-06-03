@@ -18,4 +18,10 @@ after_seq?: number;
  * @maximum 500
  */
 limit?: number;
+/**
+ * Filter to a single human actor's entries (the actor's id). Used by the "show me everything this analyst did" pivot so a reviewer sees the actor's complete trail, server-filtered and paginated, instead of only entries that happen to be in the most-recent window.
+
+ * @minLength 1
+ */
+actor?: string;
 };

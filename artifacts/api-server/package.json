@@ -13,6 +13,9 @@
     "eval:update": "rm -rf evals/results && vitest run --config vitest.eval.config.ts && node evals/gate.mjs --update"
   },
   "dependencies": {
+    "@a2a-js/sdk": "^0.3.13",
+    "@ag-ui/core": "^0.0.54",
+    "@ag-ui/encoder": "^0.0.54",
     "@google/genai": "^1.52.0",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",

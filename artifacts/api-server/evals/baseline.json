@@ -1,6 +1,6 @@
 {
   "citation-correctness": 1,
-  "detector-phi": 0.9908,
+  "detector-phi": 1,
   "detector-secrets": 1,
   "injection-resistance": 1,
   "redaction-completeness": 1,

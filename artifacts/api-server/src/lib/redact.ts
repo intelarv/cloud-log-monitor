@@ -53,6 +53,59 @@ function luhnValid(raw: string): boolean {
   return sum % 10 === 0;
 }
 
+// DEA registration number checksum. A DEA number is two letters followed by
+// seven digits; the 7th digit is a check digit: ((d1+d3+d5) + 2*(d2+d4+d6))
+// mod 10 must equal d7. The checksum (not just the shape) is what keeps this
+// detector off arbitrary "2 letters + 7 digits" tokens, mirroring how the
+// card detector leans on Luhn rather than length alone.
+function deaValid(match: string): boolean {
+  const digits = match.slice(-7);
+  if (!/^\d{7}$/.test(digits)) return false;
+  const d = digits.split("").map((c) => c.charCodeAt(0) - 48);
+  const check = d[0]! + d[2]! + d[4]! + 2 * (d[1]! + d[3]! + d[5]!);
+  return check % 10 === d[6]!;
+}
+
+// Shannon entropy in bits/char. Used by the generic high-entropy secret
+// detector to tell a real credential ("9f8e7d6c…") from an ordinary slug
+// ("service-mesh-cluster") assigned to the same key.
+function shannonEntropy(s: string): number {
+  if (s.length === 0) return 0;
+  const freq: Record<string, number> = {};
+  for (const ch of s) freq[ch] = (freq[ch] ?? 0) + 1;
+  let h = 0;
+  for (const k of Object.keys(freq)) {
+    const p = freq[k]! / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+// Generic high-entropy secret (M13.5, last-resort). Fires on a value assigned
+// to a secret-shaped key (api_key / secret / token / client_secret / ...) ONLY
+// when the value is long AND high-entropy — so `token=ok`, `account=disabled`,
+// and ordinary slugs do not match, while opaque base64/hex credentials without
+// a recognizable provider prefix still get caught. The two conditions
+// (key context + entropy) together are what hold precision.
+const HIGH_ENTROPY_KEY_RE =
+  /\b(?:api[_-]?key|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|token|apikey)\b["']?\s*[:=]\s*["']?([A-Za-z0-9_./+-]{20,})/gi;
+function scanHighEntropySecret(
+  text: string,
+): { start: number; end: number; match: string }[] {
+  const spans: { start: number; end: number; match: string }[] = [];
+  HIGH_ENTROPY_KEY_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = HIGH_ENTROPY_KEY_RE.exec(text)) !== null) {
+    const value = m[1]!;
+    if (shannonEntropy(value) >= 3.5) {
+      const start = m.index + m[0].length - value.length;
+      spans.push({ start, end: start + value.length, match: value });
+    }
+    if (m.index === HIGH_ENTROPY_KEY_RE.lastIndex) HIGH_ENTROPY_KEY_RE.lastIndex++;
+  }
+  return spans;
+}
+
 // Lightweight name dictionaries (lowercased). A curated list of common
 // given names and surnames provides an NER-style signal so names that the
 // capitalized "First [M] Last" heuristic misses — lowercase names, or a
@@ -436,6 +489,128 @@ const DETECTORS: Detector[] = [
     classification: "secrets",
     name: "db_url_password",
     regex: /(?<=:\/\/[^/\s:@]+:)[^/\s:@]+(?=@)/g,
+  },
+
+  // --- M13.1: date of birth (non-slash). The `date` detector above is
+  // slash-only by design so it never fires on the ISO timestamps that saturate
+  // ops logs. Birth dates appear as ISO (`1981-03-14`), dash-MDY, or textual
+  // ("March 14, 1981") forms; this detector catches those ONLY when anchored to
+  // a birth-context keyword, so `ts=2025-02-01` / `timestamp:` stay unmatched.
+  {
+    classification: "phi",
+    name: "dob_date",
+    regex:
+      /(?<=\b(?:dob|d\.o\.b\.?|date of birth|birth\s*date|birthday|born)["']?\s*[:=]?\s*["']?)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?,?\s+\d{4})/gi,
+  },
+
+  // --- M13.2: remaining HIPAA Safe Harbor identifiers.
+  // IPv6 (the ip_address detector above is IPv4-only). Matches the full
+  // 8-group form and the `::`-compressed forms; the per-alternative group
+  // counts keep it off ordinary `host:port` / `file.js:line:col` colon noise.
+  {
+    classification: "pii",
+    // Boundaries are negative lookarounds (no adjacent hex/colon), NOT `\b`:
+    // ordered alternation with `\b` lets the `::`-trailing alt win early (e.g.
+    // matching only `fe80::`). Forbidding a hex/colon char on either side forces
+    // the engine to backtrack to the alternative that consumes the full address.
+    name: "ipv6",
+    regex:
+      /(?<![0-9A-Fa-f:])(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?::[0-9A-Fa-f]{1,4}){1,6})(?![0-9A-Fa-f:])/g,
+  },
+  // License plate — open-format, so context-anchored on `plate`/`license plate`
+  // and required to carry at least one digit to stay off plain words.
+  {
+    classification: "phi",
+    name: "license_plate",
+    regex:
+      /(?<=\b(?:license[\s_]?plate|plate)["']?\s*(?:number|no\.?|#)?["']?\s*[:=#]?\s*["']?)(?=[A-Z0-9-]*\d)[A-Z0-9](?:[A-Z0-9-]{3,7})\b/gi,
+  },
+  // Passport number — context-anchored on `passport`; 6–9 alphanumerics with at
+  // least one digit.
+  {
+    classification: "phi",
+    name: "passport",
+    regex:
+      /(?<=\bpassport["']?\s*(?:number|no\.?|#|id)?["']?\s*[:=#]?\s*["']?)(?=[A-Z0-9]*\d)[A-Z0-9]{6,9}\b/gi,
+  },
+  // DEA registration number — two letters + seven digits with a checksum (see
+  // deaValid). NPI is recalled incidentally by the 10-digit phone detector;
+  // DEA was not covered at all. Context-anchored on a `dea` keyword AND
+  // checksum-gated: the bare two-letter+7-digit shape collides with ordinary
+  // enterprise IDs (order/employee numbers) and ~10% of those pass the checksum
+  // by chance, so anchoring is required to hold zero benign false positives.
+  {
+    classification: "phi",
+    name: "dea",
+    regex:
+      /(?<=\bdea(?:[\s_]?(?:registration|number|reg|no\.?|#|id))?["']?\s*[:=#]?\s*["']?)[A-Za-z][A-Za-z9]\d{7}\b/gi,
+    validate: deaValid,
+  },
+
+  // --- M13.4: additional secret classes (prefix- or context-anchored).
+  // AWS secret access key — the 40-char secret (only the access-key ID was
+  // covered before). Context-anchored: a bare 40-char base64 blob is too common
+  // to flag on shape alone.
+  {
+    classification: "secrets",
+    name: "aws_secret_key",
+    regex:
+      /(?<=\b(?:aws_secret_access_key|secret_access_key|aws[._]?secret[._]?(?:access[._]?)?key)["']?\s*[:=]\s*["']?)[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/gi,
+  },
+  // Stripe live/test keys (secret, restricted, publishable).
+  {
+    classification: "secrets",
+    name: "stripe_key",
+    regex: /\b[srp]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
+  },
+  // Twilio Account SID / API key SID — fixed "AC"/"SK" prefix + 32 hex.
+  {
+    classification: "secrets",
+    name: "twilio_sid",
+    regex: /\b(?:AC|SK)[0-9a-fA-F]{32}\b/g,
+  },
+  // SendGrid API key — `SG.<22+>.<22+>`.
+  {
+    classification: "secrets",
+    name: "sendgrid_key",
+    regex: /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g,
+  },
+  // OpenAI / Anthropic API keys. The structured `sk-proj-…` / `sk-ant-…`
+  // prefixes are distinctive enough to match on shape; a *bare* `sk-…` is only
+  // flagged when it is a long all-alphanumeric blob (≥40, OpenAI legacy length)
+  // so kebab-case service labels like `sk-prod-us-east-webhook` don't trip it.
+  {
+    classification: "secrets",
+    name: "llm_api_key",
+    regex: /\b(?:sk-(?:proj|ant)[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,})\b/g,
+  },
+  // npm automation/access token — `npm_` + 36 chars.
+  {
+    classification: "secrets",
+    name: "npm_token",
+    regex: /\bnpm_[A-Za-z0-9]{36}\b/g,
+  },
+  // HashiCorp Vault service token — `hvs.<opaque>`.
+  {
+    classification: "secrets",
+    name: "vault_token",
+    regex: /\bhvs\.[A-Za-z0-9_-]{20,}\b/g,
+  },
+  // Azure storage account key — context-anchored `AccountKey=<86 base64>==`.
+  // (GCP service-account JSON private keys are already covered by the
+  // private_key_pem detector, which matches the PEM the key field contains.)
+  {
+    classification: "secrets",
+    name: "azure_storage_key",
+    regex: /(?<=AccountKey=)[A-Za-z0-9/+]{86}==/g,
+  },
+
+  // --- M13.5: generic high-entropy secret (last-resort). Custom scanner so it
+  // can apply the entropy threshold on top of the key-context match.
+  {
+    classification: "secrets",
+    name: "high_entropy_secret",
+    scan: scanHighEntropySecret,
   },
 ];
 

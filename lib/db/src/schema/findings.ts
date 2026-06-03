@@ -41,6 +41,16 @@ export const findingsTable = pgTable(
     // tier, and the dashboard's normal queries MUST NOT select it (only the
     // step-up-gated /admin/findings/:id/raw endpoint reads it).
     rawEvidence: jsonb("raw_evidence"),
+    // M10.2/M10.3: pointer to raw evidence held in an EXTERNAL WORM object
+    // store (S3 Object Lock / GCS retention / Azure Blob immutability) instead
+    // of the `raw_evidence` column. Holds `{first, latest}` object URIs (see
+    // RawEvidenceRef in api-server's raw-evidence-store.ts). NULL when the
+    // database store is active (raw stays inline in `raw_evidence`) — exactly
+    // one of the two columns carries raw for a given finding. Like
+    // `raw_evidence`, this is deliberately EXCLUDED from `findingSafeColumns`:
+    // it is only ever read on the step-up-gated /admin/findings/:id/raw path,
+    // which resolves it back to the payload through the configured store.
+    rawEvidenceRef: jsonb("raw_evidence_ref"),
     detectorVersion: text("detector_version").notNull(),
     firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
       .notNull()
@@ -106,6 +116,10 @@ export const findingSafeColumns = {
   lastAgentReviewAt: findingsTable.lastAgentReviewAt,
 } as const;
 
-// Matches `Finding` minus `rawEvidence`. Drizzle infers this from the
-// projection at query sites, but we name the type for explicit annotations.
-export type FindingSafe = Omit<Finding, "rawEvidence">;
+// Matches `Finding` minus the raw-evidence columns. Drizzle infers this from
+// the projection at query sites, but we name the type for explicit
+// annotations. BOTH `rawEvidence` (inline DB store) and `rawEvidenceRef`
+// (external WORM store pointer) are omitted — neither may enter a safe
+// projection, an LLM prompt, or an SSE frame; both are reachable only via the
+// step-up-gated /admin/findings/:id/raw endpoint.
+export type FindingSafe = Omit<Finding, "rawEvidence" | "rawEvidenceRef">;

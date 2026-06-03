@@ -1,17 +1,126 @@
 import React from "react";
+import { useSearch, Link } from "wouter";
 import Layout from "../components/layout";
 import { useListLedger, useVerifyLedger, useListLedgerCheckpoints, getListLedgerCheckpointsQueryKey, getVerifyLedgerQueryKey } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { ShieldCheck, ShieldAlert, Key, Link as LinkIcon, ChevronDown, ChevronRight, Activity } from "lucide-react";
-import { format } from "date-fns";
+import { ShieldCheck, ShieldAlert, Key, Link as LinkIcon, ChevronDown, ChevronRight, Activity, ExternalLink, CheckCircle2 } from "lucide-react";
+import { safeTimestamp } from "../lib/format";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function Ledger() {
-  const { data: ledgerPage, isLoading } = useListLedger({ limit: 50 });
+  // Deep-link support: a `?seq=<n>` query param (e.g. from a finding's history
+  // timeline) focuses the list on a specific ledger entry. We widen the fetch
+  // window so the target row is loaded even if it falls outside the default
+  // page, then auto-expand and scroll to it below.
+  const search = useSearch();
+  const targetSeq = React.useMemo(() => {
+    const raw = new URLSearchParams(search).get("seq");
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }, [search]);
+
+  // `?actor=<id>` pivots the ledger to one human actor's activity (e.g. from
+  // clicking an actor in a row — "show me everything this analyst did"). The
+  // server filters by actor id so the trail is complete (paginated over the
+  // actor's full history), not just whatever falls in the most-recent window.
+  const actorFilter = React.useMemo(
+    () => new URLSearchParams(search).get("actor") || null,
+    [search],
+  );
+
+  // Page size per fetch. We paginate forward over the actor's (or the whole
+  // tenant's) trail using the server's `after_seq` cursor, accumulating pages
+  // client-side so "load more" reveals the complete history instead of a single
+  // capped window.
+  const PAGE_SIZE = 100;
+
+  // The first cursor for a given view. For a deep-link target we widen the
+  // initial window so the focused row loads even if it's outside the default
+  // first page; otherwise we start from the beginning of the (tenant/actor)
+  // chain. Forward pagination then continues from the last loaded seq.
+  const baseCursor = React.useMemo(() => {
+    if (actorFilter) return 0;
+    if (targetSeq != null) return Math.max(0, targetSeq - 26);
+    return 0;
+  }, [actorFilter, targetSeq]);
+
+  // A stable identity for the current "view" (actor pivot / deep-link target /
+  // default). When it changes we reset the accumulated pages and cursor.
+  const viewKey = `${actorFilter ?? ""}|${targetSeq ?? ""}`;
+
+  const [cursor, setCursor] = React.useState(baseCursor);
+  const [accumulated, setAccumulated] = React.useState<any[]>([]);
+  const [reachedEnd, setReachedEnd] = React.useState(false);
+
+  React.useEffect(() => {
+    setCursor(baseCursor);
+    setAccumulated([]);
+    setReachedEnd(false);
+  }, [viewKey, baseCursor]);
+
+  const listParams = React.useMemo(() => {
+    const p: { limit: number; after_seq: number; actor?: string } = {
+      limit: PAGE_SIZE,
+      after_seq: cursor,
+    };
+    if (actorFilter) p.actor = actorFilter;
+    return p;
+  }, [cursor, actorFilter]);
+
+  const { data: ledgerPage, isFetching } = useListLedger(listParams);
+
+  // Append each freshly-fetched page into the accumulated list (dedup by seq,
+  // kept ascending). A short page (< PAGE_SIZE) means we've reached the end of
+  // this view's history.
+  React.useEffect(() => {
+    if (!ledgerPage) return;
+    setAccumulated((prev) => {
+      const seen = new Set(prev.map((e) => e.seq));
+      const merged = [...prev];
+      for (const e of ledgerPage.entries) {
+        if (!seen.has(e.seq)) merged.push(e);
+      }
+      merged.sort((a, b) => a.seq - b.seq);
+      return merged;
+    });
+    setReachedEnd(ledgerPage.entries.length < PAGE_SIZE);
+  }, [ledgerPage]);
+
+  const visibleEntries = accumulated;
+
+  // Skeletons only on the very first load of a view; subsequent "load more"
+  // fetches keep the already-loaded rows visible with an inline spinner.
+  const showInitialSkeleton = isFetching && accumulated.length === 0;
+
+  const handleLoadMore = React.useCallback(() => {
+    const last = accumulated[accumulated.length - 1];
+    if (last) setCursor(last.seq);
+  }, [accumulated]);
+
+  // If a deep-link target was requested but it isn't present in the loaded
+  // window (too old to be in range, or doesn't exist for this tenant), surface
+  // a notice instead of silently showing the list with nothing highlighted.
+  // The initial cursor centers the first page on the target, so once that page
+  // has loaded the target is present iff it exists for this tenant; forward
+  // "load more" only adds higher seqs and never changes this answer.
+  const targetMissing = React.useMemo(() => {
+    if (targetSeq == null || isFetching || accumulated.length === 0) return false;
+    return !accumulated.some((e) => e.seq === targetSeq);
+  }, [targetSeq, isFetching, accumulated]);
+
+  const actorFilterLabel = React.useMemo<string | null>(() => {
+    if (!actorFilter) return null;
+    const match = accumulated.find(
+      (e) => e.actor?.kind === "human" && e.actor?.id === actorFilter,
+    );
+    const dn = (match?.actor as { display_name?: string } | undefined)?.display_name;
+    return dn || actorFilter;
+  }, [actorFilter, accumulated]);
   
   const verifyChain = useVerifyLedger({ query: { enabled: false, queryKey: getVerifyLedgerQueryKey() } });
   const { data: checkpointsPage, refetch: refetchCheckpoints, isFetching: isVerifyingCheckpoints } = useListLedgerCheckpoints(
@@ -108,6 +217,37 @@ export default function Ledger() {
           </Card>
         </div>
 
+        {actorFilter && (
+          <div className="flex items-center justify-between gap-2 p-3 rounded-md border bg-primary/5 border-primary/20 text-sm">
+            <span className="flex items-center gap-2">
+              <Activity className="h-4 w-4 shrink-0 text-primary" />
+              Showing activity for actor{" "}
+              <span className="font-mono font-semibold">{actorFilterLabel}</span>
+            </span>
+            <Link href="/ledger" className="text-primary hover:underline shrink-0">
+              Clear filter
+            </Link>
+          </div>
+        )}
+
+        {actorFilter && !isFetching && visibleEntries.length === 0 && (
+          <div className="flex items-center gap-2 p-3 rounded-md border bg-yellow-500/10 border-yellow-500/20 text-yellow-700 dark:text-yellow-400 text-sm">
+            <ShieldAlert className="h-4 w-4 shrink-0" />
+            <span>
+              No activity recorded for this actor in your tenant.
+            </span>
+          </div>
+        )}
+
+        {targetMissing && (
+          <div className="flex items-center gap-2 p-3 rounded-md border bg-yellow-500/10 border-yellow-500/20 text-yellow-700 dark:text-yellow-400 text-sm">
+            <ShieldAlert className="h-4 w-4 shrink-0" />
+            <span>
+              Entry #{targetSeq} is not in the current view. It may be outside the loaded range or unavailable for your tenant.
+            </span>
+          </div>
+        )}
+
         <Card>
           <CardHeader>
             <CardTitle>Ledger Entries</CardTitle>
@@ -125,7 +265,7 @@ export default function Ledger() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {isLoading ? (
+                {showInitialSkeleton ? (
                   Array.from({ length: 5 }).map((_, i) => (
                     <TableRow key={i}>
                       <TableCell><Skeleton className="h-4 w-10" /></TableCell>
@@ -137,12 +277,48 @@ export default function Ledger() {
                     </TableRow>
                   ))
                 ) : (
-                  ledgerPage?.entries.map((entry) => (
-                    <LedgerRow key={entry.seq} entry={entry} colorClass={getEventColor(entry.event_type)} />
+                  visibleEntries.map((entry) => (
+                    <LedgerRow
+                      key={entry.seq}
+                      entry={entry}
+                      colorClass={getEventColor(entry.event_type)}
+                      isTarget={targetSeq != null && entry.seq === targetSeq}
+                      activeActorFilter={actorFilter}
+                    />
                   ))
                 )}
               </TableBody>
             </Table>
+            {!showInitialSkeleton && visibleEntries.length > 0 && (
+              <div className="flex flex-col items-center justify-center gap-2 border-t p-4">
+                {!reachedEnd ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleLoadMore}
+                    disabled={isFetching}
+                  >
+                    {isFetching ? (
+                      <>
+                        <ChevronDown className="h-4 w-4 mr-2 animate-pulse" />
+                        Loading…
+                      </>
+                    ) : (
+                      <>
+                        <ChevronDown className="h-4 w-4 mr-2" />
+                        Load newer entries
+                      </>
+                    )}
+                  </Button>
+                ) : (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <CheckCircle2 className="h-4 w-4" />
+                    End of history — {visibleEntries.length}{" "}
+                    {visibleEntries.length === 1 ? "entry" : "entries"} loaded.
+                  </div>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -150,22 +326,82 @@ export default function Ledger() {
   );
 }
 
-function LedgerRow({ entry, colorClass }: { entry: any, colorClass: string }) {
-  const [isOpen, setIsOpen] = React.useState(false);
-  
+function LedgerRow({ entry, colorClass, isTarget = false, activeActorFilter = null }: { entry: any, colorClass: string, isTarget?: boolean, activeActorFilter?: string | null }) {
+  const [isOpen, setIsOpen] = React.useState(isTarget);
+  const rowRef = React.useRef<HTMLTableRowElement>(null);
+  const isFindingSubject = entry.subject_type === "finding" && !!entry.subject_id;
+  const isChatSessionSubject = entry.subject_type === "chat_session" && !!entry.subject_id;
+
+  // Only human actors map to a "user activity" view; agent/system actors have
+  // no per-user pivot, so they stay plain text. Don't self-link the actor we're
+  // already filtering by.
+  const isUserActor = entry.actor?.kind === "human" && !!entry.actor?.id;
+  const actorLabel = entry.actor?.display_name || entry.actor?.id || entry.actor?.kind || JSON.stringify(entry.actor);
+  const actorLinkable = isUserActor && entry.actor.id !== activeActorFilter;
+
+  // When deep-linked to this entry, expand it and bring it into view.
+  React.useEffect(() => {
+    if (isTarget) {
+      setIsOpen(true);
+      rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [isTarget]);
+
   return (
     <>
-      <TableRow className="font-mono text-xs cursor-pointer hover:bg-muted/50" onClick={() => setIsOpen(!isOpen)}>
+      <TableRow
+        ref={rowRef}
+        className={`font-mono text-xs cursor-pointer hover:bg-muted/50 ${isTarget ? "bg-primary/5 outline outline-2 outline-primary/40" : ""}`}
+        onClick={() => setIsOpen(!isOpen)}
+      >
         <TableCell>{entry.seq}</TableCell>
-        <TableCell className="text-muted-foreground">{format(new Date(entry.ts), "yyyy-MM-dd HH:mm:ss")}</TableCell>
+        <TableCell className="text-muted-foreground">{safeTimestamp(entry.ts)}</TableCell>
         <TableCell>
           <Badge variant="outline" className={colorClass}>{entry.event_type}</Badge>
         </TableCell>
         <TableCell className="max-w-[150px] truncate">
-          {entry.actor.sub || entry.actor.role || JSON.stringify(entry.actor)}
+          {actorLinkable ? (
+            <Link
+              href={`/ledger?actor=${encodeURIComponent(entry.actor.id)}`}
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 hover:text-foreground hover:underline"
+              title="Show this user's activity"
+            >
+              {actorLabel}
+              <Activity className="h-3 w-3" />
+            </Link>
+          ) : (
+            actorLabel
+          )}
         </TableCell>
         <TableCell className="max-w-[200px] truncate text-muted-foreground">
-          {entry.subject_type ? `${entry.subject_type}:${entry.subject_id?.substring(0,8)}` : "—"}
+          {entry.subject_type ? (
+            isFindingSubject ? (
+              <Link
+                href={`/findings/${entry.subject_id}`}
+                onClick={(e) => e.stopPropagation()}
+                className="inline-flex items-center gap-1 hover:text-foreground hover:underline"
+                title="Open this finding's detail page"
+              >
+                {`${entry.subject_type}:${entry.subject_id?.substring(0, 8)}`}
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            ) : isChatSessionSubject ? (
+              <Link
+                href={`/chat?session=${encodeURIComponent(entry.subject_id)}`}
+                onClick={(e) => e.stopPropagation()}
+                className="inline-flex items-center gap-1 hover:text-foreground hover:underline"
+                title="Open this chat session"
+              >
+                {`${entry.subject_type}:${entry.subject_id?.substring(0, 8)}`}
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            ) : (
+              `${entry.subject_type}:${entry.subject_id?.substring(0, 8)}`
+            )
+          ) : (
+            "—"
+          )}
         </TableCell>
         <TableCell className="flex items-center gap-2 text-muted-foreground">
           {entry.hash.substring(0, 16)}...
@@ -196,6 +432,45 @@ function LedgerRow({ entry, colorClass }: { entry: any, colorClass: string }) {
                     <div className="flex gap-2"><span className="text-foreground w-12">Hash:</span> {entry.hash}</div>
                   </div>
                 </div>
+                {isUserActor && (
+                  <div>
+                    <div className="text-muted-foreground mb-1 font-sans font-semibold">Actor activity</div>
+                    <Link
+                      href={`/ledger?actor=${encodeURIComponent(entry.actor.id)}`}
+                      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                      title="Show this user's activity"
+                    >
+                      <span className="font-mono">View activity for {actorLabel}</span>
+                      <Activity className="h-3 w-3" />
+                    </Link>
+                  </div>
+                )}
+                {isFindingSubject && (
+                  <div>
+                    <div className="text-muted-foreground mb-1 font-sans font-semibold">Subject</div>
+                    <Link
+                      href={`/findings/${entry.subject_id}`}
+                      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                      title="Open this finding's detail page"
+                    >
+                      <span className="font-mono">View finding {entry.subject_id}</span>
+                      <ExternalLink className="h-3 w-3" />
+                    </Link>
+                  </div>
+                )}
+                {isChatSessionSubject && (
+                  <div>
+                    <div className="text-muted-foreground mb-1 font-sans font-semibold">Subject</div>
+                    <Link
+                      href={`/chat?session=${encodeURIComponent(entry.subject_id)}`}
+                      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                      title="Open this chat session"
+                    >
+                      <span className="font-mono">Open chat session {entry.subject_id}</span>
+                      <ExternalLink className="h-3 w-3" />
+                    </Link>
+                  </div>
+                )}
               </div>
             </div>
           </TableCell>

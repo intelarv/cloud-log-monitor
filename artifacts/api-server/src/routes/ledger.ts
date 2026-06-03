@@ -1,5 +1,5 @@
 import { Router, type IRouter } from "express";
-import { asc, desc, gt } from "drizzle-orm";
+import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
 import {
   db,
   ledgerEntriesTable,
@@ -21,15 +21,44 @@ router.get("/ledger", requireSession, async (req, res): Promise<void> => {
   const limit = req.query.limit
     ? Math.min(Math.max(Number(req.query.limit), 1), 500)
     : 100;
+  // M12.4 (cross-tenant escalation guard): the in-app ledger *view* is scoped
+  // to the caller's tenant. `ledger_entries` is a single global hash chain with
+  // NO RLS policy (the chain verifier + notarizer must walk every tenant's
+  // entries to prove integrity — that path stays global by design), so we
+  // enforce isolation here with an explicit `tenant_id` predicate. Entry
+  // payloads carry tenant-private free text (break-glass justification /
+  // approval_note / revoke reason), so an unscoped list would leak another
+  // tenant's operational audit trail. `head` is likewise the caller-tenant
+  // head, so the response never exposes the global cross-tenant event count.
+  const tenantId = req.session!.tenant_id;
+  // `actor` pivots the list to a single human actor's full trail ("show me
+  // everything this analyst did"). Filtering server-side — instead of in the
+  // client over a recent window — is what makes the trail complete for a busy
+  // or long-lived actor. The `actor` jsonb column carries `{kind,id,...}`; we
+  // match human actors by id so agent/system rows never collide with a human id.
+  const actor =
+    typeof req.query.actor === "string" && req.query.actor.length > 0
+      ? req.query.actor
+      : null;
+  const actorPredicate = actor
+    ? sql`${ledgerEntriesTable.actor}->>'kind' = 'human' and ${ledgerEntriesTable.actor}->>'id' = ${actor}`
+    : undefined;
   const rows = await db
     .select()
     .from(ledgerEntriesTable)
-    .where(gt(ledgerEntriesTable.seq, Number.isFinite(afterSeq) ? afterSeq : 0))
+    .where(
+      and(
+        eq(ledgerEntriesTable.tenantId, tenantId),
+        gt(ledgerEntriesTable.seq, Number.isFinite(afterSeq) ? afterSeq : 0),
+        actorPredicate,
+      ),
+    )
     .orderBy(asc(ledgerEntriesTable.seq))
     .limit(limit);
   const [head] = await db
     .select()
     .from(ledgerEntriesTable)
+    .where(eq(ledgerEntriesTable.tenantId, tenantId))
     .orderBy(desc(ledgerEntriesTable.seq))
     .limit(1);
   res.json(

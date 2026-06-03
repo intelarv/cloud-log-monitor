@@ -20,6 +20,14 @@ author = "agent"
 task = "workflow.run"
 args = "eval-gate"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "dashboard-typecheck"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "dashboard-test"
+
 [[workflows.workflow]]
 name = "eval-gate"
 author = "agent"
@@ -27,6 +35,28 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "pnpm run eval:gate"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "dashboard-typecheck"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/dashboard run typecheck"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "dashboard-test"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/dashboard run test"
 
 [workflows.workflow.metadata]
 isValidation = true

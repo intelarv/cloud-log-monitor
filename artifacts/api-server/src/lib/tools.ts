@@ -10,6 +10,20 @@ import {
   type ToolName,
 } from "./policy";
 import { hybridSearchFindings, type RetrieverSource } from "./search";
+import { withTimeout, TimeoutError } from "./with-timeout";
+
+// Default hard timeout for a single tool handler. Threat model §DoS:
+// "Every tool handler MUST have a hard timeout." A well-behaved retrieval
+// tool answers in well under a second; 10s is generous head-room that still
+// turns a wedged handler into a deterministic refusal.
+const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+
+function envInt(name: string, def: number): number {
+  const v = process.env[name];
+  if (v === undefined) return def;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : def;
+}
 
 // MCP-shaped tool definition. A real MCP server would advertise these via
 // `list_tools` and execute them via `call_tool`. For M0 the registry is
@@ -84,7 +98,8 @@ export type ToolCallError =
   | "unknown_tool"
   | "bad_args"
   | "policy_violation"
-  | "exec_error";
+  | "exec_error"
+  | "timeout";
 
 export type ToolCallResult =
   | { ok: true; result: unknown; tool: { name: string; version: string } }
@@ -98,6 +113,11 @@ export type ToolCallResult =
 
 export class ToolRegistry {
   private readonly tools = new Map<string, McpToolDef<unknown, unknown>>();
+  private readonly handlerTimeoutMs: number;
+
+  constructor(opts: { handlerTimeoutMs?: number } = {}) {
+    this.handlerTimeoutMs = opts.handlerTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+  }
 
   register<A, R>(def: McpToolDef<A, R>): void {
     this.tools.set(def.name, def as McpToolDef<unknown, unknown>);
@@ -170,13 +190,26 @@ export class ToolRegistry {
       };
     }
     try {
-      const result = await def.handler(parsed.data, ctx);
+      // Hard per-handler timeout (threat model §DoS). `Promise.resolve` guards
+      // a handler that throws synchronously instead of returning a promise.
+      const result = await withTimeout(
+        Promise.resolve(def.handler(parsed.data, ctx)),
+        this.handlerTimeoutMs,
+        `tool:${def.name}`,
+      );
       return {
         ok: true,
         result,
         tool: { name: def.name, version: def.version },
       };
     } catch (err) {
+      if (err instanceof TimeoutError) {
+        return {
+          ok: false,
+          error: `tool ${def.name} timed out after ${err.timeoutMs}ms`,
+          code: "timeout",
+        };
+      }
       return {
         ok: false,
         error: err instanceof Error ? err.message : String(err),
@@ -247,6 +280,8 @@ export const searchFindingsTool: McpToolDef<
   },
 };
 
-export const toolRegistry: ToolRegistry = new ToolRegistry();
+export const toolRegistry: ToolRegistry = new ToolRegistry({
+  handlerTimeoutMs: envInt("TOOL_CALL_TIMEOUT_MS", DEFAULT_TOOL_TIMEOUT_MS),
+});
 toolRegistry.register(getFindingTool);
 toolRegistry.register(searchFindingsTool);

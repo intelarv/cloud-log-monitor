@@ -7,6 +7,7 @@ import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import router from "./routes";
 import { logger } from "./lib/logger";
 import { sessionMiddleware } from "./lib/auth";
+import { mountA2AAgents } from "./lib/a2a";
 
 const app: Express = express();
 app.set("trust proxy", 1);
@@ -110,5 +111,10 @@ app.use("/api/admin/break-glass/grants", breakGlassLimiter);
 app.use("/api/admin/ingest/replay", ingestReplayLimiter);
 
 app.use("/api", router);
+
+// Mount the A2A specialist agents (Triage, Verifier) on loopback-only routes
+// (deliberately NOT in the shared proxy path table) so the Supervisor can call
+// them over the official A2A protocol. Guarded by a shared-secret middleware.
+mountA2AAgents(app);
 
 export default app;

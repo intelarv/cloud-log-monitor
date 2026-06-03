@@ -166,6 +166,15 @@ importers:
 
   artifacts/api-server:
     dependencies:
+      '@a2a-js/sdk':
+        specifier: ^0.3.13
+        version: 0.3.13(@bufbuild/protobuf@2.12.0)(express@5.2.1)
+      '@ag-ui/core':
+        specifier: ^0.0.54
+        version: 0.0.54
+      '@ag-ui/encoder':
+        specifier: ^0.0.54
+        version: 0.0.54
       '@google/genai':
         specifier: ^1.52.0
         version: 1.52.0
@@ -239,6 +248,9 @@ importers:
 
   artifacts/dashboard:
     devDependencies:
+      '@ag-ui/core':
+        specifier: ^0.0.54
+        version: 0.0.54
       '@hookform/resolvers':
         specifier: ^3.10.0
         version: 3.10.0(react-hook-form@7.75.0(react@19.1.0))
@@ -712,8 +724,32 @@ importers:
 
 packages:
 
+  '@a2a-js/sdk@0.3.13':
+    resolution: {integrity: sha512-BZr0f9JVNQs3GKOM9xINWCh6OKIJWZFPyqqVqTym5mxO2Eemc6I/0zL7zWnljHzGdaf5aZQyQN5xa6PSH62q+A==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      '@bufbuild/protobuf': ^2.10.2
+      '@grpc/grpc-js': ^1.11.0
+      express: ^4.21.2 || ^5.1.0
+    peerDependenciesMeta:
+      '@bufbuild/protobuf':
+        optional: true
+      '@grpc/grpc-js':
+        optional: true
+      express:
+        optional: true
+
   '@adobe/css-tools@4.5.0':
     resolution: {integrity: sha512-6OzddxPio9UiWTCemp4N8cYLV2ZN1ncRnV1cVGtve7dhPOtRkleRyx32GQCYSwDYgaHU3USMm84tNsvKzRCa1Q==}
+
+  '@ag-ui/core@0.0.54':
+    resolution: {integrity: sha512-Ilx31OvRQaZfU7jSArGqz06JZKOsAt8zWiCPJljyp9zR6Tzl18oyfx8o6FsuGfAktGRe50GI9SCCxNXXysZwtA==}
+
+  '@ag-ui/encoder@0.0.54':
+    resolution: {integrity: sha512-0dPuE/eAeBRBDj/OOj5AW8SoP1r0dufmoOdrtKgmf+dlbVXKSNkDDHGrrvIWFPxwvPTWhHeN6wnsVUayWpUsGg==}
+
+  '@ag-ui/proto@0.0.54':
+    resolution: {integrity: sha512-IPF+xeFaBAKKP2FO74MaVTkKUP8VaGGkbPzORCvC5TLDdGs+oQgQFqz+XoBeksQGE14+jgLWiAr9EPXdhqr1NA==}
 
   '@asamuzakjp/css-color@5.1.11':
     resolution: {integrity: sha512-KVw6qIiCTUQhByfTd78h2yD1/00waTmm9uy/R7Ck/ctUyAPj+AEDLkQIdJW0T8+qGgj3j5bpNKK7Q3G+LedJWg==}
@@ -824,6 +860,9 @@ packages:
   '@bramus/specificity@2.4.2':
     resolution: {integrity: sha512-ctxtJ/eA+t+6q2++vj5j7FYX3nRu311q1wfYH3xjlLOsczhlhxAg2FWNUXhpGvAw3BWo1xBcvOV6/YLc2r5FJw==}
     hasBin: true
+
+  '@bufbuild/protobuf@2.12.0':
+    resolution: {integrity: sha512-B/XlCaFIP8LOwzo+bz5uFzATYokcwCKQcghqnlfwSmM5eX/qTkvDBnDPs+gXtX/RyjxJ4DRikECcPJbyALA8FA==}
 
   '@commander-js/extra-typings@14.0.0':
     resolution: {integrity: sha512-hIn0ncNaJRLkZrxBIp5AsW/eXEHNKYQBh0aPdoUqNgD+Io3NIykQqpKFyKcuasZhicGaEZJX/JBSIkZ4e5x8Dg==}
@@ -987,6 +1026,10 @@ packages:
 
   '@pinojs/redact@0.4.0':
     resolution: {integrity: sha512-k2ENnmBugE/rzQfEcdWHcCY+/FM3VLzH9cYEsbdsoqrvzAKRhUZeRNhAZvB8OitQJ1TBed3yqWtdjzS6wJKBwg==}
+
+  '@protobuf-ts/protoc@2.11.1':
+    resolution: {integrity: sha512-mUZJaV0daGO6HUX90o/atzQ6A7bbN2RSuHtdwo8SSF2Qoe3zHwa4IHyCN1evftTeHfLmdz+45qo47sL+5P8nyg==}
+    hasBin: true
 
   '@protobufjs/aspromise@1.1.2':
     resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
@@ -3646,6 +3689,10 @@ packages:
   util-deprecate@1.0.2:
     resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
 
+  uuid@11.1.1:
+    resolution: {integrity: sha512-vIYxrBCC/N/K+Js3qSN88go7kIfNPssr/hHCesKCQNAjmgvYS2oqr69kIufEG+O4+PfezOH4EbIeHCfFov8ZgQ==}
+    hasBin: true
+
   vary@1.1.2:
     resolution: {integrity: sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==}
     engines: {node: '>= 0.8'}
@@ -3822,7 +3869,29 @@ packages:
 
 snapshots:
 
+  '@a2a-js/sdk@0.3.13(@bufbuild/protobuf@2.12.0)(express@5.2.1)':
+    dependencies:
+      uuid: 11.1.1
+    optionalDependencies:
+      '@bufbuild/protobuf': 2.12.0
+      express: 5.2.1
+
   '@adobe/css-tools@4.5.0': {}
+
+  '@ag-ui/core@0.0.54':
+    dependencies:
+      zod: 3.25.76
+
+  '@ag-ui/encoder@0.0.54':
+    dependencies:
+      '@ag-ui/core': 0.0.54
+      '@ag-ui/proto': 0.0.54
+
+  '@ag-ui/proto@0.0.54':
+    dependencies:
+      '@ag-ui/core': 0.0.54
+      '@bufbuild/protobuf': 2.12.0
+      '@protobuf-ts/protoc': 2.11.1
 
   '@asamuzakjp/css-color@5.1.11':
     dependencies:
@@ -3963,6 +4032,8 @@ snapshots:
   '@bramus/specificity@2.4.2':
     dependencies:
       css-tree: 3.2.1
+
+  '@bufbuild/protobuf@2.12.0': {}
 
   '@commander-js/extra-typings@14.0.0(commander@14.0.3)':
     dependencies:
@@ -4182,6 +4253,8 @@ snapshots:
       - typescript
 
   '@pinojs/redact@0.4.0': {}
+
+  '@protobuf-ts/protoc@2.11.1': {}
 
   '@protobufjs/aspromise@1.1.2': {}
 
@@ -6778,6 +6851,8 @@ snapshots:
       react: 19.1.0
 
   util-deprecate@1.0.2: {}
+
+  uuid@11.1.1: {}
 
   vary@1.1.2: {}
 

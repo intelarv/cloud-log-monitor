@@ -110,7 +110,11 @@ describe("scanForPhi", () => {
     });
 
     it("detects an ASIA temporary access key id", () => {
-      const hits = scanForPhi("token=ASIAABCDEFGHIJKLMNOP");
+      // `token=` also trips high_entropy_secret (defense-in-depth overlap), so
+      // assert the specific detector rather than the total hit count.
+      const hits = scanForPhi("token=ASIAABCDEFGHIJKLMNOP").filter(
+        (h) => h.detector === "aws_akid",
+      );
       expect(hits).toHaveLength(1);
       expect(hits[0]!.detector).toBe("aws_akid");
     });
@@ -124,6 +128,125 @@ describe("scanForPhi", () => {
       expect(hits).toHaveLength(1);
       expect(hits[0]!.detector).toBe("jwt");
       expect(hits[0]!.classification).toBe("secrets");
+    });
+  });
+
+  // M13.1 — date of birth (non-slash, birth-context anchored).
+  describe("M13.1 dob_date detector", () => {
+    it("detects ISO/textual/dash DOBs only in birth context", () => {
+      for (const s of [
+        '{"dob":"1981-03-14"}',
+        "date of birth March 14, 1981 confirmed",
+        "dob=03-14-1981",
+        "born 14 March 1981",
+      ]) {
+        const hits = scanForPhi(s).filter((h) => h.detector === "dob_date");
+        expect(hits).toHaveLength(1);
+        expect(hits[0]!.classification).toBe("phi");
+      }
+    });
+
+    it("does NOT flag routine ISO timestamps with no birth context", () => {
+      expect(scanForPhi("ts=2025-02-01T00:00:00Z level=warn")).toEqual([]);
+      expect(scanForPhi("deployed 2025-02-01 at 12:00")).toEqual([]);
+    });
+  });
+
+  // M13.2 — IPv6, license plate, passport, DEA.
+  describe("M13.2 identifiers", () => {
+    it("detects full and compressed IPv6 addresses", () => {
+      for (const ip of [
+        "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+        "fe80::1ff:fe23:4567:890a",
+        "2001:db8::8a2e:370:7334",
+      ]) {
+        const hits = scanForPhi(`client_ip=${ip} ok`).filter(
+          (h) => h.detector === "ipv6",
+        );
+        expect(hits).toHaveLength(1);
+        expect(hits[0]!.match).toBe(ip);
+      }
+    });
+
+    it("does NOT flag host:port or file:line:col colon noise as IPv6", () => {
+      for (const s of [
+        "endpoint=internal.svc.local:8443 ready",
+        "at server.js:1024:17 in handler",
+        "node:internal/process/task_queues.js:95:5",
+      ]) {
+        expect(scanForPhi(s).filter((h) => h.detector === "ipv6")).toEqual([]);
+      }
+    });
+
+    it("detects context-anchored license plate and passport", () => {
+      const plate = scanForPhi("license plate 7XYZ123 on file").filter(
+        (h) => h.detector === "license_plate",
+      );
+      expect(plate).toHaveLength(1);
+      expect(plate[0]!.match).toBe("7XYZ123");
+
+      const passport = scanForPhi("passport=X1234567 verified").filter(
+        (h) => h.detector === "passport",
+      );
+      expect(passport).toHaveLength(1);
+      expect(passport[0]!.match).toBe("X1234567");
+    });
+
+    it("detects checksum-valid DEA numbers and rejects bad checksums", () => {
+      const ok = scanForPhi("prescriber DEA AB1234563 refill").filter(
+        (h) => h.detector === "dea",
+      );
+      expect(ok).toHaveLength(1);
+      expect(ok[0]!.match).toBe("AB1234563");
+      // Same shape, wrong check digit → rejected.
+      expect(scanForPhi("DEA AB1234560").filter((h) => h.detector === "dea")).toEqual(
+        [],
+      );
+    });
+  });
+
+  // M13.4 — additional secret classes.
+  describe("M13.4 secret classes", () => {
+    it("detects prefix-anchored provider secrets", () => {
+      const cases: [string, string, string][] = [
+        ["k1 sk_live_4eC39HqLyjWDarjtT1zdp7dc", "stripe_key", "sk_live_4eC39HqLyjWDarjtT1zdp7dc"],
+        ["k2 ACa1b2c3d4e5f6071829304a5b6c7d8e9f", "twilio_sid", "ACa1b2c3d4e5f6071829304a5b6c7d8e9f"],
+        ["k3 sk-ant-api03-abcdefGHIJKL1234567890mnopqrstuv", "llm_api_key", "sk-ant-api03-abcdefGHIJKL1234567890mnopqrstuv"],
+        ["k4 npm_abcdefghijklmnopqrstuvwxyz0123456789", "npm_token", "npm_abcdefghijklmnopqrstuvwxyz0123456789"],
+        ["k5 hvs.CAESIabcdefghijklmnopqrstuvwxyz0123456789", "vault_token", "hvs.CAESIabcdefghijklmnopqrstuvwxyz0123456789"],
+      ];
+      for (const [text, detector, match] of cases) {
+        const hit = scanForPhi(text).find((h) => h.detector === detector);
+        expect(hit, `${detector} should fire`).toBeDefined();
+        expect(hit!.classification).toBe("secrets");
+        expect(hit!.match).toBe(match);
+      }
+    });
+
+    it("detects context-anchored AWS secret access key", () => {
+      const hits = scanForPhi(
+        "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      ).filter((h) => h.detector === "aws_secret_key");
+      expect(hits).toHaveLength(1);
+      expect(hits[0]!.match).toBe("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    });
+  });
+
+  // M13.5 — generic high-entropy secret.
+  describe("M13.5 high_entropy_secret detector", () => {
+    it("flags a high-entropy value on a secret-shaped key", () => {
+      const hits = scanForPhi("api_key=9f8e7d6c5b4a3210ffeeddccbbaa9988").filter(
+        (h) => h.detector === "high_entropy_secret",
+      );
+      expect(hits).toHaveLength(1);
+      expect(hits[0]!.classification).toBe("secrets");
+      expect(hits[0]!.match).toBe("9f8e7d6c5b4a3210ffeeddccbbaa9988");
+    });
+
+    it("does NOT flag short or low-entropy values", () => {
+      expect(scanForPhi("token=ok")).toEqual([]);
+      expect(scanForPhi("api_key=aaaaaaaaaaaaaaaaaaaaaaaa")).toEqual([]);
+      expect(scanForPhi("account=disabled subscriber=none")).toEqual([]);
     });
   });
 

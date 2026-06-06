@@ -1,6 +1,6 @@
 # Deployment (M9)
 
-Two deployment paths today, both produced by **M9.1** (Helm + Docker) and **M9.4** (Replit). Terraform / per-cloud IaC roots are still scoped under M9.2 + M9.3 (planned, not built).
+Two deployment paths today: container/Kubernetes via **M9.1** (Helm + Docker) and Replit via **M9.4**. Per-cloud IaC is built — **M9.2** ships the provider-abstracted `modules/postgres`, and **M9.3** ships the three per-cloud Terraform roots under `roots/{aws,gcp,azure}/` (each consumes the M9.2 module and emits values for the M9.1 Helm overlays). Still deferred (operator policy, not application code): CI/CD pipelines, service-mesh mTLS, and per-tenant KMS-key lifecycle automation.
 
 ## Layout
 

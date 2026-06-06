@@ -42,6 +42,18 @@ Code lives in `artifacts/api-server/src/lib/a2a/` and `lib/sse.ts`.
   `paths` (only `/api` is). Shared-secret bearer auth (`a2aAuthMiddleware`,
   `timingSafeEqual`) gates both card + JSON-RPC routes; dev fallback derives from
   `SESSION_SECRET` with a WARN, like notarization.
+- **Two independent auth layers — keep both.** Bearer shared-secret proves the
+  caller is in-cluster; a per-call **signed JWT caller identity** (HS256, short
+  TTL, `x-a2a-caller-identity` header, minted client-side) proves *which* agent is
+  calling and carries its ABAC scope. The called agent's scope middleware verifies
+  signature + issuer + audience + expiry, then asserts the requested skill is in
+  the caller's advertised scope — so Triage cannot invoke a Verifier-only/remediation
+  skill even with a valid bearer token. JWT audience/skill constants MUST match the
+  Agent Card skill ids (`triage_finding`, `verify_finding`).
+  **Why:** bearer auth alone is a single shared secret — it authenticates the
+  cluster, not the agent, so it cannot enforce per-agent least privilege. The
+  cross-cloud mTLS hook is documented/deferred; loopback keeps the plane private
+  meanwhile. Covered by the JSON-RPC abuse-path tests in `a2a.test.ts`.
 
 ## Keeping tests offline
 

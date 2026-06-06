@@ -31,6 +31,21 @@ also matches benign noise.
   (defense-in-depth). It fires only on secret-shaped keys (`api_key`/`secret`/`token`/…)
   past a Shannon-entropy floor — the key-context gate is what keeps benign base64/hex out.
 
+**Open-class names (the hardest precision case):** tokens that collide with
+ordinary English words (Sun, Park, Moon, Long, Song, Li, Le, Tang, Dang) MUST stay
+out of the name gazetteer — the bare adjacent-pair/casing passes would fire on "the
+sun set" / "members park sessions". Only the **context-anchored** subset is safe to
+close deterministically: a person-context keyword (`patient`/`member`/`enrollee`)
+immediately preceding a **Capitalized** collision token across a **non-period**
+separator. Capitalization is the discriminator (lowercase prose stays silent); the
+non-period rule blocks sentence-boundary FPs ("patient. Sun exposure"). The
+un-anchored case ("Park reviewed the chart") is unreachable without a real NER model
+and is honestly **deferred** — never add it as a knownGap fixture, which would lower
+recall below the 1.0 baseline and fail the gate.
+**Why:** "An" is deliberately excluded even from the context pass — too common a word
+for the anchor alone to disambiguate. Over-redaction on "patient Sun exposure" is the
+accepted PHI-safe edge (better than leaking a real surname).
+
 After adding/changing a detector: run the redact unit tests, then `pnpm run eval:gate`
 (placeholder DB env is fine — deterministic suites import `lib/db` but never connect),
 and re-baseline with `eval:update` only once precision is proven clean.

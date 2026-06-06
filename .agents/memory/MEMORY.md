@@ -1,3 +1,2 @@
-- [Agent harness invariants](agent-harness.md) — chat loop degrades (never errors/leaks raw tool_call JSON); loop is DI'd for offline tests; per-call+per-tool timeouts mandatory.
-- [A2A + AG-UI protocol seams](a2a-agui-integration.md) — @a2a-js/sdk loopback agents + @ag-ui/encoder; SDK gotchas (Router mounting, Message-vs-Task), parse+strip redacted boundary, injectable invoker keeps tests offline.
-- [Dashboard render safety](dashboard-render-safety.md) — never feed raw timestamps to date-fns inline; use safeTimestamp/safeRelativeTime in src/lib/format.ts or a bad row white-screens the page.
+- [A2A auth-layer ledgering posture](a2a-auth-layer-ledgering.md) — transport/auth rejections are log-only by default (ledger-DoS); mTLS 403 is the lone ledgered exception (explicit non-repudiation), payload must stay attacker-data-free.
+- [Broker consume() blocking semantics](broker-consume-blocking-semantics.md) — KafkaJS `consumer.run()` resolves promptly (await it); NATS `for await` blocks (background-drain it). Reviewers misread this as a deadlock.

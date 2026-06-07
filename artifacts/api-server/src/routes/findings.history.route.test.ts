@@ -19,7 +19,7 @@ import { withTenant } from "../lib/db-context";
 // ---------------------------------------------------------------------------
 
 const TENANT = "default";
-const uniq = () => Math.random().toString(36).slice(2, 10);
+import { uniq } from "../test-support/ledger-harness";
 
 let server: Server;
 let baseUrl: string;

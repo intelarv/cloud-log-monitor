@@ -10,6 +10,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { logger } from "../logger";
+import { A2A_CALLER_IDENTITY_HEADER } from "./caller-identity";
+import { getA2AClientDispatcher } from "./transport";
 
 let cachedSecret: string | undefined;
 let warned = false;
@@ -60,13 +62,33 @@ export const a2aAuthMiddleware: RequestHandler = (req, res, next) => {
 };
 
 /** A `fetch` implementation that injects the shared-secret bearer header on
- *  every A2A client request (card fetch + message/send). */
-export function buildA2AClientFetch(): typeof fetch {
+ *  every A2A client request (card fetch + message/send). When `tokenFactory` is
+ *  supplied it also mints a fresh, short-lived caller-identity JWT per request
+ *  and sets it on the `x-a2a-caller-identity` header — minted per call (not
+ *  baked into the cached client) so the 60s token never goes stale. */
+export function buildA2AClientFetch(
+  tokenFactory?: () => Promise<string>,
+): typeof fetch {
   const authorization = `Bearer ${getA2ASharedSecret()}`;
-  return ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+  return (async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
     const headers = new Headers(init?.headers);
     headers.set("authorization", authorization);
-    return fetch(input, { ...init, headers });
+    if (tokenFactory !== undefined) {
+      headers.set(A2A_CALLER_IDENTITY_HEADER, await tokenFactory());
+    }
+    // When cross-cloud mTLS is enabled the outbound call rides an undici
+    // dispatcher carrying the client cert/key; `undefined` (the loopback
+    // default) leaves native fetch untouched. `dispatcher` is an undici fetch
+    // extension not present in the DOM `RequestInit` type, hence the cast.
+    const dispatcher = await getA2AClientDispatcher();
+    const finalInit =
+      dispatcher !== undefined
+        ? ({ ...init, headers, dispatcher } as RequestInit)
+        : { ...init, headers };
+    return fetch(input, finalInit);
   }) as typeof fetch;
 }
 

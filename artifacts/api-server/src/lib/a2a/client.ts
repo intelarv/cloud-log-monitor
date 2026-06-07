@@ -27,6 +27,14 @@ import {
   A2A_CARD_SUFFIX,
 } from "./protocol";
 import { buildA2AClientFetch, getA2ABaseUrl } from "./auth";
+import {
+  mintCallerToken,
+  SUPERVISOR_CALLER_ID,
+  TRIAGE_AUDIENCE,
+  VERIFY_AUDIENCE,
+  TRIAGE_SKILL,
+  VERIFY_SKILL,
+} from "./caller-identity";
 
 function userDataMessage(data: Record<string, unknown>): Message {
   return {
@@ -92,14 +100,30 @@ export class A2AAgentInvoker implements AgentInvoker {
   private triage_(): Promise<A2AClient> {
     return (this.triageClient ??= A2AClient.fromCardUrl(
       `${this.baseUrl}${TRIAGE_AGENT_PATH}${A2A_CARD_SUFFIX}`,
-      { fetchImpl: buildA2AClientFetch() },
+      {
+        fetchImpl: buildA2AClientFetch(() =>
+          mintCallerToken({
+            subject: SUPERVISOR_CALLER_ID,
+            audience: TRIAGE_AUDIENCE,
+            scope: [TRIAGE_SKILL],
+          }),
+        ),
+      },
     ));
   }
 
   private verify_(): Promise<A2AClient> {
     return (this.verifierClient ??= A2AClient.fromCardUrl(
       `${this.baseUrl}${VERIFY_AGENT_PATH}${A2A_CARD_SUFFIX}`,
-      { fetchImpl: buildA2AClientFetch() },
+      {
+        fetchImpl: buildA2AClientFetch(() =>
+          mintCallerToken({
+            subject: SUPERVISOR_CALLER_ID,
+            audience: VERIFY_AUDIENCE,
+            scope: [VERIFY_SKILL],
+          }),
+        ),
+      },
     ));
   }
 

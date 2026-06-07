@@ -205,6 +205,46 @@ describe("scanForPhi", () => {
     });
   });
 
+  // M13.3 (partial) — context-anchored word-collision surnames.
+  describe("M13.3 context-anchored word-collision surnames", () => {
+    const names = (text: string) =>
+      scanForPhi(text)
+        .filter((h) => h.detector === "name")
+        .map((h) => h.match);
+
+    it("recalls a collision surname when a context keyword anchors it", () => {
+      expect(names("Lab results for patient Sun were filed.")).toContain("Sun");
+      expect(names("Follow-up assigned to member Li today.")).toContain("Li");
+      // Colon separator after the context keyword.
+      expect(names("Returned by enrollee: Park before noon.")).toContain("Park");
+    });
+
+    it("does NOT fire on the ordinary-word use of a collision token", () => {
+      // Lowercase prose word, no context keyword.
+      expect(names("The sun set over region us-west-2.")).toEqual([]);
+      // Context keyword present but the collision token is lowercase prose.
+      expect(names("Members park their idle sessions.")).toEqual([]);
+      // Capitalized, context keyword present, but across a SENTENCE boundary.
+      expect(names("Notified the patient. Sun exposure guidance updated.")).toEqual(
+        [],
+      );
+      // Token must match exactly: "parking" is not the surname "park".
+      expect(names("Patient parking validation completed.")).toEqual([]);
+      // "An" is intentionally excluded as too-common a word.
+      expect(names("Notified patient An before the appointment.")).toEqual([]);
+      // Capitalization is the discriminator: lowercase prose stays silent even
+      // with a context keyword present ("patient sun exposure", not a name).
+      expect(names("Reviewed patient sun exposure guidance.")).toEqual([]);
+    });
+
+    it("treats a Capitalized collision token after a context keyword as a name (PHI-safe over-redaction)", () => {
+      // No sentence boundary + Capitalized + context keyword → flagged. This is
+      // the accepted precision edge documented in redact.ts pass 5: we redact
+      // rather than risk leaking a real surname "Sun".
+      expect(names("Reviewed patient Sun exposure guidance.")).toContain("Sun");
+    });
+  });
+
   // M13.4 — additional secret classes.
   describe("M13.4 secret classes", () => {
     it("detects prefix-anchored provider secrets", () => {

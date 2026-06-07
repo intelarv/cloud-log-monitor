@@ -21,8 +21,28 @@ export {
 } from "./client";
 export { mountA2AAgents } from "./server";
 export {
+  isA2AMtlsRequired,
+  a2aMtlsMiddleware,
+  hasVerifiedClientCert,
+  getA2AClientDispatcher,
+  __resetA2ATransportForTest,
+} from "./transport";
+export {
   getA2ABaseUrl,
   getA2ASharedSecret,
   __resetA2ASecretForTest,
 } from "./auth";
 export { buildTriageCard, buildVerifierCard } from "./cards";
+export {
+  mintCallerToken,
+  verifyCallerToken,
+  a2aScopeMiddleware,
+  CallerIdentityError,
+  A2A_CALLER_IDENTITY_HEADER,
+  SUPERVISOR_CALLER_ID,
+  TRIAGE_AUDIENCE,
+  VERIFY_AUDIENCE,
+  TRIAGE_SKILL,
+  VERIFY_SKILL,
+  __resetCallerIdentityForTest,
+} from "./caller-identity";

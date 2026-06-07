@@ -34,7 +34,7 @@ import { withTenant } from "../lib/db-context";
 // ---------------------------------------------------------------------------
 
 const TENANT = "default";
-const uniq = () => Math.random().toString(36).slice(2, 10);
+import { uniq, ledgerHeadSeq } from "../test-support/ledger-harness";
 
 let server: Server;
 let baseUrl: string;
@@ -151,12 +151,6 @@ async function createCriticalFinding(): Promise<string> {
   return id;
 }
 
-async function ledgerHeadSeq(): Promise<number> {
-  const res = await db.execute(
-    sql`SELECT COALESCE(MAX(seq), 0)::int AS head FROM ledger_entries`,
-  );
-  return Number((res.rows[0] as { head?: number }).head ?? 0);
-}
 
 /** True if a ledger entry of `eventType` for `findingId` exists after `sinceSeq`. */
 async function hasLedgerEvent(

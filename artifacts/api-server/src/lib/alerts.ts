@@ -161,6 +161,39 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // the break-glass read handler, never the alert dispatcher. Payload carries
   // finding id + store name + reason only (no raw PHI).
   "break_glass.raw_fallback_used": "high",
+  // T001 (cross-cloud A2A mTLS): an mTLS-required A2A request arrived without a
+  // verified client certificate and was refused 403 at the outermost transport
+  // layer (before shared-secret / caller-identity). Warning, not critical: this
+  // is most often a misconfigured peer or a benign probe, and the refusal
+  // already prevented any action — but for a HIPAA system a transport-auth
+  // failure on the agent plane is security-relevant and must be non-repudiable
+  // (threat_model §Repudiation / §Spoofing — "A2A caller identity"). Sustained
+  // refusals are the pageable pattern, detected downstream from the alert
+  // stream. Loop-safe: emitted only from the transport middleware, never from
+  // the alert dispatcher. Inert unless A2A_REQUIRE_MTLS is set. Payload carries
+  // the fixed agent route + a static reason only (no PHI, no request headers).
+  "a2a.transport_rejected": "warning",
+  // Tiered storage: a raw-evidence tiering migration (aging inline raw PHI out
+  // of the hot findings.raw_evidence column into the external WORM store)
+  // failed at put/get/verify for one finding. Warning, not high: unlike the
+  // ingest write-failure event (raw permanently lost for that occurrence), the
+  // tiering job preserves the inline copy on any failure and retries next
+  // cadence, so nothing is lost — but a compliance system should still surface
+  // proactively that hot→WORM migration is degraded (it usually means the same
+  // object-store outage is also failing ingest writes). Inert unless an
+  // external store + RAW_EVIDENCE_TIER_AGE_DAYS are configured. Loop-safe:
+  // emitted from the tiering job, never the alert dispatcher. Payload carries
+  // finding id + provider only (no raw PHI, no object URIs).
+  "raw_evidence.tier_failed": "warning",
+  // Memory eviction: a per-tenant eviction sweep over the finding_embeddings
+  // derived cache failed. The embeddings are left intact on any failure and the
+  // job retries next cadence, so retrieval recall is unaffected — but a
+  // persistent failure means the vector cache is growing unbounded against the
+  // configured cap, which is worth surfacing. Inert unless
+  // MEMORY_MAX_EMBEDDINGS_PER_TENANT is set. Loop-safe: emitted from the
+  // eviction job, never the alert dispatcher. Payload carries counts + policy
+  // params only (no finding ids, no PHI).
+  "memory.evict_failed": "warning",
 } as const;
 
 /** Event types that are legitimately emitted at high volume or as part of a
@@ -227,6 +260,20 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // during an investigation window) but routine — not pageable.
   "ingest.source_started",
   "ingest.source_stopped",
+  // Tiered storage: a finding's inline raw PHI was successfully aged out of
+  // the hot findings.raw_evidence column into the external WORM store. A
+  // routine lifecycle action that *reduces* exposure (raw leaves the hot
+  // tier); auditable in the ledger like the rest of the finding lifecycle.
+  // The failure event (raw_evidence.tier_failed, warning above) is the
+  // alertable one.
+  "raw_evidence.tiered",
+  // Memory eviction: low-importance embeddings were pruned from the
+  // finding_embeddings derived cache to honor MEMORY_MAX_EMBEDDINGS_PER_TENANT
+  // and the consolidation policy. A routine maintenance action that only
+  // affects the vector retrieval cache (the findings audit record and the
+  // lexical/BM25 leg are untouched); auditable in the ledger. The failure
+  // event (memory.evict_failed, warning above) is the alertable one.
+  "memory.evicted",
 ]);
 
 /** In-memory rolling counters for threshold-based alerts.

@@ -43,7 +43,10 @@ beforeAll(async () => {
 });
 
 const TENANT = "default";
-const uniq = () => Math.random().toString(36).slice(2, 10);
+import {
+  uniq,
+  ledgerHeadSeq as currentHeadSeq,
+} from "../../test-support/ledger-harness";
 
 interface FakeCall {
   systemPrompt: string;
@@ -115,13 +118,6 @@ async function ledgerSince(seedSeq: number, subjectId: string) {
     .orderBy(ledgerEntriesTable.seq);
 }
 
-async function currentHeadSeq(): Promise<number> {
-  const { sql } = await import("drizzle-orm");
-  const res = await db.execute<{ max: number | null }>(
-    sql`SELECT max(seq) AS max FROM ledger_entries`,
-  );
-  return Number(res.rows[0]?.max ?? 0);
-}
 
 beforeEach(() => {
   __startSupervisorForTest();

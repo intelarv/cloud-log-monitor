@@ -14,7 +14,7 @@ beforeAll(async () => {
 });
 
 const TENANT = "default";
-const uniq = () => Math.random().toString(36).slice(2, 10);
+import { uniq } from "../test-support/ledger-harness";
 
 // Tiny in-memory fake client. Per-call response queue so tests can script
 // pagination, empty pages, and explicit failures.

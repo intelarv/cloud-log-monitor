@@ -12,7 +12,8 @@
 
 import { Router, type IRouter } from "express";
 import { requireSession } from "../lib/auth";
-import { logBus, type PublishResult } from "../lib/log-bus";
+import { type PublishResult } from "../lib/log-bus";
+import { getLogBus } from "../lib/log-bus-config";
 import { StaticFixtureLogSource } from "../lib/log-source";
 
 const router: IRouter = Router();
@@ -26,8 +27,9 @@ router.post(
       // ingest handler failed (architect-flagged: previous version returned
       // success even if every handler threw).
       const results: PublishResult[] = [];
+      const bus = getLogBus();
       const src = new StaticFixtureLogSource(async (r) => {
-        const out = await logBus.publish("raw.logs", r);
+        const out = await bus.publish("raw.logs", r);
         results.push(out);
       });
       const out = await src.replayOnce();

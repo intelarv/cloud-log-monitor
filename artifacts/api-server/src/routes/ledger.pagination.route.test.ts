@@ -27,7 +27,7 @@ import { appendLedger } from "../lib/ledger";
 //     notice path) instead of silently paging the whole tenant.
 // ---------------------------------------------------------------------------
 
-const uniq = () => Math.random().toString(36).slice(2, 10);
+import { uniq } from "../test-support/ledger-harness";
 
 // Mirror the dashboard's page size (artifacts/dashboard/src/pages/ledger.tsx).
 const PAGE_SIZE = 100;

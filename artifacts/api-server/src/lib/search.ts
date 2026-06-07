@@ -8,6 +8,12 @@ import {
   getSearchProvider,
   type LexicalSearchProvider,
 } from "./search-config";
+import {
+  getMemoryPolicyFromEnv,
+  selectEvictions,
+  type MemoryFinding,
+  type MemoryPolicy,
+} from "./memory-eviction";
 import { logger } from "./logger";
 
 // ---------------------------------------------------------------------------
@@ -195,8 +201,18 @@ export async function hybridSearchFindings(
 // evidence (there is none in M1, but the contract holds going forward).
 export async function backfillEmbeddings(opts: {
   embedder?: Embedder;
+  /** Memory-eviction policy. Shared eligibility oracle with the eviction job:
+   *  when a policy is active, an embedding is NOT created for any finding the
+   *  policy would immediately evict — otherwise boot backfill would just
+   *  recreate what the last eviction removed (recreate thrash). `undefined`
+   *  reads env (default-inert), explicit `null` disables the gate entirely so
+   *  the path is byte-identical to the pre-eviction behavior. */
+  memoryPolicy?: MemoryPolicy | null;
 } = {}): Promise<{ inserted: number; updated: number; skipped: number }> {
   const embedder = opts.embedder ?? getEmbedder();
+  const policy =
+    opts.memoryPolicy === undefined ? getMemoryPolicyFromEnv() : opts.memoryPolicy;
+  const now = Date.now();
   const result = { inserted: 0, updated: 0, skipped: 0 };
 
   // We list all tenants present in findings, then re-enter RLS context per
@@ -213,8 +229,11 @@ export async function backfillEmbeddings(opts: {
         classification: string;
         subclass: string | null;
         severity: string;
+        status: string;
         source: string;
         snippet: string | null;
+        last_seen_ms: number | string;
+        occurrence_count: number | string;
         existing_version: string | null;
       }>(sql`
         SELECT
@@ -222,15 +241,45 @@ export async function backfillEmbeddings(opts: {
           f.classification,
           f.subclass,
           f.severity,
+          f.status,
           f.source,
           f.redacted_evidence->>'snippet' AS snippet,
+          extract(epoch FROM f.last_seen_at) * 1000 AS last_seen_ms,
+          f.occurrence_count,
           fe.embedder_version AS existing_version
         FROM findings f
         LEFT JOIN finding_embeddings fe ON fe.finding_id = f.id
         WHERE f.tenant_id = ${tenant_id}
       `);
 
+      // When a memory policy is active, compute the evict set over the tenant's
+      // full finding population FIRST, then skip creating embeddings for any
+      // ineligible finding. Checked BEFORE the version check so a stale-version
+      // ineligible row is not re-embedded only to be evicted next cadence.
+      const evictSet = policy
+        ? selectEvictions(
+            rows.rows.map(
+              (r): MemoryFinding => ({
+                id: r.id,
+                classification: r.classification,
+                subclass: r.subclass,
+                source: r.source,
+                severity: r.severity,
+                status: r.status,
+                lastSeenAtMs: Number(r.last_seen_ms),
+                occurrenceCount: Number(r.occurrence_count),
+              }),
+            ),
+            policy,
+            now,
+          )
+        : null;
+
       for (const row of rows.rows) {
+        if (evictSet && evictSet.has(row.id)) {
+          result.skipped += 1;
+          continue;
+        }
         if (row.existing_version === embedder.version) {
           result.skipped += 1;
           continue;

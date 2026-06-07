@@ -120,6 +120,37 @@ export const PHI_FIXTURES: PhiFixture[] = [
     text: "Auditor dmitri volkov closed the case.",
     phi: [{ sub: "dmitri volkov", identifier: "name" }],
   },
+  // ---------------------------------------------------------------------------
+  // M13.3 (partial) — context-anchored word-collision surnames. These collide
+  // with ordinary English words ("Sun", "Li", "Park") and are deliberately kept
+  // out of the gazetteer, so they are recalled ONLY when a person-context
+  // keyword anchors them, the token is Capitalized, and the separator is not a
+  // sentence-ending period. The bare un-anchored case still needs NER (deferred,
+  // see COLLISION_SURNAMES in redact.ts). The benign-collision-* controls below
+  // prove these conditions hold precision on ordinary operational text.
+  {
+    // Context keyword + collision surname ("Sun"). The casing pass needs a
+    // middle initial for the context shape, and "sun" is not a dictionary name,
+    // so only the M13.3 collision pass recalls it.
+    id: "name-10",
+    shape: "clean",
+    text: "Lab results for patient Sun were filed overnight.",
+    phi: [{ sub: "Sun", identifier: "name" }],
+  },
+  {
+    // Context keyword + two-letter collision surname ("Li").
+    id: "name-11",
+    shape: "clean",
+    text: "Follow-up assigned to member Li this morning.",
+    phi: [{ sub: "Li", identifier: "name" }],
+  },
+  {
+    // Colon separator after the context keyword ("enrollee: Park").
+    id: "name-12",
+    shape: "clean",
+    text: "Questionnaire returned by enrollee: Park before noon.",
+    phi: [{ sub: "Park", identifier: "name" }],
+  },
   {
     id: "address-1",
     shape: "clean",
@@ -495,6 +526,20 @@ export const BENIGN_FIXTURES: { id: string; shape: LogShape; text: string }[] = 
   { id: "benign-32", shape: "clean", text: "Patient portal maintenance completed at 02:00." },
   { id: "benign-33", shape: "clean", text: "Member services resolved 14 tickets today." },
   { id: "benign-34", shape: "clean", text: "Resident memory climbed to 92 percent overnight." },
+
+  // Word-collision surname precision controls (M13.3 partial). The collision
+  // pass must stay silent on ordinary operational prose where the collision word
+  // is NOT a context-anchored, capitalized name.
+  // Collision word as an ordinary lowercase word, no context keyword.
+  { id: "benign-collision-1", shape: "clean", text: "The sun set over region us-west-2 at 18:00." },
+  // Context keyword present, but the collision word is lowercase prose.
+  { id: "benign-collision-2", shape: "clean", text: "Members park their idle sessions in the pool." },
+  // Capitalized collision word after a context keyword but across a SENTENCE
+  // boundary (period) — the no-period separator rule must keep this silent.
+  { id: "benign-collision-3", shape: "clean", text: "Notified the patient. Sun exposure guidance was updated." },
+  // Context keyword + a longer word that merely starts with a collision token
+  // ("park" vs "parking") — token equality must hold, so this must not fire.
+  { id: "benign-collision-4", shape: "clean", text: "Patient parking validation completed cleanly." },
 
   // ---------------------------------------------------------------------------
   // PRODUCTION-SHAPED benign controls — the harder precision traps that only

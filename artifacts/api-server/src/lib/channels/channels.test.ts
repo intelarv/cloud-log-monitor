@@ -26,9 +26,10 @@ import type { ChannelAdapter, ChannelEnvelope, DispatchResult } from "./types";
 
 const TENANT = "00000000-0000-0000-0000-00000000c6a6";
 
-function uniq(): string {
-  return Math.random().toString(36).slice(2, 10);
-}
+import {
+  uniq,
+  ledgerHeadSeq as currentHeadSeq,
+} from "../../test-support/ledger-harness";
 
 interface FakeAdapter extends ChannelAdapter {
   readonly calls: ChannelEnvelope[];
@@ -64,12 +65,6 @@ async function ledgerEntriesAfter(sinceSeq: number, subjectId?: string) {
   return db.select().from(ledgerEntriesTable).where(where).orderBy(ledgerEntriesTable.seq);
 }
 
-async function currentHeadSeq(): Promise<number> {
-  const rows = await db.execute<{ max: number | null }>(
-    "select max(seq)::int as max from ledger_entries",
-  );
-  return rows.rows[0]?.max ?? 0;
-}
 
 beforeAll(async () => {
   await bootstrap({ embeddingDim: 256 });

@@ -10,12 +10,76 @@
 // only thing the ingest pipeline knows is the `subscribe()` shape, not who
 // the broker is.
 
+import { z } from "zod";
 import { logger } from "./logger";
-import type { LogRecord } from "./log-source";
+import type { LogRecord, LogSourceType } from "./log-source";
 
 export type LogTopic = "raw.logs";
 
 export type LogHandler = (record: LogRecord) => Promise<void>;
+
+// Runtime mirror of the `LogSourceType` union (log-source.ts is a type-only
+// declaration). Used to validate records arriving off a real broker — a
+// brokered transport is a trust boundary, so we re-validate the envelope
+// shape on the consume side even though our own producers wrote it.
+export const LOG_SOURCE_TYPES = [
+  "cloudwatch",
+  "cloud_logging",
+  "azure_monitor",
+  "onprem",
+  "fixture",
+] as const satisfies readonly LogSourceType[];
+
+const LogRecordWireSchema = z.object({
+  tenantId: z.string().min(1),
+  sourceType: z.enum(LOG_SOURCE_TYPES),
+  sourceName: z.string().min(1),
+  sourceRecordId: z.string().min(1),
+  observedAt: z.string().min(1),
+  ingestedAt: z.string().min(1),
+  payload: z.string(),
+});
+
+/** Serialize a `LogRecord` for transit over a real broker. Dates → ISO-8601
+ *  strings; everything else is already JSON-safe. The `payload` is
+ *  attacker-controlled but carried verbatim (the detector pipeline, not the
+ *  transport, is responsible for it). */
+export function encodeLogRecord(record: LogRecord): string {
+  return JSON.stringify({
+    tenantId: record.tenantId,
+    sourceType: record.sourceType,
+    sourceName: record.sourceName,
+    sourceRecordId: record.sourceRecordId,
+    observedAt: record.observedAt.toISOString(),
+    ingestedAt: record.ingestedAt.toISOString(),
+    payload: record.payload,
+  });
+}
+
+/** Parse + validate a `LogRecord` arriving off a broker. Throws on malformed
+ *  JSON, a bad envelope shape, or unparseable timestamps — the consumer
+ *  treats a throw as a poison message (logged + skipped, never crashes the
+ *  consume loop). */
+export function decodeLogRecord(raw: string): LogRecord {
+  const parsed = LogRecordWireSchema.parse(JSON.parse(raw));
+  const observedAt = new Date(parsed.observedAt);
+  const ingestedAt = new Date(parsed.ingestedAt);
+  if (Number.isNaN(observedAt.getTime())) {
+    throw new Error(`decodeLogRecord: invalid observedAt "${parsed.observedAt}"`);
+  }
+  if (Number.isNaN(ingestedAt.getTime())) {
+    throw new Error(`decodeLogRecord: invalid ingestedAt "${parsed.ingestedAt}"`);
+  }
+  return {
+    tenantId: parsed.tenantId,
+    sourceType: parsed.sourceType,
+    sourceName: parsed.sourceName,
+    sourceRecordId: parsed.sourceRecordId,
+    observedAt,
+    ingestedAt,
+    payload: parsed.payload,
+  };
+}
 
 /** Per-publish delivery result. `delivered` counts handlers that completed
  *  without throwing; `errors` carries everything else. Callers that need
@@ -29,6 +93,13 @@ export interface PublishResult {
 export interface LogBus {
   publish(topic: LogTopic, record: LogRecord): Promise<PublishResult>;
   subscribe(topic: LogTopic, handler: LogHandler): () => void;
+  /** Connect to the underlying broker and begin consuming. No-op for the
+   *  in-memory bus (publish dispatches synchronously). Brokered impls open
+   *  producer/consumer connections here, AFTER subscribers have registered,
+   *  so the consume loop sees the handler set. */
+  start?(): Promise<void>;
+  /** Disconnect the broker. No-op for the in-memory bus. */
+  stop?(): Promise<void>;
 }
 
 export class InMemoryLogBus implements LogBus {

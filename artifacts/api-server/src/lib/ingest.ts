@@ -28,10 +28,12 @@ import { and, eq, sql } from "drizzle-orm";
 import { findingsTable } from "@workspace/db";
 import { withTenant } from "./db-context";
 import { appendLedger } from "./ledger";
-import { scanForPhi, redactInline, type PhiHit } from "./redact";
+import { scanForPhi, redactInline, mergePhiHits, type PhiHit } from "./redact";
 import type { LogBus, LogHandler } from "./log-bus";
 import type { LogRecord } from "./log-source";
 import { logger } from "./logger";
+import { getNerProviderOrNull } from "./ner-config";
+import type { NerProvider } from "./ner";
 import {
   getSearchProviderOrNull,
   type LexicalSearchProvider,
@@ -158,6 +160,10 @@ export interface IngestDeps {
   redact?: typeof redactInline;
   searchProvider?: LexicalSearchProvider | null;
   rawEvidenceStore?: RawEvidenceStore | null;
+  // Optional Stage-2 NER provider. `undefined` → use the module-registered
+  // provider (or none); explicit `null` disables Stage-2 (test default). The
+  // default path is unchanged unless an operator sets `NER_PROVIDER`.
+  ner?: NerProvider | null;
 }
 
 /** Process a single `LogRecord`. Idempotent at the fingerprint level: a
@@ -171,6 +177,9 @@ export async function ingestRecord(
 ): Promise<IngestResult> {
   const scan = deps.scan ?? scanForPhi;
   const redact = deps.redact ?? redactInline;
+  // `undefined` → module-registered NER provider (or none); explicit `null`
+  // forces Stage-1-only (test default). Inert unless `NER_PROVIDER` is set.
+  const ner = deps.ner === undefined ? getNerProviderOrNull() : deps.ner;
   // `undefined` → use the module-registered provider (or none); an explicit
   // `null` disables mirroring (test path). Postgres' no-op provider is skipped
   // below via `maintainsExternalIndex`.
@@ -227,7 +236,13 @@ export async function ingestRecord(
     return result;
   }
 
-  const hits = scan(record.payload);
+  // Stage-1 (deterministic) detection, optionally augmented by Stage-2 NER.
+  // The Stage-2 call only happens when a real provider is configured, so the
+  // default ingest path runs exactly the prior synchronous detection.
+  const baseHits = scan(record.payload);
+  const hits = ner
+    ? mergePhiHits(baseHits, await ner.detect(record.payload))
+    : baseHits;
   if (hits.length === 0) return result;
   result.hits = hits.length;
 

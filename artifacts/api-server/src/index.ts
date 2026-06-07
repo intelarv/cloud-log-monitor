@@ -7,10 +7,13 @@ import { backfillEmbeddings, reconcileSearchIndex } from "./lib/search";
 import { initEmbedderFromEnv } from "./lib/embedder-config";
 import { initSearchProviderFromEnv } from "./lib/search-config";
 import { initRawEvidenceStoreFromEnv } from "./lib/raw-evidence-store";
+import { initNerProviderFromEnv } from "./lib/ner-config";
 import { initLlmRuntimeFromEnv } from "./lib/llm-runtime-config";
 import { hasDedicatedNotarizationSecret } from "./lib/notarization";
 import { startIngestPipeline } from "./lib/ingest";
-import { logBus } from "./lib/log-bus";
+import { startRawEvidenceTiering } from "./lib/raw-evidence-tiering";
+import { startMemoryEviction } from "./lib/memory-eviction";
+import { initLogBusFromEnv } from "./lib/log-bus-config";
 import { buildCloudwatchSourceFromEnv } from "./lib/cloud-log-sources";
 import { startAgentSupervisor } from "./lib/agents/supervisor";
 import { buildChannelsFromEnv, initChannels } from "./lib/channels";
@@ -52,6 +55,14 @@ async function main(): Promise<void> {
   // is always explicit (needs a bucket/container). No DB access here. See
   // raw-evidence-store.ts.
   initRawEvidenceStoreFromEnv();
+
+  // Step 0.9: resolve the optional Stage-2 NER provider from env. Default is
+  // `none` (NoopNerProvider) so detection runs Stage-1 only and the offline
+  // eval gate is byte-identical. NER_PROVIDER=aws-comprehend|gcp-dlp|
+  // azure-language augments ingest detection with cloud NER (un-anchored names
+  // / free-form addresses) — no DEPLOYMENT_TARGET shortcut, always explicit.
+  // No DB access here. See ner-config.ts.
+  initNerProviderFromEnv();
 
   // Step 1: idempotent DB setup (RLS policies + findings_redacted view).
   // Safe to run every boot; CREATE OR REPLACE / DROP IF EXISTS make it so.
@@ -125,7 +136,37 @@ async function main(): Promise<void> {
   // production swaps the bus impl without touching the pipeline.
   // No source is auto-started; POST /api/admin/ingest/replay triggers
   // the static fixture source on demand.
-  startIngestPipeline(logBus);
+  //
+  // The bus impl is env-selected (`LOG_BUS_PROVIDER=memory|kafka|nats`,
+  // default in-memory). We init + subscribe the pipeline FIRST, then call
+  // `bus.start?.()` so a brokered consume loop sees the registered handler.
+  const bus = initLogBusFromEnv();
+  startIngestPipeline(bus);
+  await bus.start?.();
+
+  // Step 4.7 (tiered storage): start the raw-evidence tiering lifecycle. Ages
+  // inline raw PHI out of the hot `findings.raw_evidence` column into the
+  // configured external WORM store once a finding is older than
+  // RAW_EVIDENCE_TIER_AGE_DAYS, then nulls the inline copy (break-glass still
+  // resolves it via raw_evidence_ref). Default-INERT: schedules nothing unless
+  // the operator opts in (RAW_EVIDENCE_TIER_AGE_DAYS) AND an external store is
+  // configured. With the inline DB store (dev default) there is no WORM tier to
+  // age into, so dev boot + the offline eval gate are byte-identical. The store
+  // was resolved in step 0.8. See raw-evidence-tiering.ts.
+  startRawEvidenceTiering();
+
+  // Step 4.8 (memory eviction): start the importance-decay eviction + group-
+  // consolidation lifecycle over the `finding_embeddings` derived cache. Bounds
+  // the vector memory per tenant (top-N by a deterministic importance score)
+  // and collapses old/resolved duplicates, while NEVER evicting a critical+open
+  // finding. Prunes only the derived embedding cache — never the findings audit
+  // record, and the lexical/BM25 retrieval leg still finds evicted findings.
+  // Default-INERT: schedules nothing unless the operator opts in
+  // (MEMORY_MAX_EMBEDDINGS_PER_TENANT). With it unset, dev boot + the offline
+  // eval gate are byte-identical, and the boot backfill above is unchanged. The
+  // backfill shares the same eligibility oracle so it never recreates what
+  // eviction removed. See memory-eviction.ts.
+  startMemoryEviction();
 
   // Step 4.5 (M8): real cloud log source(s), env-driven. Inert by default —
   // an operator opts in with `LOG_SOURCE=cloudwatch` + the required vars
@@ -135,7 +176,7 @@ async function main(): Promise<void> {
   // pattern as cloud-embedders — `@aws-sdk/client-cloudwatch-logs` is an
   // optional dep that's only required when this branch fires.
   const cloudwatchSource = buildCloudwatchSourceFromEnv((record) =>
-    logBus.publish("raw.logs", record),
+    bus.publish("raw.logs", record),
   );
   if (cloudwatchSource) {
     await cloudwatchSource.start();

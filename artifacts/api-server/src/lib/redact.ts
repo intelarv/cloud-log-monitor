@@ -7,6 +7,8 @@
 // patterns tagged with a classification. Real production replaces these with
 // a Stage-1+2 pipeline plus dictionary lookups.
 
+import type { NerProvider } from "./ner";
+
 export interface PhiHit {
   classification: "phi" | "secrets" | "pii" | "pii_s";
   detector: string;
@@ -228,6 +230,31 @@ const NAME_CONTEXT = new Set<string>([
   "claimant",
 ]);
 
+// M13.3 (partial) — context-anchored word-collision surnames. Real, common
+// surnames (especially East/South-East Asian) that ALSO collide with ordinary
+// English words: "Park", "Sun", "Tang", "Li", "Le", "Song", "Moon", "Long".
+// They are deliberately kept OUT of GIVEN_NAMES/SURNAMES because the bare
+// adjacent-pair and casing passes would then fire on ordinary prose ("the sun
+// set", "members park their sessions"). They are recalled ONLY when ALL of:
+//   (a) an immediately-preceding person-context keyword anchors them
+//       ("patient Sun", "member Li") — the honorific case ("Dr. Park") is
+//       already covered by the honorific arm of NAME_CASING_RE;
+//   (b) the token is Capitalized (a lowercase collision word in prose stays
+//       unmatched); and
+//   (c) the separator is NOT a sentence-ending period, so a clause boundary
+//       ("patient. Sun exposure guidance …") does not anchor a collision word.
+// These three conditions together make a benign operational-log match
+// implausible while catching the single-token collision-surname-with-context
+// case the dictionary passes miss. The remaining *un-anchored* word-collision
+// case ("Park reviewed the chart") cannot be closed deterministically without
+// regressing precision and stays deferred to the production NER path (M13.3 /
+// ARCHITECTURE.md §11). "An" is intentionally excluded even here — it is too
+// common a word for a context anchor alone to disambiguate safely.
+const COLLISION_SURNAMES = new Set<string>(
+  "park sun tang dang li le song moon long".split(/\s+/),
+);
+const isCapitalizedName = (w: string): boolean => /^[A-Z][a-z]+$/.test(w);
+
 // Precision-tightened name-casing heuristic. A bare capitalized-word-pair
 // regex over-matches ordinary TitleCase operational text ("Load Balancer",
 // "Internal Server Error", "Patient Portal", "Type A Record"), so pass 1 fires
@@ -280,6 +307,11 @@ function scanNames(
   // Title gap allows a trailing period ("Dr." / "Dr").
   const titleGap = (a: { end: number }, b: { start: number }): boolean =>
     /^\.?[ \t]+$/.test(text.slice(a.end, b.start));
+  // Context gap for collision surnames: whitespace or a single colon, but NOT a
+  // sentence-ending period — so "patient: Sun" / "member Li" anchor, while
+  // "patient. Sun exposure …" (new clause) does not.
+  const contextGapNoPeriod = (a: { end: number }, b: { start: number }): boolean =>
+    /^[ \t]*:?[ \t]+$/.test(text.slice(a.end, b.start));
 
   for (let i = 0; i + 1 < tokens.length; i++) {
     const a = tokens[i]!;
@@ -297,6 +329,27 @@ function scanNames(
     // 4) Patient-context keyword + single dictionary name ("patient Ngozi").
     // titleGap also covers a "patient: Ngozi" colon separator.
     if (NAME_CONTEXT.has(a.t.toLowerCase()) && isName(b.t) && titleGap(a, b)) {
+      spans.push({ start: b.start, end: b.end, match: b.t });
+      continue;
+    }
+    // 5) Patient-context keyword + Capitalized word-collision surname
+    // ("patient Sun", "member Li"). Stricter than pass 4: the surname is NOT in
+    // the dictionary (collision words are deliberately excluded), so it must be
+    // Capitalized and the separator must not be a sentence-ending period. See
+    // COLLISION_SURNAMES for the precision rationale.
+    //
+    // Capitalization is the deliberate discriminator: lowercase prose
+    // ("patient sun exposure guidance") stays silent, while a mid-clause
+    // Capitalized collision token right after a person-context keyword
+    // ("patient Sun exposure") IS flagged. That last case favors PHI-safe
+    // over-redaction over leaking a real surname — an accepted precision edge of
+    // this anchored slice (the un-anchored case stays deferred to NER).
+    if (
+      NAME_CONTEXT.has(a.t.toLowerCase()) &&
+      COLLISION_SURNAMES.has(b.t.toLowerCase()) &&
+      isCapitalizedName(b.t) &&
+      contextGapNoPeriod(a, b)
+    ) {
       spans.push({ start: b.start, end: b.end, match: b.t });
     }
   }
@@ -649,6 +702,37 @@ export function scanForPhi(text: string): PhiHit[] {
     }
   }
   return hits;
+}
+
+// Stage-2 augmentation: merge optional NER spans into the deterministic
+// Stage-1 hits. An NER span fully covered by a Stage-1 span is dropped (the
+// regex/dictionary detector already masks those bytes); partial/disjoint spans
+// are kept. `redactInline` is robust to any residual overlap. The sync
+// `scanForPhi` (Stage-1) is unchanged and still drives the offline eval gate;
+// this async wrapper is only used on the live ingest path when a provider is
+// configured (see ner-config.ts).
+export function mergePhiHits(base: PhiHit[], extra: PhiHit[]): PhiHit[] {
+  if (extra.length === 0) return base;
+  const merged = [...base];
+  for (const e of extra) {
+    if (e.end <= e.start) continue;
+    const covered = base.some((b) => e.start >= b.start && e.end <= b.end);
+    if (!covered) merged.push(e);
+  }
+  return merged;
+}
+
+/** Stage-1 (`scanForPhi`) ∪ optional Stage-2 NER spans. When `ner` is
+ *  undefined/null the result is exactly `scanForPhi(text)` — so the default
+ *  ingest path and the eval gate are unaffected. */
+export async function scanForPhiWithNer(
+  text: string,
+  ner?: NerProvider | null,
+): Promise<PhiHit[]> {
+  const base = scanForPhi(text);
+  if (!ner) return base;
+  const nerHits = await ner.detect(text);
+  return mergePhiHits(base, nerHits);
 }
 
 // M3: inline redaction helper used by the ingest pipeline to produce the

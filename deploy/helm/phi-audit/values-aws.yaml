@@ -45,6 +45,22 @@ logSource:
     region: us-east-1
     # tenantId + logGroups MUST be set per environment
 
+# Raw-evidence WORM store (off by default → inline DB). To push raw PHI into an
+# S3 Object Lock bucket, uncomment below. region reuses llm.aws.region above.
+# Provision the bucket WITH Object Lock at creation + a COMPLIANCE default
+# retention, and grant the IRSA role s3:PutObject/GetObject/PutObjectRetention
+# scoped to it (NOT permission to disable the lock) — see deploy/README.md
+# "Bringing up an external WORM store". Install the SDK first:
+#   pnpm --filter @workspace/api-server add @aws-sdk/client-s3
+# rawEvidence:
+#   provider: s3
+#   s3:
+#     bucket: phi-audit-raw-evidence-<env>   # must be Object-Lock-enabled
+#     # objectLockMode: COMPLIANCE           # default; never GOVERNANCE for PHI
+#     # retentionDays: "2555"                # default 7y
+#   # tiering:                                # optional age-out of inline raw
+#   #   ageDays: "30"
+
 ingress:
   className: alb
   annotations:

@@ -177,7 +177,94 @@ if grep -q '^  name: phi-audit-eval-heartbeat$' "$OUT_DIR/gcp.yaml"; then
 fi
 pass "default: no heartbeat CronJob when evalGate.heartbeat disabled"
 
+heading "[2c/3] raw-evidence WORM store (positive + default-inert)"
+# Default-inert: a standard render must emit NO RAW_EVIDENCE_* env at all.
+for cloud in aws gcp azure; do
+  if grep -q 'RAW_EVIDENCE_' "$OUT_DIR/$cloud.yaml"; then
+    fail "raw-evidence: RAW_EVIDENCE_* env present while rawEvidence.provider unset ($cloud)"
+  fi
+done
+pass "default: no RAW_EVIDENCE_* env when rawEvidence.provider unset (all overlays)"
+
+# S3 (AWS): region reuses llm.aws.region from the overlay; only provider+bucket here.
+RE_S3_OUT="$OUT_DIR/aws-rawevidence-s3.yaml"
+if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+    -f "$CHART_DIR/values.yaml" \
+    -f "$CHART_DIR/values-aws.yaml" \
+    -f "$CI_DIR/values-aws-ci.yaml" \
+    --set rawEvidence.provider=s3 \
+    --set rawEvidence.s3.bucket=phi-audit-raw-evidence-ci >"$RE_S3_OUT" 2>"$OUT_DIR/aws-rawevidence-s3.err"; then
+  grep -q 'RAW_EVIDENCE_PROVIDER' "$RE_S3_OUT" || fail "raw-evidence(s3): RAW_EVIDENCE_PROVIDER not wired"
+  grep -q 'RAW_EVIDENCE_S3_BUCKET' "$RE_S3_OUT" || fail "raw-evidence(s3): bucket not wired"
+  pass "render: aws + rawEvidence.provider=s3 → RAW_EVIDENCE_S3_BUCKET present"
+else
+  cat "$OUT_DIR/aws-rawevidence-s3.err"
+  fail "render: aws + rawEvidence.provider=s3"
+fi
+
+# GCS (GCP): provider + bucket; auth via Workload Identity (no secret).
+RE_GCS_OUT="$OUT_DIR/gcp-rawevidence-gcs.yaml"
+if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+    -f "$CHART_DIR/values.yaml" \
+    -f "$CHART_DIR/values-gcp.yaml" \
+    -f "$CI_DIR/values-gcp-ci.yaml" \
+    --set rawEvidence.provider=gcs \
+    --set rawEvidence.gcs.bucket=phi-audit-raw-evidence-ci >"$RE_GCS_OUT" 2>"$OUT_DIR/gcp-rawevidence-gcs.err"; then
+  grep -q 'RAW_EVIDENCE_GCS_BUCKET' "$RE_GCS_OUT" || fail "raw-evidence(gcs): bucket not wired"
+  pass "render: gcp + rawEvidence.provider=gcs → RAW_EVIDENCE_GCS_BUCKET present"
+else
+  cat "$OUT_DIR/gcp-rawevidence-gcs.err"
+  fail "render: gcp + rawEvidence.provider=gcs"
+fi
+
+# Azure: provider + container; connection string from secretKeyRef (defaults to
+# the session Secret name when rawEvidenceSecret is unset).
+RE_AZ_OUT="$OUT_DIR/azure-rawevidence-blob.yaml"
+if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+    -f "$CHART_DIR/values.yaml" \
+    -f "$CHART_DIR/values-azure.yaml" \
+    -f "$CI_DIR/values-azure-ci.yaml" \
+    --set rawEvidence.provider=azure-blob \
+    --set rawEvidence.azure.container=phi-audit-raw-evidence-ci >"$RE_AZ_OUT" 2>"$OUT_DIR/azure-rawevidence-blob.err"; then
+  grep -q 'RAW_EVIDENCE_AZURE_CONTAINER' "$RE_AZ_OUT" || fail "raw-evidence(azure): container not wired"
+  grep -q 'RAW_EVIDENCE_AZURE_CONNECTION_STRING' "$RE_AZ_OUT" || fail "raw-evidence(azure): connection-string secretKeyRef not wired"
+  grep -q 'raw-evidence-azure-connection-string' "$RE_AZ_OUT" || fail "raw-evidence(azure): connection-string secret key not wired"
+  pass "render: azure + rawEvidence.provider=azure-blob → container + connection-string secretKeyRef present"
+else
+  cat "$OUT_DIR/azure-rawevidence-blob.err"
+  fail "render: azure + rawEvidence.provider=azure-blob"
+fi
+
 heading "[3/3] negative cases (fail-fast validators must trip)"
+
+# Raw-evidence: provider=s3 without a bucket.
+expect_fail "rawevidence-s3-missing-bucket" "rawEvidence.s3.bucket is required" \
+  -f "$CHART_DIR/values.yaml" \
+  -f "$CHART_DIR/values-aws.yaml" \
+  -f "$CI_DIR/values-aws-ci.yaml" \
+  --set rawEvidence.provider=s3
+
+# Raw-evidence: unknown provider.
+expect_fail "rawevidence-bad-provider" "rawEvidence.provider must be one of" \
+  -f "$CHART_DIR/values.yaml" \
+  -f "$CHART_DIR/values-aws.yaml" \
+  -f "$CI_DIR/values-aws-ci.yaml" \
+  --set rawEvidence.provider=glacier
+
+# Raw-evidence: s3 with no resolvable AWS region (gcp overlay has no llm.aws.region).
+expect_fail "rawevidence-s3-no-region" "rawEvidence.provider=s3 needs an AWS region" \
+  -f "$CHART_DIR/values.yaml" \
+  -f "$CHART_DIR/values-gcp.yaml" \
+  -f "$CI_DIR/values-gcp-ci.yaml" \
+  --set rawEvidence.provider=s3 \
+  --set rawEvidence.s3.bucket=b
+
+# Raw-evidence: tiering enabled without an external provider (no-op guard).
+expect_fail "rawevidence-tiering-no-provider" "rawEvidence.tiering.ageDays needs an external rawEvidence.provider" \
+  -f "$CHART_DIR/values.yaml" \
+  -f "$CHART_DIR/values-aws.yaml" \
+  -f "$CI_DIR/values-aws-ci.yaml" \
+  --set rawEvidence.tiering.ageDays=30
 
 # Nightly eval enabled without an eval image.
 expect_fail "eval-missing-image" "evalGate.nightly.image.repository is required" \

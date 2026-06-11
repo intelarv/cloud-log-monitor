@@ -142,6 +142,46 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            # ---- Raw-evidence WORM store (M10.2/M10.3) ----
+            {{- if .Values.rawEvidence.provider }}
+            - { name: RAW_EVIDENCE_PROVIDER, value: {{ .Values.rawEvidence.provider | quote }} }
+            {{- if eq .Values.rawEvidence.provider "s3" }}
+            - { name: RAW_EVIDENCE_S3_BUCKET, value: {{ required "rawEvidence.s3.bucket is required when rawEvidence.provider=s3" .Values.rawEvidence.s3.bucket | quote }} }
+            {{- if .Values.rawEvidence.s3.prefix }}
+            - { name: RAW_EVIDENCE_S3_PREFIX, value: {{ .Values.rawEvidence.s3.prefix | quote }} }
+            {{- end }}
+            {{- if .Values.rawEvidence.s3.objectLockMode }}
+            - { name: RAW_EVIDENCE_OBJECT_LOCK_MODE, value: {{ .Values.rawEvidence.s3.objectLockMode | quote }} }
+            {{- end }}
+            {{- if .Values.rawEvidence.s3.retentionDays }}
+            - { name: RAW_EVIDENCE_RETENTION_DAYS, value: {{ .Values.rawEvidence.s3.retentionDays | quote }} }
+            {{- end }}
+            {{- if and .Values.rawEvidence.s3.region (not .Values.llm.aws.region) (not (and .Values.logSource.enabled (eq .Values.logSource.type "cloudwatch") .Values.logSource.cloudwatch.region)) }}
+            - { name: AWS_REGION, value: {{ .Values.rawEvidence.s3.region | quote }} }
+            {{- end }}
+            {{- else if eq .Values.rawEvidence.provider "gcs" }}
+            - { name: RAW_EVIDENCE_GCS_BUCKET, value: {{ required "rawEvidence.gcs.bucket is required when rawEvidence.provider=gcs" .Values.rawEvidence.gcs.bucket | quote }} }
+            {{- if .Values.rawEvidence.gcs.prefix }}
+            - { name: RAW_EVIDENCE_GCS_PREFIX, value: {{ .Values.rawEvidence.gcs.prefix | quote }} }
+            {{- end }}
+            {{- else if eq .Values.rawEvidence.provider "azure-blob" }}
+            - { name: RAW_EVIDENCE_AZURE_CONTAINER, value: {{ required "rawEvidence.azure.container is required when rawEvidence.provider=azure-blob" .Values.rawEvidence.azure.container | quote }} }
+            {{- if .Values.rawEvidence.azure.prefix }}
+            - { name: RAW_EVIDENCE_AZURE_PREFIX, value: {{ .Values.rawEvidence.azure.prefix | quote }} }
+            {{- end }}
+            - name: RAW_EVIDENCE_AZURE_CONNECTION_STRING
+              valueFrom: { secretKeyRef: { name: {{ include "phi-audit.rawEvidenceSecretName" . }}, key: {{ .Values.secrets.rawEvidenceSecret.key }} } }
+            {{- end }}
+            {{- if .Values.rawEvidence.tiering.ageDays }}
+            - { name: RAW_EVIDENCE_TIER_AGE_DAYS, value: {{ .Values.rawEvidence.tiering.ageDays | quote }} }
+            {{- if .Values.rawEvidence.tiering.intervalMs }}
+            - { name: RAW_EVIDENCE_TIER_INTERVAL_MS, value: {{ .Values.rawEvidence.tiering.intervalMs | quote }} }
+            {{- end }}
+            {{- if .Values.rawEvidence.tiering.batchSize }}
+            - { name: RAW_EVIDENCE_TIER_BATCH_SIZE, value: {{ .Values.rawEvidence.tiering.batchSize | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- end }}
             # ---- Channels ----
             - { name: CHANNEL_RATE_LIMIT_PER_MINUTE, value: {{ .Values.channels.rateLimitPerMinute | quote }} }
             {{- if .Values.channels.slack.enabled }}

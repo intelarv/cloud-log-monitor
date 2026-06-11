@@ -16,19 +16,22 @@ Current milestone: **M13** (deterministic detector slices) on top of the eval su
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL`, `SESSION_SECRET`. **All optional env + the cloud-aware embedder-selection table live in `docs/CONFIGURATION.md`** — one-line summary of each optional subsystem below:
-  - Embedder (`EMBEDDING_PROVIDER`/`DEPLOYMENT_TARGET`/`EMBEDDING_DIM`): featurehash dev default; Bedrock/Vertex/Azure/TEI cloud providers; dim defaults to 256.
-  - Lexical search (`SEARCH_PROVIDER=postgres|opensearch`, M10.1): only the BM25 leg moves to OpenSearch; no `DEPLOYMENT_TARGET` shortcut; redacted-only mirror.
-  - Raw-evidence store (`RAW_EVIDENCE_PROVIDER=database|s3|gcs|azure-blob`, M10.2/M10.3): inline jsonb default vs external WORM (S3 Object Lock / GCS / Azure Blob); `GOVERNANCE` mode warns at boot; break-glass resolves ref with inline fallback.
-  - Raw-evidence tiering (`RAW_EVIDENCE_TIER_AGE_DAYS`/`RAW_EVIDENCE_TIER_INTERVAL_MS`/`RAW_EVIDENCE_TIER_BATCH_SIZE`, M10.4): opt-in leader-locked job that ages already-stored inline raw PHI out of the hot `findings.raw_evidence` column into the active external WORM store (get-after-put before nulling); default-inert unless the age is set AND an external store is active.
-  - Memory eviction (`MEMORY_MAX_EMBEDDINGS_PER_TENANT`/`MEMORY_DECAY_HALF_LIFE_DAYS` def30/`MEMORY_EVICT_INTERVAL_MS` def6h, M10.5): opt-in leader-locked job that bounds the `finding_embeddings` derived pgvector cache by deterministic importance — group-dedup of old/resolved same-`(classification,subclass,source)` findings + per-tenant top-N count cap, never evicting critical+open; one shared `selectEvictions` policy gates both `backfillEmbeddings` (don't create) and eviction (remove) so boot never re-creates what eviction removed; prunes only the derived cache (audit record + lexical leg + break-glass untouched); default-inert unless the cap is set.
-  - Agent/LLM harness limits (`LLM_CALL_TIMEOUT_MS`/`TOOL_CALL_TIMEOUT_MS`/`AGENT_MAX_TOOL_CALLS`/`AGENT_MAX_OUTPUT_TOKENS_PER_TURN`/`AGENT_MAX_LLM_RETRIES`/`AGENT_LLM_RETRY_DELAY_MS`/`AGENT_MAX_TOOL_RESULT_BYTES`): per-call LLM + per-tool-handler hard timeouts, bounded tool budget, per-turn output-token circuit breaker, bounded retry, tool-result clamp; chat turn degrades to a deterministic redacted finding summary (never an error page or raw tool_call JSON) on LLM failure / cost cap / budget exhaustion, recorded as `degraded`/`degrade_reason`/`approx_output_tokens` in the `chat.agent_turn` ledger.
-  - Step-up auth (`STEP_UP_DEV_TOKEN`, dev only).
-  - Notarization (`NOTARIZATION_SECRET` + `NOTARIZATION_RETIRED_KEYS`): separate trust zone; dev fallback + WARN when unset.
-  - Channel adapters (`CHANNEL_*`, M6): Slack / generic HMAC webhook / PagerDuty; inert without config; per-channel severity gating + rate limit.
-  - Cloud LLM runtime (`LLM_PROVIDER=bedrock|vertex|azure-openai`): lazy SDKs; Azure is pure fetch.
-  - Cloud log source (`LOG_SOURCE=cloudwatch`, M8): inert by default; standard AWS credential chain.
-  - Event-bus transport (`LOG_BUS_PROVIDER=memory|kafka|nats`): in-process `InMemoryLogBus` default; real Kafka/Redpanda (`kafkajs`) or NATS JetStream (`nats`) brokers for the `raw.logs` ingest topic, lazy SDKs, at-least-once (handler throw → no-ack → redeliver; ingest dedupes by fingerprint). No `DEPLOYMENT_TARGET` shortcut.
+- Required env: `DATABASE_URL`, `SESSION_SECRET`. **Every optional subsystem — full env vars, defaults, credentials, and the cloud-aware embedder-selection table — is documented in `docs/CONFIGURATION.md` ("Optional env (by subsystem)").** All seams are **default-inert**: unset ⇒ no SDK loaded, no behavior change, eval gate byte-identical. Quick index of the switches (see CONFIGURATION.md for each):
+  - Embedder — `EMBEDDING_PROVIDER` / `DEPLOYMENT_TARGET` / `EMBEDDING_DIM`.
+  - Lexical search (M10.1) — `SEARCH_PROVIDER=postgres|opensearch`.
+  - Raw-evidence store (M10.2/M10.3) — `RAW_EVIDENCE_PROVIDER=database|s3|gcs|azure-blob`.
+  - Raw-evidence tiering (M10.4) — `RAW_EVIDENCE_TIER_AGE_DAYS` (switch) / `_INTERVAL_MS` / `_BATCH_SIZE`.
+  - Raw-evidence write retry — `RAW_EVIDENCE_WRITE_MAX_ATTEMPTS` / `RAW_EVIDENCE_WRITE_BACKOFF_MS` (bounded retry+backoff before the WORM write is declared degraded; default-inert without an external store).
+  - Memory eviction (M10.5) — `MEMORY_MAX_EMBEDDINGS_PER_TENANT` (switch) / `MEMORY_DECAY_HALF_LIFE_DAYS` / `MEMORY_EVICT_INTERVAL_MS`.
+  - Agent/LLM harness limits — `LLM_CALL_TIMEOUT_MS` / `TOOL_CALL_TIMEOUT_MS` / `AGENT_MAX_TOOL_CALLS` / `AGENT_MAX_OUTPUT_TOKENS_PER_TURN` / `AGENT_MAX_LLM_RETRIES` / `AGENT_LLM_RETRY_DELAY_MS` / `AGENT_MAX_TOOL_RESULT_BYTES`.
+  - Step-up auth — `STEP_UP_DEV_TOKEN` (dev only).
+  - Notarization — `NOTARIZATION_SECRET` / `NOTARIZATION_RETIRED_KEYS` (separate trust zone).
+  - Channel adapters (M6) — `CHANNEL_*` (Slack / HMAC webhook / PagerDuty).
+  - NER detector (M13.3) — `NER_PROVIDER=none|aws-comprehend|gcp-dlp|azure-language`.
+  - Cloud LLM runtime — `LLM_PROVIDER=bedrock|vertex|azure-openai`.
+  - A2A cross-cloud mTLS + peer ABAC — `A2A_REQUIRE_MTLS` / `A2A_MTLS_*`.
+  - Cloud log source (M8) — `LOG_SOURCE=cloudwatch`.
+  - Event-bus transport — `LOG_BUS_PROVIDER=memory|kafka|nats`.
 
 ## Stack
 
@@ -41,44 +44,14 @@ Current milestone: **M13** (deterministic detector slices) on top of the eval su
 
 ## Where things live
 
+Full per-component index moved to **`docs/CODE_MAP.md`** (grouped: API server, retrieval/embeddings, raw-evidence storage & lifecycle, LLM runtime, ingestion, detection/redaction, policy/prompts, ledger/notarization/alerting, auth/routes, DB) to keep this file scannable. Top entry points:
+
 - API entry: `artifacts/api-server/src/index.ts` (bootstrap → embedding backfill → chain verify → start chain verifier + notarizer → wire ingest pipeline → listen)
-- Chat agent loop: `artifacts/api-server/src/lib/chat-agent.ts`
-- A2A agent-to-agent protocol (`@a2a-js/sdk`): `artifacts/api-server/src/lib/a2a/` — `protocol.ts` (Zod wire schemas + `AgentInvoker` seam + loopback paths), `auth.ts` (shared-secret bearer + `timingSafeEqual`, dev fallback from `SESSION_SECRET`+WARN), `cards.ts` (Triage/Verifier Agent Cards), `executors.ts` (Triage/Verifier `AgentExecutor`s that parse+strip the inbound finding then wrap `runTriageAgent`/`runVerifierAgent`), `server.ts` (`mountA2AAgents` — card + JSON-RPC routes under `/a2a/triage`,`/a2a/verify`, both behind `a2aAuthMiddleware`), `client.ts` (`A2AAgentInvoker` over loopback handling Message-or-Task results + `inProcessAgentInvoker` test seam + `getAgentInvoker()`). Supervisor calls agents only through `getAgentInvoker()`.
-- AG-UI SSE encoder seam (`@ag-ui/encoder`): `artifacts/api-server/src/lib/sse.ts` (emits official AG-UI `EventType` frames; PHI-safe write seam + heartbeat preserved); dashboard consumer: `artifacts/dashboard/src/pages/chat.tsx` (parses `EventType` from `@ag-ui/core`).
-- Tool registry (MCP-shaped): `artifacts/api-server/src/lib/tools.ts`
-- Hybrid retrieval (BM25 + vector + RRF; `reconcileSearchIndex` boot backfill): `artifacts/api-server/src/lib/search.ts`
-- Pluggable lexical search provider seam + config/factory/registry (M10.1, mirrors embedder-config): `artifacts/api-server/src/lib/search-config.ts` (`PostgresLexicalSearchProvider` default; `LexicalSearchProvider` interface)
-- OpenSearch lexical provider (lazy `@opensearch-project/opensearch`, single shared index w/ mandatory tenant_id term-filter): `artifacts/api-server/src/lib/cloud-search.ts`
-- Pluggable raw-evidence store seam + config/factory/registry + DB default store (M10.2/M10.3, mirrors embedder/search): `artifacts/api-server/src/lib/raw-evidence-store.ts` (`RawEvidenceStore` interface, `RawEvidenceRef {first,latest}`, `DatabaseRawEvidenceStore`)
-- Cloud WORM raw-evidence stores (S3 Object Lock / GCS retention / Azure Blob immutability; lazy SDKs, thin mockable clients, tenant-scoped keys + get-time tenant/bucket check): `artifacts/api-server/src/lib/cloud-raw-evidence-stores.ts`
-- Raw-evidence tiering lifecycle (M10.4, opt-in leader-locked hot→WORM aging job; default-inert unless `RAW_EVIDENCE_TIER_AGE_DAYS` set AND external store active; get-after-put before nulling inline `raw_evidence`; ledgers `raw_evidence.tiered`/`tier_failed` with finding id + provider only): `artifacts/api-server/src/lib/raw-evidence-tiering.ts`
-- Vector-memory consolidation + importance-decay eviction (M10.5, opt-in leader-locked job bounding the `finding_embeddings` derived cache; pure `computeImportance`/`selectEvictions` shared by `backfillEmbeddings` create-gate AND eviction remove-gate so boot never recreates; group-dedup + per-tenant count cap, hard floor on critical+open; default-inert unless `MEMORY_MAX_EMBEDDINGS_PER_TENANT` set; ledgers `memory.evicted`/`memory.evict_failed` with counts + policy params only): `artifacts/api-server/src/lib/memory-eviction.ts`; backfill create-gate lives in `artifacts/api-server/src/lib/search.ts` (`backfillEmbeddings` `memoryPolicy?` opt)
-- Embedder interface + dev embedder: `artifacts/api-server/src/lib/embeddings.ts`
-- Cloud embedders (Bedrock/Vertex/Azure/TEI, lazy-loaded): `artifacts/api-server/src/lib/cloud-embedders.ts`
-- Cloud LLM runtimes + PHI guard wrapper (Bedrock Converse / Vertex generateContent / Azure OpenAI Chat, lazy-loaded): `artifacts/api-server/src/lib/cloud-llm-runtimes.ts`; env factory: `artifacts/api-server/src/lib/llm-runtime-config.ts`
-- Log ingestion (M3): `artifacts/api-server/src/lib/log-source.ts` (LogRecord + LogSource interface + StaticFixtureLogSource; re-exports `CloudwatchLogSource` from cloud-log-sources.ts), `artifacts/api-server/src/lib/log-bus.ts` (LogBus interface + InMemoryLogBus stub for Kafka/NATS), `artifacts/api-server/src/lib/ingest.ts` (detector → redact → fingerprint upsert → ledger), `artifacts/api-server/src/routes/ingest.ts` (`POST /api/admin/ingest/replay` dev/demo trigger)
-- Pluggable event-bus transport seam + config/factory/registry (mirrors embedder/search/raw-evidence factories): `artifacts/api-server/src/lib/log-bus-config.ts` (`LOG_BUS_PROVIDER` env factory, discriminated-union `LogBusConfig`, `getLogBus`/`setLogBus`/`initLogBusFromEnv`/`resetLogBusForTests` registry — lazy-defaults to the in-memory singleton); broker impls in `artifacts/api-server/src/lib/cloud-log-bus.ts` (`BrokerDriver` seam + one `BrokeredLogBus`; `createKafkaDriver` lazy `kafkajs`, `createNatsDriver` lazy `nats` JetStream); wire codec (`encodeLogRecord`/`decodeLogRecord`, Zod-validated) + optional `start?()`/`stop?()` lifecycle live on the `LogBus` interface in `lib/log-bus.ts`.
-- Real CloudWatch Logs source + checkpoint store (M8): `artifacts/api-server/src/lib/cloud-log-sources.ts` (`CloudwatchLogSource` w/ lazy `@aws-sdk/client-cloudwatch-logs`, `DbCheckpointStore` + `InMemoryCheckpointStore`, env-driven `buildCloudwatchSourceFromEnv`), `lib/db/src/schema/log-source-checkpoints.ts` (mutable cursor table — `source_name` PK, `tenant_id`, `last_event_ts` bigint ms, `updated_at`), DDL mirrored in `lib/db/src/setup-sql.ts` so first boot creates the table.
-- Chat agent + LLM runtime seam (M9.5): `artifacts/api-server/src/lib/chat-agent.ts` (`runChatTurn` calls `streamFromRuntime(getLlmRuntime(), ...)`); runtime adapter + `streamFromRuntime` helper in `cloud-llm-runtimes.ts` / `llm-runtime-config.ts`.
-- Inline redaction helper (`redactInline`) + Stage-1 `scanForPhi` + async `scanForPhiWithNer` (Stage-1 ∪ NER): `artifacts/api-server/src/lib/redact.ts`
-- Optional Stage-2 NER detector seam (M13.3 production path; mirrors embedder/search/raw-evidence factories): `artifacts/api-server/src/lib/ner.ts` (`NerProvider` interface + default `NoopNerProvider` + `nerHit`), `artifacts/api-server/src/lib/ner-config.ts` (`NER_PROVIDER` env factory/registry/`initNerProviderFromEnv`/`getNerProviderOrNull`), `artifacts/api-server/src/lib/cloud-ner.ts` (lazy AWS Comprehend / GCP DLP / Azure Language providers). Default-inert; wired into the async ingest detection path only.
-- Embedder factory + env config + registry: `artifacts/api-server/src/lib/embedder-config.ts`
-- Per-agent tool allow-list + tool-arg revalidation: `artifacts/api-server/src/lib/policy.ts`
-- Free-text ledger-payload guard (justification/approval_note/step-up reason): `artifacts/api-server/src/lib/text-policy.ts`
-- Agent prompts (version-pinned): `artifacts/api-server/src/lib/prompts.ts`
-- Ledger writer + chain walk: `artifacts/api-server/src/lib/ledger.ts`
-- Periodic chain verifier + notarization scheduler (per-scope advisory leader lock): `artifacts/api-server/src/lib/chain-verifier.ts`
-- HMAC notarization (canonical-JSON signing, retired-key registry): `artifacts/api-server/src/lib/notarization.ts`
-- Event-type alert routing + post-commit hook: `artifacts/api-server/src/lib/alerts.ts`
-- Mechanical event-type coverage scan: `artifacts/api-server/src/lib/event-type-coverage.test.ts`
-- Channel router + Slack/webhook adapters + dispatch hook (M6): `artifacts/api-server/src/lib/channels/{types,router,dispatch,index,adapters/slack,adapters/webhook}.ts`
-- Session + step-up cookies (HMAC, domain-separated): `artifacts/api-server/src/lib/auth.ts`
-- Step-up + break-glass admin routes: `artifacts/api-server/src/routes/admin.ts`, `artifacts/api-server/src/routes/auth.ts`
-- Ledger admin route (incl. `GET /api/admin/ledger/checkpoints?verify=1`): `artifacts/api-server/src/routes/ledger.ts`
-- Per-user rate limiters (chat, tools, break-glass, step-up): `artifacts/api-server/src/app.ts`
-- DB schema (source of truth): `lib/db/src/schema/*.ts` — `findingSafeColumns` / `FindingSafe` in `findings.ts` is the compile-time gate that keeps `raw_evidence` out of non-break-glass reads.
-- DB setup SQL (RLS, pgvector, FTS, triggers, break-glass grants table, `ledger_checkpoints` + ENABLE ALWAYS triggers, F-CANARY raw backfill): `lib/db/src/setup-sql.ts`
-- Seed (10 findings + canary w/ raw payload + genesis): `lib/db/src/seed.ts`
+- Chat agent loop: `artifacts/api-server/src/lib/chat-agent.ts`; tool registry (MCP-shaped): `artifacts/api-server/src/lib/tools.ts`
+- Ledger writer + chain walk: `artifacts/api-server/src/lib/ledger.ts`; HMAC notarization: `artifacts/api-server/src/lib/notarization.ts`
+- Hybrid retrieval (BM25 + vector + RRF): `artifacts/api-server/src/lib/search.ts`
+- Ingest pipeline (detector → redact → fingerprint upsert → ledger): `artifacts/api-server/src/lib/ingest.ts`
+- DB schema (source of truth): `lib/db/src/schema/*.ts` — `findingSafeColumns` / `FindingSafe` in `findings.ts` is the compile-time gate that keeps `raw_evidence` out of non-break-glass reads; setup SQL (RLS, pgvector, FTS, triggers): `lib/db/src/setup-sql.ts`
 - Threat model: `threat_model.md`
 
 ## Architecture decisions
@@ -139,5 +112,5 @@ _None recorded._
 
 - See `.local/skills/pnpm-workspace/SKILL.md` for workspace structure, TypeScript setup, and package details.
 - Agent continuity / crash-recovery notes (gitignored): `.agent-context.md`.
-- Deployment (M9.1 Helm + Docker, M9.4 Replit deploy path): `deploy/README.md`. Per-cloud overlays: `deploy/helm/phi-audit/values-{aws,gcp,azure}.yaml`. Terraform IaC is **built**: M9.2 `deploy/terraform/modules/postgres` (4 branches) + M9.3 `deploy/terraform/roots/{aws,gcp,azure}` (each consumes the module, emits Helm-overlay values, provisions the notarization key in a separate account/project/subscription). `pnpm run tf:fmt` validates. Deferred: CI/CD, service-mesh mTLS, per-tenant KMS lifecycle.
+- Deployment (M9.1 Helm + Docker, M9.4 Replit deploy path): `deploy/README.md`. Per-cloud overlays: `deploy/helm/phi-audit/values-{aws,gcp,azure}.yaml`. Terraform IaC is **built**: M9.2 `deploy/terraform/modules/postgres` (4 branches) + M9.3 `deploy/terraform/roots/{aws,gcp,azure}` (each consumes the module, emits Helm-overlay values, provisions the notarization key in a separate account/project/subscription). `pnpm run tf:fmt` validates. CI pipeline (`.github/workflows/ci.yml`) runs typecheck / eval-gate / api+dashboard tests / IaC-lint on push + PR. Deferred (cluster/cloud operator policy): service-mesh mTLS enforcement, per-tenant KMS lifecycle — see `deploy/README.md` "Still deferred".
 - Full env + embedder config reference: `docs/CONFIGURATION.md`. Per-milestone history (M0 → M13): `docs/MILESTONES.md`. Architecture + implementation decisions: `docs/ARCHITECTURE.md`.

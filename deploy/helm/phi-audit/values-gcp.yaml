@@ -50,6 +50,20 @@ database:
 logSource:
   enabled: false              # GCP Cloud Logging adapter deferred (see M8 deferred list)
 
+# Raw-evidence WORM store (off by default → inline DB). To push raw PHI into a
+# GCS bucket, uncomment below. WORM on GCS = a LOCKED bucket retention policy
+# (operator-configured + locked so it cannot be shortened); the app only writes
+# objects and never manages the policy. Grant the Workload Identity GSA
+# roles/storage.objectAdmin scoped to the bucket — see deploy/README.md
+# "Bringing up an external WORM store". Install the SDK first:
+#   pnpm --filter @workspace/api-server add @google-cloud/storage
+# rawEvidence:
+#   provider: gcs
+#   gcs:
+#     bucket: phi-audit-raw-evidence-<env>   # with a LOCKED retention policy
+#   # tiering:
+#   #   ageDays: "30"
+
 ingress:
   className: gce
   annotations:

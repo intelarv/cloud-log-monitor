@@ -128,6 +128,12 @@ secrets:
     existingSecret: ""        # defaults to sessionSecret.existingSecret
   llmSecret:
     existingSecret: ""        # defaults to sessionSecret.existingSecret
+  # Holds the Azure Blob connection string for the raw-evidence WORM store
+  # (only consumed when rawEvidence.provider=azure-blob). S3/GCS authenticate
+  # via the pod's cloud identity (IRSA / Workload Identity) and need no secret.
+  rawEvidenceSecret:
+    existingSecret: ""        # defaults to sessionSecret.existingSecret
+    key: raw-evidence-azure-connection-string
 
 # ----------------------------------------------------------------------------
 # LLM runtime selection. See replit.md "Run & Operate" for the precedence
@@ -169,6 +175,47 @@ logSource:
     region: ""
     pollIntervalMs: 5000
     lookbackMs: 300000
+
+# ----------------------------------------------------------------------------
+# Raw-evidence WORM store (M10.2/M10.3). Inert by default → raw evidence stays
+# INLINE in Postgres (`raw_evidence` jsonb, dev-only). Set `provider` to push
+# raw PHI into an external WORM object store. Turning it on is a ONE-LOCATION
+# change: set `provider` + the matching bucket/container in the cloud overlay.
+#
+# The bucket/container AND its LOCKED immutability policy are provisioned
+# out-of-band FIRST — the app is only a least-privileged writer+reader and
+# never manages the lock (threat_model §Tampering). Full provisioning +
+# verification runbook: deploy/README.md "Bringing up an external WORM store".
+#   provider: "s3" | "gcs" | "azure-blob"   (empty → inline database, default)
+# ----------------------------------------------------------------------------
+rawEvidence:
+  provider: ""
+  s3:
+    bucket: ""                # RAW_EVIDENCE_S3_BUCKET (REQUIRED when provider=s3)
+    prefix: ""                # RAW_EVIDENCE_S3_PREFIX (optional; default raw-evidence)
+    # AWS_REGION source: reuses llm.aws.region when set (Bedrock deployments).
+    # Set this ONLY for an S3 store on a deployment with no llm.aws.region — it
+    # emits AWS_REGION for the S3 client.
+    region: ""
+    # Object Lock retain-until mode. COMPLIANCE (default) = not even root can
+    # shorten. GOVERNANCE is bypassable (s3:BypassGovernanceRetention) and logs
+    # a boot WARN — do NOT use for PHI outside an approved, time-boxed exception.
+    objectLockMode: COMPLIANCE   # COMPLIANCE | GOVERNANCE
+    retentionDays: ""            # RAW_EVIDENCE_RETENTION_DAYS (optional; default 2555 = 7y)
+  gcs:
+    bucket: ""                # RAW_EVIDENCE_GCS_BUCKET (REQUIRED when provider=gcs)
+    prefix: ""                # RAW_EVIDENCE_GCS_PREFIX (optional)
+  azure:
+    container: ""             # RAW_EVIDENCE_AZURE_CONTAINER (REQUIRED when provider=azure-blob)
+    prefix: ""                # RAW_EVIDENCE_AZURE_PREFIX (optional)
+    # The connection string is a SECRET — store it in a K8s Secret and point
+    # secrets.rawEvidenceSecret at it (key: raw-evidence-azure-connection-string).
+  # Optional age-out of pre-existing INLINE raw into the external store (M10.4).
+  # Only effective when provider is external. Empty ageDays → tiering disabled.
+  tiering:
+    ageDays: ""               # RAW_EVIDENCE_TIER_AGE_DAYS (switch; empty → off)
+    intervalMs: ""            # RAW_EVIDENCE_TIER_INTERVAL_MS (optional)
+    batchSize: ""             # RAW_EVIDENCE_TIER_BATCH_SIZE (optional)
 
 # ----------------------------------------------------------------------------
 # Channel adapters. Inert by default.
@@ -241,9 +288,14 @@ evalGate:
     # secret: store it in a Secret and reference it here (same secretKeyRef
     # pattern as the CHANNEL_* webhook URLs). Inert when existingSecret is empty.
     # Passed through as HEARTBEAT_PING_URL. See deploy/README.md "External leg".
+    # NOTE: this ping is hit ONLY by the nightly --record run above, so it
+    # REQUIRES evalGate.nightly.enabled=true. Setting existingSecret here while
+    # the nightly job is disabled is rejected at render time (the chart fails
+    # fast) — otherwise the external monitor would never be pinged and would page
+    # "missing" forever / give false cluster-down coverage.
     heartbeatPing:
       existingSecret: ""        # Secret holding the ping URL; empty → no external ping
-      key: heartbeat-ping-url   # key within that Secret
+      key: heartbeat-ping-url   # key within that Secret (required when existingSecret set)
       # Optional request timeout (ms) for the ping; empty → 10000 default.
       # Passed through as HEARTBEAT_PING_TIMEOUT_MS.
       timeoutMs: ""

@@ -30,6 +30,52 @@ unset EVAL_LLM
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+# Per-change external heartbeat (opt-in). When HEARTBEAT_PING_URL is set, this
+# fast, frequent gate becomes its own external dead-man's switch: a --start ping
+# before the run and a success/fail --record after let an external monitor
+# (healthchecks.io / Cronitor) alert when a per-change run begins but never
+# completes (a hung suite, a wedged process, a killed CI runner), distinctly from
+# one that simply never ran. This is the per-change parallel of the nightly job's
+# external leg in eval-gate-llm.sh.
+#
+# Scoped apart from the nightly switch on two axes so the two never cross-signal:
+#   - Identity: EVAL_HEARTBEAT_NAME defaults to "per-change" (the nightly job
+#     uses "nightly"), so each maps to its own external monitor / check.
+#   - Transport: this gate is DB-free (it runs against a placeholder
+#     DATABASE_URL), so the heartbeat is invoked with DATABASE_URL unset — only
+#     the external ping leg runs; no connection is attempted and the in-cluster
+#     row (owned by the nightly job) is never touched.
+# Fully inert when HEARTBEAT_PING_URL is unset (local + default CI runs page
+# nothing), and every heartbeat call is best-effort + non-fatal so it can never
+# block or change the gate result.
+HEARTBEAT="$ROOT/artifacts/api-server/evals/heartbeat.mjs"
+heartbeat_enabled=false
+if [[ -n "${HEARTBEAT_PING_URL:-}" ]]; then
+  heartbeat_enabled=true
+  export EVAL_HEARTBEAT_NAME="${EVAL_HEARTBEAT_NAME:-per-change}"
+  echo "eval-gate: signalling external heartbeat start (gate '${EVAL_HEARTBEAT_NAME}')"
+  env -u DATABASE_URL node "$HEARTBEAT" --start \
+    || echo "eval-gate: heartbeat start errored (non-fatal); see logs above" >&2
+fi
+
 echo "eval-gate: running deterministic eval suites + regression gate"
+# Preserve the gate's exit code so the heartbeat can report pass vs fail before
+# we exit with it.
+set +e
 pnpm --filter @workspace/api-server run eval
-echo "eval-gate: OK"
+gate_status=$?
+set -e
+
+if [[ $gate_status -eq 0 ]]; then
+  echo "eval-gate: OK"
+else
+  echo "eval-gate: gate FAILED (exit ${gate_status})" >&2
+fi
+
+if [[ "$heartbeat_enabled" == true ]]; then
+  echo "eval-gate: recording external heartbeat (exit ${gate_status})"
+  env -u DATABASE_URL node "$HEARTBEAT" --record --exit-code="$gate_status" \
+    || echo "eval-gate: heartbeat record errored (non-fatal); see logs above" >&2
+fi
+
+exit "$gate_status"

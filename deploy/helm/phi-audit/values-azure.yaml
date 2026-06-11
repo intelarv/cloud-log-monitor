@@ -41,6 +41,22 @@ database:
 logSource:
   enabled: false              # Azure Monitor adapter deferred
 
+# Raw-evidence WORM store (off by default → inline DB). To push raw PHI into an
+# Azure Blob container, uncomment below. WORM on Azure = a LOCKED container
+# immutability policy (operator-configured); the app only writes blobs. Auth is
+# a connection string (account key / SAS) held in a Secret — store it in Key
+# Vault and sync via Secrets Store CSI under key
+# `raw-evidence-azure-connection-string`. See deploy/README.md "Bringing up an
+# external WORM store". Install the SDK first:
+#   pnpm --filter @workspace/api-server add @azure/storage-blob
+# rawEvidence:
+#   provider: azure-blob
+#   azure:
+#     container: phi-audit-raw-evidence       # with a LOCKED immutability policy
+# secrets:
+#   rawEvidenceSecret:
+#     existingSecret: phi-audit-raw-evidence  # Secret holding the connection string
+
 ingress:
   className: azure-application-gateway
   annotations:

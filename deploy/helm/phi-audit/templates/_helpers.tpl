@@ -71,6 +71,10 @@ while still allowing per-feature separation in production.
 {{- default .Values.secrets.sessionSecret.existingSecret .Values.secrets.llmSecret.existingSecret -}}
 {{- end -}}
 
+{{- define "phi-audit.rawEvidenceSecretName" -}}
+{{- default .Values.secrets.sessionSecret.existingSecret .Values.secrets.rawEvidenceSecret.existingSecret -}}
+{{- end -}}
+
 {{/*
 Fail-fast validation. Required values that have no safe default.
 */}}
@@ -138,6 +142,33 @@ Fail-fast validation. Required values that have no safe default.
 {{- if eq (len .Values.logSource.cloudwatch.logGroups) 0 -}}{{- fail "logSource.cloudwatch.logGroups is required when logSource.enabled=true" -}}{{- end -}}
 {{- if not .Values.logSource.cloudwatch.region -}}{{- fail "logSource.cloudwatch.region is required when logSource.enabled=true" -}}{{- end -}}
 {{- end -}}
+{{/* Raw-evidence WORM store sanity. Default-inert: only validates once a
+     provider is selected. Turning it on is a one-location overlay change. */}}
+{{- if .Values.rawEvidence.provider -}}
+{{- $p := .Values.rawEvidence.provider -}}
+{{- if not (or (eq $p "s3") (eq $p "gcs") (eq $p "azure-blob")) -}}
+{{- fail (printf "rawEvidence.provider must be one of: s3 | gcs | azure-blob (got %q; empty → inline database default)" $p) -}}
+{{- end -}}
+{{- if eq $p "s3" -}}
+{{- if not .Values.rawEvidence.s3.bucket -}}{{- fail "rawEvidence.s3.bucket is required when rawEvidence.provider=s3 (RAW_EVIDENCE_S3_BUCKET)" -}}{{- end -}}
+{{- if and (not .Values.llm.aws.region) (not .Values.rawEvidence.s3.region) (not (and .Values.logSource.enabled (eq .Values.logSource.type "cloudwatch") .Values.logSource.cloudwatch.region)) -}}
+{{- fail "rawEvidence.provider=s3 needs an AWS region (AWS_REGION). Set llm.aws.region (Bedrock deployments) or rawEvidence.s3.region." -}}
+{{- end -}}
+{{- if and .Values.rawEvidence.s3.objectLockMode (not (or (eq .Values.rawEvidence.s3.objectLockMode "COMPLIANCE") (eq .Values.rawEvidence.s3.objectLockMode "GOVERNANCE"))) -}}
+{{- fail (printf "rawEvidence.s3.objectLockMode must be COMPLIANCE or GOVERNANCE (got %q)" .Values.rawEvidence.s3.objectLockMode) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $p "gcs" -}}
+{{- if not .Values.rawEvidence.gcs.bucket -}}{{- fail "rawEvidence.gcs.bucket is required when rawEvidence.provider=gcs (RAW_EVIDENCE_GCS_BUCKET)" -}}{{- end -}}
+{{- end -}}
+{{- if eq $p "azure-blob" -}}
+{{- if not .Values.rawEvidence.azure.container -}}{{- fail "rawEvidence.azure.container is required when rawEvidence.provider=azure-blob (RAW_EVIDENCE_AZURE_CONTAINER)" -}}{{- end -}}
+{{- if not (include "phi-audit.rawEvidenceSecretName" .) -}}{{- fail "rawEvidence.provider=azure-blob requires secrets.rawEvidenceSecret.existingSecret (or secrets.sessionSecret.existingSecret fallback) holding key raw-evidence-azure-connection-string" -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.rawEvidence.tiering.ageDays (not .Values.rawEvidence.provider) -}}
+{{- fail "rawEvidence.tiering.ageDays needs an external rawEvidence.provider — tiering moves inline raw INTO the WORM store, so it is a no-op without one" -}}
+{{- end -}}
 {{/* Nightly eval gate needs its own (eval-target) image — the slim api runtime
      image has no pnpm/vitest and cannot run the suites. */}}
 {{- if .Values.evalGate.nightly.enabled -}}
@@ -147,5 +178,23 @@ Fail-fast validation. Required values that have no safe default.
 {{- if not .Values.evalGate.nightly.image.tag -}}
 {{- fail "evalGate.nightly.image.tag is required when evalGate.nightly.enabled=true — pin to an immutable SHA tag" -}}
 {{- end -}}
+{{/* The heartbeat ping URL is hit ONLY by the nightly --record run, so a
+     missing `key` would render a broken secretKeyRef (the container would fail
+     to start). Catch it here while the nightly job is actually enabled. */}}
+{{- if and .Values.evalGate.nightly.heartbeatPing.existingSecret (not .Values.evalGate.nightly.heartbeatPing.key) -}}
+{{- fail "evalGate.nightly.heartbeatPing.key is empty but heartbeatPing.existingSecret is set — the external-ping secretKeyRef would be incomplete. Set heartbeatPing.key to the key holding the ping URL (default: heartbeat-ping-url)." -}}
+{{- end -}}
+{{- end -}}
+{{/* External outage-ping misconfiguration guard. The heartbeat ping URL is hit
+     ONLY by the nightly job's --record leg; configuring it while the nightly job
+     is DISABLED yields a permanently-silent external monitor — it is never
+     pinged, so it pages "missing" forever (or, worse, lulls you into believing
+     cluster-down is covered when nothing will ever ping it). This is the one
+     failure the in-cluster checker cannot see, so a dead external monitor is a
+     real gap, not cosmetic. Fail fast so it is caught at install, not mid-
+     incident. Fully inert when heartbeatPing.existingSecret is empty (the
+     default — no external ping configured). */}}
+{{- if and .Values.evalGate.nightly.heartbeatPing.existingSecret (not .Values.evalGate.nightly.enabled) -}}
+{{- fail "evalGate.nightly.heartbeatPing.existingSecret is set but evalGate.nightly.enabled=false — only the nightly --record run ever pings that URL, so the external dead-man's switch would never fire and on-call would have no cluster-down coverage. Enable the nightly job (evalGate.nightly.enabled=true + its eval image), or clear heartbeatPing.existingSecret to opt out of the external ping." -}}
 {{- end -}}
 {{- end -}}

@@ -1,6 +1,6 @@
 # Deployment (M9)
 
-Two deployment paths today: container/Kubernetes via **M9.1** (Helm + Docker) and Replit via **M9.4**. Per-cloud IaC is built — **M9.2** ships the provider-abstracted `modules/postgres`, and **M9.3** ships the three per-cloud Terraform roots under `roots/{aws,gcp,azure}/` (each consumes the M9.2 module and emits values for the M9.1 Helm overlays). Still deferred (operator policy, not application code): CI/CD pipelines, service-mesh mTLS, and per-tenant KMS-key lifecycle automation.
+Two deployment paths today: container/Kubernetes via **M9.1** (Helm + Docker) and Replit via **M9.4**. Per-cloud IaC is built — **M9.2** ships the provider-abstracted `modules/postgres`, and **M9.3** ships the three per-cloud Terraform roots under `roots/{aws,gcp,azure}/` (each consumes the M9.2 module and emits values for the M9.1 Helm overlays). A repo-level **CI pipeline** (`.github/workflows/ci.yml`) now runs the existing typecheck / eval-gate / test / IaC-lint gates on every push + PR (see "CI/CD pipeline" below). Still deferred (cluster + cloud operator policy, not application code): service-mesh mTLS enforcement and per-tenant KMS-key lifecycle automation.
 
 ## Layout
 
@@ -222,6 +222,29 @@ closes that gap:
   and generic webhooks have no resolve concept, so a healthy check posts nothing
   to them. Set `CHANNEL_PAGERDUTY_DEDUP_KEY` to pin a custom key (it applies to
   both the trigger and the resolve so they still match).
+- **In-cluster hung-run detection (fast signal).** The staleness check above only
+  fires a full interval after a run *should* have completed. To catch a run that
+  *began but wedged* (a hung suite, an LLM call stuck past its timeout, a pod
+  killed mid-run) without waiting that long, the nightly job also stamps a
+  `last_start_at` marker via `heartbeat.mjs --start` *before* the eval run, and
+  `--check` pages a `high`-severity *“eval run hung”* alert when a start is older
+  than `EVAL_HEARTBEAT_MAX_RUN_MINUTES` (default 120) with no completion at or
+  after it. This is the in-cluster parallel of the external start/success signals
+  below, so hung-run coverage no longer depends on an external monitor being
+  configured. It reuses the **same** `CHANNEL_*` config + severity gating and the
+  **same** PagerDuty liveness dedup key as the staleness alert — a hung run and a
+  quiet job are both *“the nightly mechanism is unhealthy”*, so they fold into one
+  incident whose summary reflects the current cause, and the same recovery
+  `resolve` clears it when a later run completes. The payload is liveness metadata
+  only (gate name, start/last-success timestamps, run age) — no scores, no PHI.
+  Set `EVAL_HEARTBEAT_MAX_RUN_MINUTES` above the longest legitimate run (the LLM
+  suites dominate) plus scheduling slack so a slow-but-healthy run never
+  false-pages. Hung detection needs the durable row, so it requires `DATABASE_URL`
+  on both the nightly (`--start`) and checker (`--check`) jobs; a pre-upgrade row
+  with no `last_start_at`, or any deployment that never calls `--start`, is never
+  hung and behaves exactly as before (`ADD COLUMN IF NOT EXISTS` migrates the
+  table in place, and the original `last_success_at NOT NULL` is relaxed so a
+  start-only row is legal).
 
 Enable it alongside the nightly gate (it reuses the same `eval` image, the same
 DB sidecar, and needs no LLM/embedder config):
@@ -289,6 +312,21 @@ pings), on-call is still paged from outside.
   the in-cluster checker gives a fast, channel-native page for the common cases;
   the external monitor is the only thing that can page when the cluster itself
   is down, or when a run hangs mid-flight.
+- **Per-change gate signalling.** The fast, deterministic per-change gate
+  (`eval-gate.sh`, the `eval-gate` validation command) also fires the same
+  `--start` / `--record --exit-code` pair when `HEARTBEAT_PING_URL` is set, so a
+  per-change run that begins but never completes (a hung suite, a killed CI
+  runner) pages an external monitor fast, just like the nightly job. It is
+  scoped apart from the nightly switch so the two never cross-signal:
+  `EVAL_HEARTBEAT_NAME` defaults to **`per-change`** (the nightly job uses
+  `nightly`), giving each its own external monitor/check, and because the
+  per-change gate is DB-free it runs the heartbeat with `DATABASE_URL` unset — so
+  **only** the external ping leg fires and the in-cluster row (owned by the
+  nightly job) is never touched. Point a *separate* external monitor — tuned to
+  your per-change cadence, not the 24h nightly one — at this gate's
+  `HEARTBEAT_PING_URL`. Fully inert when `HEARTBEAT_PING_URL` is unset (local +
+  default CI runs page nothing), and every call is best-effort + non-fatal so it
+  can never block or change the gate result.
 
 On the Helm path, turn the external ping on by pointing the **nightly** job at a
 Secret holding the ping URL (it carries a per-check token, so it's a secret —
@@ -342,7 +380,36 @@ Where unredacted raw evidence (PHI / secrets) is persisted is pluggable via `RAW
 
 There is **no `DEPLOYMENT_TARGET` shortcut** (same reasoning as search): moving raw PHI to an object store is always explicit — every store needs a bucket/container, and a bare cloud target must never silently start writing unredacted PHI to an unprovisioned location.
 
-How it works: when an external store is active, ingest writes each occurrence's raw payload as an immutable object (key `<prefix>/<tenant>/<finding>/<uuid>.json`) and records `{first, latest}` object URIs in the new `findings.raw_evidence_ref` jsonb column; the `raw_evidence` column stays NULL. The break-glass read path (`GET /api/admin/findings/:id/raw`) resolves the ref through the store, which re-validates tenancy + bucket on the URI before fetching. PHI safety: `raw_evidence_ref` is excluded from `findingSafeColumns` (compile-time gate) and the `findings_redacted` view, so it is reachable only via the step-up-gated break-glass endpoint — exactly like `raw_evidence`. A failed external write leaves the finding committed but the ref NULL (logged at error level); break-glass then reports `raw_unresolved` rather than fabricating a payload. The schema column is additive (`ADD COLUMN IF NOT EXISTS`); switching providers is forward-only (objects already written under one provider are not migrated).
+How it works: when an external store is active, ingest writes each occurrence's raw payload as an immutable object (key `<prefix>/<tenant>/<finding>/<uuid>.json`) and records `{first, latest}` object URIs in the new `findings.raw_evidence_ref` jsonb column; the `raw_evidence` column stays NULL. The break-glass read path (`GET /api/admin/findings/:id/raw`) resolves the ref through the store, which re-validates tenancy + bucket on the URI before fetching. PHI safety: `raw_evidence_ref` is excluded from `findingSafeColumns` (compile-time gate) and the `findings_redacted` view, so it is reachable only via the step-up-gated break-glass endpoint — exactly like `raw_evidence`. A failed external write leaves the finding committed but does not advance `raw_evidence_ref` for that occurrence (NULL for a first occurrence; the prior `{first, latest}` retained for a later one), logged at error level; break-glass then reports `raw_unresolved` for an unresolvable ref rather than fabricating a payload. The schema column is additive (`ADD COLUMN IF NOT EXISTS`); switching providers is forward-only (objects already written under one provider are not migrated).
+
+### Bringing up an external WORM store (provisioning + verification runbook)
+
+Everything code-side is already built and default-inert; turning it on is an **ops** task. The app is deliberately a least-privileged *writer + reader* — it never provisions, locks, or weakens the WORM policy. That separation is the control (`threat_model.md §Tampering`: "the writer role MUST NOT have permissions to disable Object Lock or change retention"), so the bucket/container and its immutability policy are provisioned out-of-band first, then the app is pointed at it.
+
+**Step 1 — Provision the WORM bucket/container (cloud-side, one-time).** Do NOT grant the app's identity any policy-management permission in any of these.
+
+- **S3** — Create the bucket with **Object Lock enabled at creation** (it cannot be enabled afterward) and versioning on. The app stamps each object's `ObjectLockMode`/`ObjectLockRetainUntilDate` per-PUT from `RAW_EVIDENCE_OBJECT_LOCK_MODE` (default `COMPLIANCE`) + `RAW_EVIDENCE_RETENTION_DAYS` (default 2555 = 7y); a bucket **default retention** is a good backstop but the app does not depend on it. Use **COMPLIANCE** in production — `GOVERNANCE` is bypassable via `s3:BypassGovernanceRetention` and the app logs a WARN at boot if selected.
+- **GCS** — Create the bucket, set a **retention policy**, then **lock it** (`gcloud storage buckets update gs://<bucket> --retention-period=<e.g. 7y>` followed by `--lock-retention-policy`; locking is irreversible). The app writes objects normally and never manages the policy.
+- **Azure Blob** — Create the container and apply a **locked time-based immutability policy** (a locked policy cannot be shortened or removed). The app writes blobs normally.
+
+**Step 2 — Grant the app least-privilege identity.** Write + read only, never lock-management:
+
+- **S3**: `s3:PutObject` + `s3:GetObject` on `<bucket>/<prefix>/*`, **plus `s3:PutObjectRetention`** — the app sets `ObjectLockMode`/`ObjectLockRetainUntilDate` *on the PUT*, and AWS requires `s3:PutObjectRetention` to accept those headers, so it must be **granted, not denied**. Under `COMPLIANCE` mode the retain-until stamped at write cannot be shortened by anyone (not even root), so granting it does not let the writer weaken WORM. What must be **denied / omitted** is everything that could weaken the lock itself: `s3:BypassGovernanceRetention`, `s3:DeleteObject*`, `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`. Region comes from `AWS_REGION`; credentials via the platform's normal AWS auth (IRSA on EKS — no static keys).
+- **GCS**: `storage.objects.create` + `storage.objects.get` on the bucket (e.g. a custom role, not `roles/storage.admin`); **omit** `storage.buckets.update`. Auth via ADC / Workload Identity.
+- **Azure**: blob read/write scoped to the container (e.g. *Storage Blob Data Contributor* on the container); the connection string in `RAW_EVIDENCE_AZURE_CONNECTION_STRING` must **not** be an account-management credential.
+
+**Step 3 — Install the one SDK + set env, then restart.** Install only the SDK for the store you enable (they are optional deps): `pnpm --filter @workspace/api-server add @aws-sdk/client-s3` (or `@google-cloud/storage` / `@azure/storage-blob`). Set `RAW_EVIDENCE_PROVIDER` + that provider's required vars (see the bullets above). Boot logs `Raw-evidence store initialized {provider, external:true}` — if you see `external:false` the env did not take.
+
+> **On Kubernetes this is a one-location change in the Helm overlay** — set `rawEvidence.provider` + the matching `rawEvidence.{s3,gcs,azure}.*` knobs in `values-{aws,gcp,azure}.yaml` (commented examples ship in each overlay; full reference in `values.yaml`). The chart emits exactly the `RAW_EVIDENCE_*` env above onto the api Deployment, fails fast on a missing bucket/container/region, and wires the Azure connection string from `secrets.rawEvidenceSecret` (S3/GCS use the pod's IRSA / Workload Identity). Default-inert: with `provider` unset the chart emits no `RAW_EVIDENCE_*` env at all. `deploy/scripts/helm-matrix.sh` renders + validates all three providers.
+
+**Step 4 — Verify the full path end-to-end (staging / preview, synthetic findings only — `threat_model.md §Dev-vs-Production` forbids real PHI outside production).**
+
+1. **New ingest lands in the store.** Trigger a synthetic finding (`POST /api/admin/ingest/replay`) and confirm a `<prefix>/<tenant>/<finding>/<uuid>.json` object appears in the bucket/container. In the DB the finding's `raw_evidence_ref` is populated and `raw_evidence` is NULL (the safe projection still hides both).
+2. **Break-glass reads it back.** Grant a break-glass grant for that finding, then `GET /api/admin/findings/:id/raw`. The response resolves the payload and the ledger `break_glass.raw_phi_accessed` records `raw_source: "external_store"`, `raw_resolved: true`, `raw_fallback_used: false` (a degraded inline read also emits a separate `break_glass.raw_fallback_used`). A `raw_unresolved` reason instead means the payload could not be produced — most often the object write failed at ingest (check Step 2/3 perms), but also a resolver-side cause: a malformed `raw_evidence_ref`, no/ wrong store configured to resolve it, or a store outage. It is not a reader-auth bug (the grant already passed).
+3. **Immutability actually holds.** From the app's own identity, attempt to overwrite or delete one of the written objects and confirm it is **denied** by the WORM policy. This is the real proof that retention is locked and the writer cannot weaken it; do it once per environment.
+4. **(Optional) Age inline → WORM.** Only after Steps 1–3 pass, enable `RAW_EVIDENCE_TIER_AGE_DAYS` to migrate pre-existing *inline* raw into the store (see "Operating the two maintenance jobs" below). Tiering verifies get-after-put before nulling the inline copy, so a misconfigured store fails closed (inline preserved, `raw_evidence.tier_failed` ledgered) rather than losing evidence.
+
+**Rollback / caveats.** Switching providers is **forward-only** — objects already written under one provider are not migrated, and the inline read-fallback only covers rows whose inline `raw_evidence` was never tiered away. To revert to `database`, unset `RAW_EVIDENCE_PROVIDER` and restart; new ingests go back inline, but findings whose raw already lives in the WORM store become unreadable via break-glass until the store is re-enabled (the objects are immutable and intact — this is a *config* rollback, not data loss). Never delete the bucket to "clean up": the retention lock will refuse it, by design.
 
 ## HPA caveat
 
@@ -394,7 +461,66 @@ Runnable examples: `deploy/terraform/examples/{aws,gcp,azure,self-hosted}/main.t
 
 Local validation: `pnpm run tf:fmt` (or `deploy/scripts/tf-fmt-check.sh`) runs `tofu fmt -recursive -check -diff`. The heavier `tofu validate` requires `tofu init`, which downloads ~500 MB of cloud provider plugins; that runs in CI on a cached runner, not on every commit. The script auto-detects `tofu`, `terraform`, or a locally-installed `.local/bin/tofu` in that order; on a runner that has none it exits 0 with a "skipping" log so it doesn't break unrelated CI.
 
-## Not built yet (deferred to M9.3)
+## CI/CD pipeline (GitHub Actions)
 
-- Terraform root modules per cloud (EKS / GKE / AKS + IAM wiring + KMS for `NOTARIZATION_SECRET` in a separate account / project / tenant). M9.2's module becomes a sub-module call from each root.
-- CI/CD pipeline definitions (operator policy, deliberately out of scope).
+`.github/workflows/ci.yml` runs the repo's existing gates on every push to `main` and every pull request, in three jobs. It invokes only commands already proven locally — it adds no new check, just wires them to a hosted runner:
+
+- **quality** — `pnpm run typecheck` (all libs + leaf packages), `pnpm run eval:gate` (the six credential-free eval suites + the regression gate vs `evals/baseline.json`), and the dashboard vitest suite. No database, no secrets.
+- **api-server-tests** — the api-server vitest suite against a `pgvector/pgvector:pg16` service container; `bootstrap()` creates the `vector` extension + schema idempotently, so a blank database suffices. `DATABASE_URL` points at the service; `SESSION_SECRET` is a CI-only throwaway (never a production key).
+- **infra-lint** — `pnpm run tf:fmt` (OpenTofu `fmt -check`) + `pnpm run helm:matrix` (lint + render all three cloud overlays), with `tofu` and `helm` installed via their official setup actions.
+
+The LLM/DB-backed eval suites (`pnpm run eval:gate:llm`) stay opt-in and are **not** run here, keeping CI credential-free and byte-identical to local `eval:gate` runs. Deliberately left to operator policy (they depend on the org's registry, cloud accounts, and release process): branch-protection / required-status-check configuration, signed-image build+publish, and deploy automation.
+
+## Still deferred (cluster + cloud operator policy)
+
+These two remain out of the application repo because they cannot be meaningfully built **or validated** inside it / the dev environment — they are live-cluster and cloud-account concerns:
+
+- **Service-mesh mTLS enforcement.** The *application-layer* A2A mTLS transport seam is already built and default-inert (`A2A_REQUIRE_MTLS` + `A2A_MTLS_*` peer ABAC — see `replit.md` and `threat_model.md §EoP`). What remains is *mesh-level* enforcement: Istio/Linkerd `PeerAuthentication: STRICT`, automatic sidecar injection, and SPIFFE workload identities. That is mesh-specific YAML applied to a running cluster with no in-repo validation path, so it stays an operator deliverable.
+- **Per-tenant KMS-key lifecycle.** Per-tenant customer-managed-key provisioning, rotation, and revocation across AWS KMS / GCP KMS / Azure Key Vault. This needs real cloud accounts plus a tenancy + billing model decision, and even `tofu validate` requires `tofu init`'s ~500 MB of provider plugins + cloud auth — none of which exists here. The single-key foundation (storage CMK in `modules/postgres`, notarization key in the M9.3 roots) is built; per-tenant fan-out is operator IaC.
+
+## Operating the two maintenance jobs (runbook)
+
+Two periodic, **leader-locked, default-inert** jobs bound the system's storage footprint. Both are wired at boot (`artifacts/api-server/src/index.ts` Steps 4.7 + 4.8) and stay completely off — nothing scheduled, eval gate byte-identical — until their switch env is set. Their *mechanism* is in `docs/CONFIGURATION.md` ("Optional env (by subsystem)") and `docs/ARCHITECTURE.md`; this is the operator how-to.
+
+### What they do (one line each)
+
+- **Raw-evidence tiering** (M10.4, `raw-evidence-tiering.ts`) — ages already-stored *inline* raw PHI (`findings.raw_evidence`) out into the external WORM store once a finding is older than the age window, verifying the WORM object is readable (get-after-put) before nulling the inline copy. Closes the gap that `RAW_EVIDENCE_PROVIDER` only routes *new* ingests.
+- **Memory eviction** (M10.5, `memory-eviction.ts`) — bounds the derived `finding_embeddings` pgvector cache (consolidates old/resolved duplicates + per-tenant top-N count cap), never evicting a critical+open finding, never touching the append-only audit record.
+
+### Preconditions
+
+- **Tiering needs an external WORM store.** It is inert in *two* layers: it schedules only when `RAW_EVIDENCE_TIER_AGE_DAYS` is set **AND** `RAW_EVIDENCE_PROVIDER` is an external store (`s3` / `gcs` / `azure-blob`). With the inline `database` store there is no tier to age into — boot logs a WARN and stays inert. So enable WORM storage first (see the raw-evidence storage section above), confirm new ingests land in the bucket, then turn tiering on.
+- **Eviction needs nothing external.** It operates purely on the local pgvector cache; setting the cap is sufficient.
+
+### Enable
+
+Set on the api-server (operator secret store / Helm values / Replit Deployment env), then restart:
+
+| Job | Switch (required) | Tunables (optional, with defaults) |
+| --- | --- | --- |
+| Raw-evidence tiering | `RAW_EVIDENCE_TIER_AGE_DAYS` (e.g. `30`) | `RAW_EVIDENCE_TIER_INTERVAL_MS` (1h), `RAW_EVIDENCE_TIER_BATCH_SIZE` (100/tenant/run) |
+| Memory eviction | `MEMORY_MAX_EMBEDDINGS_PER_TENANT` (e.g. `5000`) | `MEMORY_DECAY_HALF_LIFE_DAYS` (30), `MEMORY_EVICT_INTERVAL_MS` (6h) |
+
+A non-positive / non-numeric value for any of these **throws at boot** (fail-fast, never silently disabled). Both jobs are leader-locked by their own Postgres advisory key, so it is safe to set the env fleet-wide — exactly one pod runs each job per cadence regardless of replica count.
+
+### Verify it's running
+
+Both jobs ledger every run — `raw_evidence.tiered` / `raw_evidence.tier_failed` and `memory.evicted` / `memory.evict_failed`. **None of these payloads ever carries PHI, raw evidence, or object-store URIs.** The two payload shapes differ, and that distinction matters when reading the audit trail vs. the dashboard:
+
+- **Tiering events** carry the `finding_id` (plus the provider name, and on failure an error name) — they record *which* finding was migrated, so a single migration is auditable end-to-end. They do not carry the raw evidence or the WORM object URI (that lives in `raw_evidence_ref`, outside `findingSafeColumns`).
+- **Eviction events** carry only counts + policy parameters — never a finding id, snippet, or the embedding content.
+- The **dashboard / metrics API aggregates** all four into per-job *counts only* (no finding ids), which is what an operator watches day-to-day.
+
+Where to look:
+
+1. **Dashboard → Admin → "Cache-pruning Maintenance" panel.** Shows per-job run counts, embeddings evicted / findings tiered, failures (red when > 0), and last-run time. "Never run" + zeros means the job has not fired for your tenant yet (expected immediately after enabling, until the first cadence elapses and there is eligible data).
+2. **API:** `GET /api/admin/metrics/maintenance` (the panel's data source) — tenant-scoped, requires a session; returns the aggregated counts.
+3. **Raw audit trail:** the ledger itself, where each individual `raw_evidence.tiered` entry (with its `finding_id`) and each `memory.evicted` entry (with its counts) is recorded for per-event review.
+
+Because the cadences are long (tiering 1h, eviction 6h by default) and only act on *eligible* rows (findings older than the age window / a cache over the cap), expect the panel to stay at zero until both the cadence has elapsed and there is qualifying data. To observe a run quickly in a non-prod environment, lower `*_INTERVAL_MS` and the age/cap.
+
+### Troubleshoot
+
+- **`failures` climbing on tiering** (`raw_evidence.tier_failed`) — a put/get/verify against the WORM store failed; the inline copy is preserved (nothing lost) and the row retries next cadence. This usually signals the same object-store outage that is also failing ingest writes — check store credentials / bucket policy / Object-Lock config. Break-glass reads are unaffected (they resolve `raw_evidence_ref` first, inline fallback otherwise).
+- **`failures` on eviction** (`memory.evict_failed`) — embeddings were left intact and retried next cadence; only the *vector* retrieval leg is affected (BM25 + break-glass still work). Check DB health / the pgvector extension.
+- **Panel stays at zero after enabling** — confirm the switch env is actually set on the api-server process (not just declared), that tiering also has an external `RAW_EVIDENCE_PROVIDER` (check boot logs for the inline-store WARN), and that enough wall-clock time + eligible data exist.

@@ -33,6 +33,118 @@ export interface SetupSqlOptions {
    * Validated to be a positive integer ≤ 16000 (pgvector max).
    */
   embeddingDim?: number;
+  /**
+   * M12.2: when true, finding_embeddings is LIST-partitioned by tenant_id with
+   * a DEFAULT partition (per-tenant pgvector namespaces — threat_model §Info
+   * Disclosure "per-tenant pgvector namespaces"). Default false ⇒ the original
+   * single-table layout, byte-identical to pre-M12.2 (default-inert). Opt-in via
+   * EMBEDDINGS_TENANT_PARTITIONING; see embeddings-partition-config.ts.
+   */
+  tenantPartitioning?: boolean;
+}
+
+// M12.2: the finding_embeddings DDL, single-table variant. KEEP byte-identical
+// to the pre-M12.2 inline SQL — it is the default path the eval gate depends on.
+function singleEmbeddingsDdl(dim: number): string {
+  return `-- M1: vector embeddings table for findings. One row per finding, tenant-scoped
+-- and RLS-isolated like the parent table. Vector dim is interpolated from
+-- EMBEDDING_DIM and must match the configured embedder. Changing dim requires
+-- DROP + recreate of this table (it's a cache; backfill rebuilds it).
+CREATE TABLE IF NOT EXISTS finding_embeddings (
+  finding_id text PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
+  tenant_id text NOT NULL,
+  content text NOT NULL,
+  embedding vector(${dim}) NOT NULL,
+  embedder_version text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS finding_embeddings_tenant_idx
+  ON finding_embeddings (tenant_id);
+
+-- ivfflat for cosine. M1 has only ~10 rows so a sequential scan beats the
+-- index, but creating it now means production scale-up needs no schema work.
+-- 'lists=10' is fine for tiny corpora; tune at scale.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'finding_embeddings_vec_idx'
+  ) THEN
+    EXECUTE 'CREATE INDEX finding_embeddings_vec_idx ON finding_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10)';
+  END IF;
+END $$;
+
+ALTER TABLE finding_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finding_embeddings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON finding_embeddings;
+CREATE POLICY tenant_isolation ON finding_embeddings
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));`;
+}
+
+// M12.2: the finding_embeddings DDL, LIST-partitioned-by-tenant variant.
+function partitionedEmbeddingsDdl(dim: number): string {
+  return `-- M12.2 (opt-in EMBEDDINGS_TENANT_PARTITIONING): finding_embeddings is
+-- LIST-partitioned by tenant_id (per-tenant pgvector namespaces). A DEFAULT
+-- partition catches every tenant without a dedicated partition, so retrieval is
+-- identical to the single-table layout until an operator provisions a per-tenant
+-- partition (provisionTenantEmbeddingPartition). finding_embeddings is a DERIVED
+-- cache (boot backfill rebuilds every row), so the one-time conversion from the
+-- old single table just drops + recreates it. Idempotent: skipped once already
+-- partitioned. The PK is composite (finding_id, tenant_id) because a partition
+-- key column must be part of every unique constraint.
+DO $$
+DECLARE
+  tbl_exists boolean;
+  is_partitioned boolean;
+BEGIN
+  SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'finding_embeddings')
+    INTO tbl_exists;
+  SELECT EXISTS (
+    SELECT 1 FROM pg_partitioned_table pt
+    JOIN pg_class c ON c.oid = pt.partrelid
+    WHERE c.relname = 'finding_embeddings'
+  ) INTO is_partitioned;
+  IF tbl_exists AND NOT is_partitioned THEN
+    DROP TABLE finding_embeddings CASCADE;
+    tbl_exists := false;
+  END IF;
+  IF NOT tbl_exists THEN
+    CREATE TABLE finding_embeddings (
+      finding_id text NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+      tenant_id text NOT NULL,
+      content text NOT NULL,
+      embedding vector(${dim}) NOT NULL,
+      embedder_version text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (finding_id, tenant_id)
+    ) PARTITION BY LIST (tenant_id);
+    CREATE TABLE finding_embeddings_default PARTITION OF finding_embeddings DEFAULT;
+  END IF;
+END $$;
+
+-- btree on the parent propagates to every partition automatically.
+CREATE INDEX IF NOT EXISTS finding_embeddings_tenant_idx
+  ON finding_embeddings (tenant_id);
+
+-- ivfflat is created per-PARTITION: pgvector cannot build an ivfflat/hnsw index
+-- on a partitioned PARENT. The DEFAULT partition gets one here;
+-- provisionTenantEmbeddingPartition() adds one to each dedicated partition.
+CREATE INDEX IF NOT EXISTS finding_embeddings_default_vec_idx
+  ON finding_embeddings_default USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
+
+-- RLS on the parent governs every parent-routed query (all application access
+-- goes through finding_embeddings, never a partition directly). The DEFAULT
+-- partition additionally gets ENABLE/FORCE so any direct access is deny-by-
+-- default (no policy = no rows visible).
+ALTER TABLE finding_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finding_embeddings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON finding_embeddings;
+CREATE POLICY tenant_isolation ON finding_embeddings
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+ALTER TABLE finding_embeddings_default ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finding_embeddings_default FORCE ROW LEVEL SECURITY;`;
 }
 
 export function buildSetupSql(opts: SetupSqlOptions = {}): string {
@@ -42,6 +154,9 @@ export function buildSetupSql(opts: SetupSqlOptions = {}): string {
       `buildSetupSql: embeddingDim must be a positive integer ≤ 16000, got ${dim}`,
     );
   }
+  const embeddingsBlock = opts.tenantPartitioning
+    ? partitionedEmbeddingsDdl(dim)
+    : singleEmbeddingsDdl(dim);
   return `
 -- M1: pgvector for semantic retrieval. Embeddings of redacted finding evidence
 -- live in finding_embeddings; the embedder used in dev is a deterministic
@@ -78,6 +193,27 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS agent_review_status text NOT NULL 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS triage_verdict jsonb;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS verifier_verdict jsonb;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS last_agent_review_at timestamptz;
+-- Monotonic per-finding review-attempt counter (added idempotently). Bumped by
+-- the CAS pending -> in_progress in acquireFinding so each (re)start of a
+-- finding's review gets a distinct attempt number that the supervisor folds
+-- into every per-step ledger idempotency key — making a manual operator replay
+-- (reset to 'pending' + re-enqueue) re-run the LLM fresh, while a transient
+-- same-execution auto-retry keeps the same attempt and stays exactly-once.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS agent_review_attempt integer NOT NULL DEFAULT 0;
+
+-- Per-step idempotency key for retryable ledger writes (e.g. the agent review
+-- steps under Temporal auto-retry). Added idempotently so a DB seeded under an
+-- earlier milestone upgrades cleanly. NULL for ordinary one-shot writes; a
+-- stable "workflowId:step" token for retryable steps so a retried activity
+-- that already landed its ledger entry is deduped instead of writing a
+-- duplicate audit record. NOT part of the ledger hash, so the chain stays
+-- byte-identical. The unique index lets multiple NULLs coexist (Postgres treats
+-- NULLs as distinct) and only constrains keyed rows. This is an ALTER/CREATE
+-- INDEX (DDL), not a row UPDATE/DELETE, so the append-only triggers below do
+-- not fire. See artifacts/api-server/src/lib/agents/review-steps.ts.
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS idempotency_key text;
+CREATE UNIQUE INDEX IF NOT EXISTS ledger_idempotency_key_uniq
+  ON ledger_entries (idempotency_key);
 
 -- M1.6: one-shot idempotent backfill of the canary row's raw_evidence so a
 -- DB seeded before M1.6 still demos the break-glass-read path. Targets
@@ -138,11 +274,38 @@ CREATE INDEX IF NOT EXISTS bg_grants_tenant_user_idx
 CREATE INDEX IF NOT EXISTS bg_grants_lookup_idx
   ON break_glass_grants (tenant_id, user_id, finding_id, expires_at);
 
+-- HITL remediation proposals. Tenant-scoped, RLS-isolated. UPDATE is permitted
+-- (the pending -> confirmed/rejected decision transition); DELETE is not enforced
+-- at the DB level because every proposal's creation is *already* in the
+-- immutable ledger (remediation.proposed event) -- losing the row cannot hide it
+-- from auditors. See lib/db/src/schema/remediation.ts + threat_model EoP
+-- "HITL gates on write actions".
+CREATE TABLE IF NOT EXISTS remediation_proposals (
+  id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  finding_id text NOT NULL,
+  action_type text NOT NULL,
+  summary text NOT NULL,
+  rationale text NOT NULL,
+  proposed_by_agent text NOT NULL,
+  proposed_by_user_id text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  decided_by_user_id text,
+  decided_at timestamptz,
+  decision_note text,
+  decider_step_up_reason text
+);
+CREATE INDEX IF NOT EXISTS remediation_tenant_status_idx
+  ON remediation_proposals (tenant_id, status);
+CREATE INDEX IF NOT EXISTS remediation_tenant_finding_idx
+  ON remediation_proposals (tenant_id, finding_id);
+
 DO $$
 DECLARE
   t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['findings', 'chat_sessions', 'chat_messages', 'break_glass_grants'] LOOP
+  FOREACH t IN ARRAY ARRAY['findings', 'chat_sessions', 'chat_messages', 'break_glass_grants', 'remediation_proposals'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
@@ -174,40 +337,7 @@ ALTER TABLE findings
 CREATE INDEX IF NOT EXISTS findings_search_tsv_idx
   ON findings USING GIN (search_tsv);
 
--- M1: vector embeddings table for findings. One row per finding, tenant-scoped
--- and RLS-isolated like the parent table. Vector dim is interpolated from
--- EMBEDDING_DIM and must match the configured embedder. Changing dim requires
--- DROP + recreate of this table (it's a cache; backfill rebuilds it).
-CREATE TABLE IF NOT EXISTS finding_embeddings (
-  finding_id text PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
-  tenant_id text NOT NULL,
-  content text NOT NULL,
-  embedding vector(${dim}) NOT NULL,
-  embedder_version text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS finding_embeddings_tenant_idx
-  ON finding_embeddings (tenant_id);
-
--- ivfflat for cosine. M1 has only ~10 rows so a sequential scan beats the
--- index, but creating it now means production scale-up needs no schema work.
--- 'lists=10' is fine for tiny corpora; tune at scale.
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes WHERE indexname = 'finding_embeddings_vec_idx'
-  ) THEN
-    EXECUTE 'CREATE INDEX finding_embeddings_vec_idx ON finding_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10)';
-  END IF;
-END $$;
-
-ALTER TABLE finding_embeddings ENABLE ROW LEVEL SECURITY;
-ALTER TABLE finding_embeddings FORCE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation ON finding_embeddings;
-CREATE POLICY tenant_isolation ON finding_embeddings
-  USING (tenant_id = current_setting('app.tenant_id', true))
-  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+${embeddingsBlock}
 
 CREATE OR REPLACE VIEW findings_redacted AS
 SELECT
@@ -326,6 +456,47 @@ CREATE TABLE IF NOT EXISTS log_source_checkpoints (
   tenant_id text NOT NULL,
   last_event_ts bigint NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- M8 (DLQ): terminal-failure dead-letter store for the ingest pipeline. When a
+-- raw.logs record fails to process after the bounded per-record retry, the
+-- pipeline records a metadata-only marker here and ACKs so a real broker stops
+-- redelivering the poison message. PHI posture: the raw (attacker-controlled,
+-- possibly-PHI) payload is NEVER stored — only the source-provenance pointer +
+-- a payload_sha256 for correlation + the error name + attempt count, mirroring
+-- the ingest.malformed_record precedent. Like log_source_checkpoints this table
+-- is operator/system-scoped, MUTABLE, carries no audit-evidence weight (the
+-- anchor is the ingest.dead_lettered ledger event), and is NOT RLS-scoped / NOT
+-- under ENABLE ALWAYS triggers. Created here for first-boot ordering, mirrored
+-- in lib/db/src/schema/ingest-dead-letter.ts. Default-inert: only written when
+-- the operator opts the DLQ in (INGEST_DEAD_LETTER_ENABLED).
+CREATE TABLE IF NOT EXISTS ingest_dead_letter (
+  id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  source_type text NOT NULL,
+  source_name text NOT NULL,
+  source_record_id text NOT NULL,
+  payload_sha256 text NOT NULL,
+  payload_bytes integer NOT NULL,
+  error text NOT NULL,
+  attempts integer NOT NULL,
+  dead_lettered_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- M12.1: per-tenant key registry (control-plane). System-scoped (NO RLS): the
+-- boot resolver reads every row to build its in-memory key cache, and the table
+-- is never exposed through any API. Holds only key METADATA — a provider and an
+-- opaque ref (for 'external', the NAME of an env var that holds the material) —
+-- never raw key material, so no secret lives at rest here. Empty ⇒ every tenant
+-- falls back to the global secret ⇒ byte-identical to pre-M12.1 (default-inert).
+-- Created here (like ledger_checkpoints) so the boot loader can read it on first
+-- boot before a drizzle push; mirrors lib/db/src/schema/tenant-kms.ts.
+CREATE TABLE IF NOT EXISTS tenant_kms_keys (
+  tenant_id text PRIMARY KEY,
+  key_id text NOT NULL,
+  provider text NOT NULL,
+  key_ref text,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 `;
 }

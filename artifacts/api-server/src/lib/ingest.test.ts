@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { db, findingsTable, ledgerEntriesTable, bootstrap } from "@workspace/db";
-import { ingestRecord, startIngestPipeline } from "./ingest";
+import {
+  ingestRecord,
+  startIngestPipeline,
+  rawEvidenceStoreDegraded,
+  getDeadLetterConfigFromEnv,
+} from "./ingest";
+import { ingestDeadLetterTable } from "@workspace/db";
 import { redactInline, scanForPhi } from "./redact";
 import { InMemoryLogBus } from "./log-bus";
 import type { LogRecord } from "./log-source";
@@ -459,7 +465,10 @@ describe("external raw-evidence store (two-phase write)", () => {
       sourceRecordId: "evt-a",
       payload: `applicant_ssn=${ssn} status=new`,
     });
-    const r = await ingestRecord(rec, { rawEvidenceStore: failingStore });
+    const r = await ingestRecord(rec, {
+      rawEvidenceStore: failingStore,
+      rawEvidenceWriteRetry: { maxAttempts: 1 },
+    });
     expect(r.findingsCreated).toBe(1);
 
     const findings = await db
@@ -530,6 +539,248 @@ describe("external raw-evidence store (two-phase write)", () => {
         ),
       );
     expect(events).toHaveLength(0);
+  });
+
+  it("emits a recovery event (no PHI) when the external store put succeeds after a prior failure", async () => {
+    // Flaky store: the first put throws (latches degraded), the second
+    // succeeds (the recovery edge).
+    let calls = 0;
+    const provider = `worm-recover-${uniq()}`;
+    const flakyStore: RawEvidenceStore = {
+      name: provider,
+      external: true,
+      async put() {
+        calls++;
+        if (calls === 1) throw new Error("simulated WORM outage");
+        return `mem://${provider}/obj-${calls}`;
+      },
+      async get() {
+        throw new Error("not used");
+      },
+    };
+    const name = `wormrecover-${uniq()}`;
+    const ssn = "765-43-2112";
+    const mk = (rid: string): LogRecord =>
+      makeRecord({
+        sourceName: name,
+        sourceRecordId: rid,
+        payload: `applicant_ssn=${ssn} status=new`,
+      });
+
+    // Disable retry so the single put failure on occurrence 1 latches degraded
+    // (with retry the flaky store would recover within the first ingest).
+    const noRetry = { rawEvidenceWriteRetry: { maxAttempts: 1 } };
+    // Occurrence 1: put throws → degraded latched + failure alert.
+    await ingestRecord(mk("evt-a"), { rawEvidenceStore: flakyStore, ...noRetry });
+    // Occurrence 2 (same fingerprint): put succeeds → recovery alert + latch cleared.
+    await ingestRecord(mk("evt-b"), { rawEvidenceStore: flakyStore, ...noRetry });
+
+    const findings = await db
+      .select({ id: findingsTable.id })
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(findings).toHaveLength(1);
+    const findingId = findings[0]!.id;
+
+    const events = await db
+      .select({
+        eventType: ledgerEntriesTable.eventType,
+        subjectId: ledgerEntriesTable.subjectId,
+        payload: ledgerEntriesTable.payload,
+      })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(
+            ledgerEntriesTable.eventType,
+            "ingest.raw_evidence_store_recovered",
+          ),
+          eq(ledgerEntriesTable.subjectId, findingId),
+        ),
+      );
+    expect(events).toHaveLength(1);
+    const payload = events[0]!.payload as Record<string, unknown>;
+    expect(payload.provider).toBe(provider);
+    expect(payload.finding_id).toBe(findingId);
+    // No PHI / raw payload anywhere in the ledger payload.
+    expect(JSON.stringify(payload)).not.toContain(ssn);
+
+    // The latch is cleared once recovery is emitted.
+    expect(rawEvidenceStoreDegraded.has(`${provider}::${TENANT}`)).toBe(false);
+  });
+
+  it("does NOT emit a recovery event on steady-state success (no preceding failure)", async () => {
+    const provider = `worm-steady-${uniq()}`;
+    const okStore: RawEvidenceStore = {
+      name: provider,
+      external: true,
+      async put() {
+        return `mem://${provider}/obj`;
+      },
+      async get() {
+        throw new Error("not used");
+      },
+    };
+    const name = `wormsteady-${uniq()}`;
+    const r = await ingestRecord(
+      makeRecord({
+        sourceName: name,
+        sourceRecordId: "evt-a",
+        payload: "applicant_ssn=765-43-2113 status=new",
+      }),
+      { rawEvidenceStore: okStore },
+    );
+    expect(r.findingsCreated).toBe(1);
+
+    const findings = await db
+      .select({ id: findingsTable.id })
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(findings).toHaveLength(1);
+
+    const events = await db
+      .select({ seq: ledgerEntriesTable.seq })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(
+            ledgerEntriesTable.eventType,
+            "ingest.raw_evidence_store_recovered",
+          ),
+          eq(ledgerEntriesTable.subjectId, findings[0]!.id),
+        ),
+      );
+    expect(events).toHaveLength(0);
+  });
+
+  it("retries a transient store failure and succeeds without alerting", async () => {
+    // Store fails the first two puts (transient blip), succeeds on the third.
+    // With maxAttempts: 3 the write recovers within one ingest, so NO failure
+    // alert and NO degraded latch.
+    let calls = 0;
+    const provider = `worm-retry-ok-${uniq()}`;
+    const flakyStore: RawEvidenceStore = {
+      name: provider,
+      external: true,
+      async put() {
+        calls++;
+        if (calls < 3) throw new Error("transient 503");
+        return `mem://${provider}/obj-${calls}`;
+      },
+      async get() {
+        throw new Error("not used");
+      },
+    };
+    const name = `wormretryok-${uniq()}`;
+    const r = await ingestRecord(
+      makeRecord({
+        sourceName: name,
+        sourceRecordId: "evt-a",
+        payload: "applicant_ssn=765-43-2114 status=new",
+      }),
+      {
+        rawEvidenceStore: flakyStore,
+        rawEvidenceWriteRetry: { maxAttempts: 3, backoffMs: 0 },
+      },
+    );
+    expect(r.findingsCreated).toBe(1);
+    expect(calls).toBe(3);
+
+    const findings = await db
+      .select({ id: findingsTable.id, rawEvidenceRef: findingsTable.rawEvidenceRef })
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(findings).toHaveLength(1);
+    // The retried write landed: the ref was seated.
+    expect(findings[0]!.rawEvidenceRef).not.toBeNull();
+
+    // No failure alert, since the retry succeeded.
+    const failed = await db
+      .select({ seq: ledgerEntriesTable.seq })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(ledgerEntriesTable.eventType, "ingest.raw_evidence_store_failed"),
+          eq(ledgerEntriesTable.subjectId, findings[0]!.id),
+        ),
+      );
+    expect(failed).toHaveLength(0);
+    // And the provider/tenant is not latched degraded.
+    expect(rawEvidenceStoreDegraded.has(`${provider}::${TENANT}`)).toBe(false);
+  });
+
+  it("exhausts bounded retries then emits the failure alert", async () => {
+    // Store always fails. With maxAttempts: 2 the write is tried exactly twice,
+    // then declares durable capture degraded (latch + failure alert).
+    let calls = 0;
+    const provider = `worm-retry-exhaust-${uniq()}`;
+    const failingStore: RawEvidenceStore = {
+      name: provider,
+      external: true,
+      async put() {
+        calls++;
+        throw new Error("persistent outage");
+      },
+      async get() {
+        throw new Error("not used");
+      },
+    };
+    const name = `wormretryexhaust-${uniq()}`;
+    const ssn = "765-43-2115";
+    const r = await ingestRecord(
+      makeRecord({
+        sourceName: name,
+        sourceRecordId: "evt-a",
+        payload: `applicant_ssn=${ssn} status=new`,
+      }),
+      {
+        rawEvidenceStore: failingStore,
+        rawEvidenceWriteRetry: { maxAttempts: 2, backoffMs: 0 },
+      },
+    );
+    expect(r.findingsCreated).toBe(1);
+    expect(calls).toBe(2);
+
+    const findings = await db
+      .select({ id: findingsTable.id })
+      .from(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.tenantId, TENANT),
+          eq(findingsTable.fingerprint, `phi:ssn:fixture:${name}:v1`),
+        ),
+      );
+    expect(findings).toHaveLength(1);
+
+    const events = await db
+      .select({ payload: ledgerEntriesTable.payload })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(ledgerEntriesTable.eventType, "ingest.raw_evidence_store_failed"),
+          eq(ledgerEntriesTable.subjectId, findings[0]!.id),
+        ),
+      );
+    expect(events).toHaveLength(1);
+    // No PHI leaked into the alert after exhausting retries.
+    expect(JSON.stringify(events[0]!.payload)).not.toContain(ssn);
+    // The provider/tenant is now latched degraded.
+    expect(rawEvidenceStoreDegraded.has(`${provider}::${TENANT}`)).toBe(true);
   });
 });
 
@@ -633,6 +884,147 @@ describe("InMemoryLogBus integration with ingest", () => {
         ),
       );
     expect(rows.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("getDeadLetterConfigFromEnv", () => {
+  it("returns null (disabled) unless INGEST_DEAD_LETTER_ENABLED is truthy", () => {
+    expect(getDeadLetterConfigFromEnv({})).toBeNull();
+    expect(getDeadLetterConfigFromEnv({ INGEST_DEAD_LETTER_ENABLED: "" })).toBeNull();
+    expect(getDeadLetterConfigFromEnv({ INGEST_DEAD_LETTER_ENABLED: "0" })).toBeNull();
+    expect(
+      getDeadLetterConfigFromEnv({ INGEST_DEAD_LETTER_ENABLED: "false" }),
+    ).toBeNull();
+  });
+
+  it("enables with defaults on 1/true and parses overrides", () => {
+    expect(
+      getDeadLetterConfigFromEnv({ INGEST_DEAD_LETTER_ENABLED: "1" }),
+    ).toEqual({ maxAttempts: 3, backoffMs: 100 });
+    expect(
+      getDeadLetterConfigFromEnv({ INGEST_DEAD_LETTER_ENABLED: "true" }),
+    ).toEqual({ maxAttempts: 3, backoffMs: 100 });
+    expect(
+      getDeadLetterConfigFromEnv({
+        INGEST_DEAD_LETTER_ENABLED: "true",
+        INGEST_DLQ_MAX_ATTEMPTS: "5",
+        INGEST_DLQ_BACKOFF_MS: "0",
+      }),
+    ).toEqual({ maxAttempts: 5, backoffMs: 0 });
+  });
+});
+
+describe("ingest dead-letter queue", () => {
+  // A record that passes provenance validation but throws inside the upsert
+  // (observedAt is not a real Date → .toISOString() throws), mirroring the
+  // existing rethrow regression test. This is our deterministic "poison".
+  const poison = (over?: Partial<LogRecord>): LogRecord => ({
+    tenantId: TENANT,
+    sourceType: "fixture",
+    sourceName: `dlq-${uniq()}`,
+    sourceRecordId: `rec-${uniq()}`,
+    observedAt: "not-a-date" as unknown as Date,
+    ingestedAt: new Date(),
+    payload: "applicant_ssn=222-33-4444",
+    ...over,
+  });
+
+  it("DLQ off (default): rethrows on terminal failure (byte-identical) and writes no marker", async () => {
+    const bus = new InMemoryLogBus();
+    const unsub = startIngestPipeline(bus, null);
+    try {
+      const bad = poison();
+      const out = await bus.publish("raw.logs", bad);
+      expect(out.delivered).toBe(0);
+      expect(out.errors).toHaveLength(1);
+      const markers = await db
+        .select()
+        .from(ingestDeadLetterTable)
+        .where(eq(ingestDeadLetterTable.sourceName, bad.sourceName));
+      expect(markers).toHaveLength(0);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("DLQ on: after exhausting attempts, persists a metadata-only marker, ledgers ingest.dead_lettered, and ACKs", async () => {
+    const bus = new InMemoryLogBus();
+    // backoffMs: 0 so the test doesn't actually sleep between retries.
+    const unsub = startIngestPipeline(bus, { maxAttempts: 3, backoffMs: 0 });
+    try {
+      const before = await ledgerHeadSeq();
+      const bad = poison();
+      const out = await bus.publish("raw.logs", bad);
+
+      // ACKed (no rethrow) so the broker stops redelivering the poison.
+      expect(out.delivered).toBe(1);
+      expect(out.errors).toHaveLength(0);
+
+      // Metadata-only marker: source pointer + hash + counts, NO raw payload.
+      const markers = await db
+        .select()
+        .from(ingestDeadLetterTable)
+        .where(eq(ingestDeadLetterTable.sourceName, bad.sourceName));
+      expect(markers).toHaveLength(1);
+      const m = markers[0]!;
+      expect(m.tenantId).toBe(TENANT);
+      expect(m.sourceRecordId).toBe(bad.sourceRecordId);
+      expect(m.attempts).toBe(3);
+      expect(m.payloadBytes).toBe(Buffer.byteLength(bad.payload, "utf8"));
+      expect(m.payloadSha256).toMatch(/^[0-9a-f]{64}$/);
+      // The raw payload must never be stored in any column.
+      for (const v of Object.values(m)) {
+        if (typeof v === "string") expect(v).not.toContain("222-33-4444");
+      }
+
+      // Ledger event with metadata-only payload.
+      const led = await db
+        .select({
+          eventType: ledgerEntriesTable.eventType,
+          tenantId: ledgerEntriesTable.tenantId,
+          payload: ledgerEntriesTable.payload,
+        })
+        .from(ledgerEntriesTable)
+        .where(
+          and(
+            gt(ledgerEntriesTable.seq, before),
+            eq(ledgerEntriesTable.eventType, "ingest.dead_lettered"),
+            eq(
+              ledgerEntriesTable.subjectId,
+              `${bad.sourceType}:${bad.sourceName}:${bad.sourceRecordId}`,
+            ),
+          ),
+        );
+      expect(led).toHaveLength(1);
+      expect(led[0]!.tenantId).toBe(TENANT);
+      const lp = led[0]!.payload as Record<string, unknown>;
+      expect(lp.attempts).toBe(3);
+      expect(lp.payload_sha256).toBe(m.payloadSha256);
+      expect(JSON.stringify(lp)).not.toContain("222-33-4444");
+    } finally {
+      unsub();
+    }
+  });
+
+  it("DLQ on: a record that succeeds on the first try is not dead-lettered", async () => {
+    const bus = new InMemoryLogBus();
+    const unsub = startIngestPipeline(bus, { maxAttempts: 3, backoffMs: 0 });
+    try {
+      const ok = makeRecord({
+        sourceName: `dlq-ok-${uniq()}`,
+        payload: "applicant_ssn=444-55-6677",
+      });
+      const out = await bus.publish("raw.logs", ok);
+      expect(out.delivered).toBe(1);
+      expect(out.errors).toHaveLength(0);
+      const markers = await db
+        .select()
+        .from(ingestDeadLetterTable)
+        .where(eq(ingestDeadLetterTable.sourceName, ok.sourceName));
+      expect(markers).toHaveLength(0);
+    } finally {
+      unsub();
+    }
   });
 });
 

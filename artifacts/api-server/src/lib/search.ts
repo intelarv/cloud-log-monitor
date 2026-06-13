@@ -4,6 +4,7 @@ type Finding = FindingSafe;
 import { withTenant } from "./db-context";
 import { toPgVectorLiteral, type Embedder } from "./embeddings";
 import { getEmbedder } from "./embedder-config";
+import { isEmbeddingsPartitioned } from "./embeddings-partition-config";
 import {
   getSearchProvider,
   type LexicalSearchProvider,
@@ -295,10 +296,20 @@ export async function backfillEmbeddings(opts: {
         const content = parts.filter(Boolean).join(" \n ");
         const vec = await embedder.embed(content);
         const literal = toPgVectorLiteral(vec);
+        // M12.2: the ON CONFLICT arbiter must match the live primary key. The
+        // single-table layout has PK (finding_id); the LIST-partitioned layout
+        // (EMBEDDINGS_TENANT_PARTITIONING) has composite PK (finding_id,
+        // tenant_id) — a partitioned table cannot have a unique index on
+        // finding_id alone. finding_id is globally unique 1:1 with findings, so
+        // the two arbiters are semantically equivalent; only the index Postgres
+        // can infer differs.
+        const conflictTarget = isEmbeddingsPartitioned()
+          ? sql`(finding_id, tenant_id)`
+          : sql`(finding_id)`;
         await tx.execute(sql`
           INSERT INTO finding_embeddings (finding_id, tenant_id, content, embedding, embedder_version, updated_at)
           VALUES (${row.id}, ${tenant_id}, ${content}, ${literal}::vector, ${embedder.version}, now())
-          ON CONFLICT (finding_id) DO UPDATE
+          ON CONFLICT ${conflictTarget} DO UPDATE
             SET content = EXCLUDED.content,
                 embedding = EXCLUDED.embedding,
                 embedder_version = EXCLUDED.embedder_version,
@@ -323,27 +334,148 @@ export async function backfillEmbeddings(opts: {
 // For the Postgres provider it is a no-op (the generated tsv is always in
 // sync). Reads go through the safe projection — raw evidence is never read
 // here, so PHI cannot reach the searchable tier.
+const DEFAULT_REINDEX_BATCH_SIZE = 500;
+const REINDEX_BATCH_MIN = 1;
+const REINDEX_BATCH_MAX = 10000;
+
+/** Resolve the reindex page size from `SEARCH_REINDEX_BATCH_SIZE`, clamped to a
+ *  sane range. Misconfigured (blank / non-numeric / out-of-range) values fall
+ *  back to the default rather than picking a pathological page size. */
+export function resolveReindexBatchSize(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env["SEARCH_REINDEX_BATCH_SIZE"]?.trim();
+  if (!raw) return DEFAULT_REINDEX_BATCH_SIZE;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) {
+    return DEFAULT_REINDEX_BATCH_SIZE;
+  }
+  if (n < REINDEX_BATCH_MIN || n > REINDEX_BATCH_MAX) {
+    return DEFAULT_REINDEX_BATCH_SIZE;
+  }
+  return n;
+}
+
+export interface ReconcileSearchIndexOpts {
+  searchProvider?: LexicalSearchProvider;
+  /** Page size for the keyset scan + bulk mirror. Defaults to
+   *  `SEARCH_REINDEX_BATCH_SIZE` (resolved via `resolveReindexBatchSize`). */
+  batchSize?: number;
+  /** Resume point from a prior interrupted run's last progress line. The scan
+   *  processes tenants in a deterministic order (tenant_id ascending) and, within
+   *  each tenant, findings ordered by id — so a resume point is the tenant the
+   *  previous run was working on plus the last finding id it mirrored within that
+   *  tenant. On resume the scan skips every tenant ordered BEFORE `tenantId`
+   *  (already fully processed), continues `tenantId` at `id > sinceId`, and
+   *  processes every later tenant from its start. Omit for a full reindex.
+   *
+   *  A single global id is intentionally NOT used: tenants are visited in
+   *  tenant_id order, not id order, so a global `id > X` filter would both
+   *  re-mirror earlier tenants' rows above X and (worse) skip a later tenant
+   *  whose ids all fall below X, leaving those findings unsearchable. */
+  resumeFrom?: { tenantId: string; sinceId: string };
+  /** Per-batch progress callback (operator command uses it to print progress). */
+  onProgress?: (p: {
+    tenantId: string;
+    indexed: number;
+    lastId: string;
+  }) => void;
+}
+
+// Decide, for a deterministic tenant processing order, each tenant's starting
+// keyset cursor given an optional resume point. Pure + side-effect-free so the
+// resume semantics can be unit-tested without a DB. Tenants must be passed in
+// the same order the scan visits them (tenant_id ascending). With no resume
+// point every tenant starts from the top (cursor null). With a resume point,
+// tenants ordered before the resume tenant are dropped (already fully
+// processed), the resume tenant continues at `id > sinceId`, and every later
+// tenant starts from the top. If the resume tenant is absent from the list
+// (e.g. deleted between runs) nothing is returned — the caller logs a warning.
+export function planReindexResume(
+  orderedTenantIds: ReadonlyArray<string>,
+  resumeFrom?: { tenantId: string; sinceId: string } | null,
+): Array<{ tenantId: string; cursor: string | null }> {
+  if (!resumeFrom) {
+    return orderedTenantIds.map((tenantId) => ({ tenantId, cursor: null }));
+  }
+  const out: Array<{ tenantId: string; cursor: string | null }> = [];
+  let reached = false;
+  for (const tenantId of orderedTenantIds) {
+    if (!reached) {
+      if (tenantId === resumeFrom.tenantId) {
+        reached = true;
+        out.push({ tenantId, cursor: resumeFrom.sinceId });
+      }
+      continue;
+    }
+    out.push({ tenantId, cursor: null });
+  }
+  return out;
+}
+
+// Reconcile in keyset-paginated batches ordered by finding id. Each batch is
+// mirrored in a single bulk round-trip when the provider supports it (falls
+// back to per-doc otherwise). Batching keeps memory bounded on large tenants,
+// surfaces progress, and — combined with `resumeFrom` — makes an interrupted
+// operator reindex resumable. Reads go through the safe projection; raw
+// evidence is never read, so PHI cannot reach the searchable tier.
 export async function reconcileSearchIndex(
-  opts: { searchProvider?: LexicalSearchProvider } = {},
+  opts: ReconcileSearchIndexOpts = {},
 ): Promise<{ indexed: number; skipped: boolean }> {
   const provider = opts.searchProvider ?? getSearchProvider();
   if (!provider.maintainsExternalIndex) return { indexed: 0, skipped: true };
 
+  const batchSize = opts.batchSize ?? resolveReindexBatchSize();
   const { db } = await import("@workspace/db");
   const tenantRows = await db.execute<{ tenant_id: string }>(
-    sql`SELECT DISTINCT tenant_id FROM findings`,
+    sql`SELECT DISTINCT tenant_id FROM findings ORDER BY tenant_id`,
   );
 
+  const tenantPlan = planReindexResume(
+    tenantRows.rows.map((r) => r.tenant_id),
+    opts.resumeFrom ?? null,
+  );
+  if (opts.resumeFrom && tenantPlan.length === 0) {
+    logger.warn(
+      { provider: provider.name, resumeTenant: opts.resumeFrom.tenantId },
+      "Search index reconcile: resume tenant not found among current tenants; " +
+        "nothing reindexed",
+    );
+  }
+
   let indexed = 0;
-  for (const { tenant_id } of tenantRows.rows) {
-    await withTenant(tenant_id, async (tx) => {
-      const rows = await tx
-        .select(findingSafeColumns)
-        .from(findingsTable)
-        .where(eq(findingsTable.tenantId, tenant_id));
-      for (const r of rows) {
+  for (const { tenantId: tenant_id, cursor: startCursor } of tenantPlan) {
+    // Keyset cursor within this tenant, seeded by the resume plan (sinceId for
+    // the resume tenant, null for a from-the-top scan).
+    let cursor: string | null = startCursor;
+    for (;;) {
+      const batch: Array<{
+        id: string;
+        classification: string;
+        subclass: string | null;
+        severity: string;
+        source: string;
+        redactedEvidence: unknown;
+      }> = await withTenant(tenant_id, async (tx) => {
+        const where =
+          cursor === null
+            ? eq(findingsTable.tenantId, tenant_id)
+            : and(
+                eq(findingsTable.tenantId, tenant_id),
+                sql`${findingsTable.id} > ${cursor}`,
+              );
+        return tx
+          .select(findingSafeColumns)
+          .from(findingsTable)
+          .where(where)
+          .orderBy(findingsTable.id)
+          .limit(batchSize);
+      });
+      if (batch.length === 0) break;
+
+      const docs = batch.map((r) => {
         const ev = r.redactedEvidence as { snippet?: string };
-        await provider.indexFinding({
+        return {
           findingId: r.id,
           tenantId: tenant_id,
           classification: r.classification,
@@ -351,11 +483,29 @@ export async function reconcileSearchIndex(
           severity: r.severity,
           source: r.source,
           snippet: ev.snippet ?? "",
-        });
-        indexed += 1;
+        };
+      });
+
+      if (provider.indexFindingBulk) {
+        await provider.indexFindingBulk(docs);
+      } else {
+        for (const d of docs) await provider.indexFinding(d);
       }
-    });
+
+      indexed += docs.length;
+      cursor = batch[batch.length - 1]!.id;
+      opts.onProgress?.({ tenantId: tenant_id, indexed, lastId: cursor });
+      logger.info(
+        { provider: provider.name, tenant: tenant_id, indexed, lastId: cursor },
+        "Search index reconcile progress",
+      );
+
+      if (batch.length < batchSize) break;
+    }
   }
-  logger.info({ provider: provider.name, indexed }, "Search index reconcile complete");
+  logger.info(
+    { provider: provider.name, indexed, batchSize },
+    "Search index reconcile complete",
+  );
   return { indexed, skipped: false };
 }

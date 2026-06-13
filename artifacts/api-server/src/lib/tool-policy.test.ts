@@ -73,4 +73,58 @@ describe("validateToolArgs", () => {
     const r = validateToolArgs("get_finding", { finding_id: "F-CANARY_2" });
     expect(r.ok).toBe(true);
   });
+
+  it("accepts a clean structured_query payload", () => {
+    const r = validateToolArgs("structured_query", {
+      severity: ["high", "critical"],
+      status: ["open"],
+      limit: 25,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.violations).toEqual([]);
+  });
+
+  it("trips the canary inside a structured_query arg", () => {
+    const r = validateToolArgs("structured_query", {
+      source: [`cloudwatch ${CANARY_TOKEN}`],
+      limit: 5,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.canaryTripped).toBe(true);
+  });
+
+  it("accepts a clean propose_remediation payload", () => {
+    const r = validateToolArgs("propose_remediation", {
+      finding_id: "F-001",
+      action_type: "notify_owner",
+      summary: "Notify the billing service owner about the leak",
+      rationale: "The log group has emitted PHI repeatedly; owner should rotate",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.violations).toEqual([]);
+  });
+
+  it("flags PHI inside a propose_remediation arg", () => {
+    const r = validateToolArgs("propose_remediation", {
+      finding_id: "F-001",
+      action_type: "other",
+      summary: "patient 123-45-6789 exposed",
+      rationale: "needs redaction",
+    });
+    expect(r.ok).toBe(false);
+    expect(r.violations.map((v) => v.kind)).toContain("phi_in_args");
+  });
+
+  it("rejects a bad finding_id format on propose_remediation", () => {
+    const r = validateToolArgs("propose_remediation", {
+      finding_id: "../../etc/passwd",
+      action_type: "open_pr",
+      summary: "x",
+      rationale: "y",
+    });
+    expect(r.ok).toBe(false);
+    expect(r.violations.map((v) => v.kind)).toContain(
+      "bad_finding_id_format",
+    );
+  });
 });

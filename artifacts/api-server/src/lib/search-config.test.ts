@@ -11,8 +11,10 @@ import {
 } from "./search-config";
 import {
   OpenSearchLexicalProvider,
+  safeTenantSegment,
   type OpenSearchClient,
 } from "./cloud-search";
+import { planReindexResume, resolveReindexBatchSize } from "./search";
 
 afterEach(() => resetSearchProviderForTests());
 
@@ -219,5 +221,318 @@ describe("OpenSearchLexicalProvider (fake client)", () => {
       source: "cloudwatch:billing",
       snippet: "AWS key <REDACTED>",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-tenant index isolation (OPENSEARCH_PER_TENANT_INDEX)
+// ---------------------------------------------------------------------------
+
+/** A fake client that stores indexed docs keyed by the index they were written
+ *  to, and on search returns ONLY the ids living in the exact queried index.
+ *  This proves physical isolation: a query against tenant A's index can never
+ *  surface a document written into tenant B's index. */
+function makePerIndexClient(): {
+  client: OpenSearchClient;
+  byIndex: Map<string, Set<string>>;
+  searched: Array<{ index: string; body: Record<string, unknown> }>;
+} {
+  const byIndex = new Map<string, Set<string>>();
+  const searched: Array<{ index: string; body: Record<string, unknown> }> = [];
+  const client: OpenSearchClient = {
+    async ensureIndex(index) {
+      if (!byIndex.has(index)) byIndex.set(index, new Set());
+    },
+    async indexDoc(index, id) {
+      const set = byIndex.get(index) ?? new Set<string>();
+      set.add(id);
+      byIndex.set(index, set);
+    },
+    async searchIds(index, body) {
+      searched.push({ index, body });
+      return [...(byIndex.get(index) ?? new Set<string>())];
+    },
+  };
+  return { client, byIndex, searched };
+}
+
+describe("OpenSearchLexicalProvider per-tenant index isolation", () => {
+  it("safeTenantSegment is collision-free for ids that sanitize alike", () => {
+    // `a/b` and `a-b` both sanitize to the readable `a-b`; the raw-id hash
+    // suffix must keep their full segments distinct.
+    expect(safeTenantSegment("a/b")).not.toBe(safeTenantSegment("a-b"));
+    // Deterministic for a given id.
+    expect(safeTenantSegment("tenant-xyz")).toBe(safeTenantSegment("tenant-xyz"));
+  });
+
+  it("routes each tenant to its own physical index and keeps the tenant filter", async () => {
+    const { client, searched } = makePerIndexClient();
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      perTenantIndex: true,
+      clientFactory: async () => client,
+    });
+
+    await provider.search("tenant-a", "ssn", 5);
+    await provider.search("tenant-b", "ssn", 5);
+
+    const idxA = searched[0]!.index;
+    const idxB = searched[1]!.index;
+    expect(idxA).toBe(`idx-${safeTenantSegment("tenant-a")}`);
+    expect(idxB).toBe(`idx-${safeTenantSegment("tenant-b")}`);
+    expect(idxA).not.toBe(idxB);
+    expect(idxA).not.toBe("idx"); // not the shared index
+
+    // Belt-and-suspenders: the mandatory tenant_id term filter still rides
+    // every query even though the index is already physically separated.
+    const body = searched[0]!.body as {
+      query: { bool: { filter: Array<{ term: { tenant_id: string } }> } };
+    };
+    expect(body.query.bool.filter).toContainEqual({
+      term: { tenant_id: "tenant-a" },
+    });
+  });
+
+  it("a query for tenant A can never read tenant B's index", async () => {
+    const { client } = makePerIndexClient();
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      perTenantIndex: true,
+      clientFactory: async () => client,
+    });
+
+    // Index a finding owned by tenant B.
+    await provider.indexFinding({
+      findingId: "F-B1",
+      tenantId: "tenant-b",
+      classification: "phi",
+      subclass: null,
+      severity: "high",
+      source: "cloudwatch:b",
+      snippet: "<REDACTED>",
+    });
+
+    // Tenant A searches — its index is physically separate, so B's doc is
+    // unreachable.
+    const aHits = await provider.search("tenant-a", "redacted", 10);
+    expect(aHits).toEqual([]);
+
+    // Tenant B searches its own index and finds it.
+    const bHits = await provider.search("tenant-b", "redacted", 10);
+    expect(bHits.map((h) => h.finding_id)).toEqual(["F-B1"]);
+  });
+
+  it("defaults to a single shared index when per-tenant is off (backward compat)", async () => {
+    const { client, searched } = makePerIndexClient();
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      clientFactory: async () => client,
+    });
+    await provider.search("tenant-a", "ssn", 5);
+    await provider.search("tenant-b", "ssn", 5);
+    expect(searched[0]!.index).toBe("idx");
+    expect(searched[1]!.index).toBe("idx");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bulk reindex path (#42)
+// ---------------------------------------------------------------------------
+
+describe("OpenSearchLexicalProvider.indexFindingBulk", () => {
+  function doc(id: string, tenantId = "t1") {
+    return {
+      findingId: id,
+      tenantId,
+      classification: "phi",
+      subclass: null,
+      severity: "high",
+      source: "cloudwatch:x",
+      snippet: "<REDACTED>",
+    };
+  }
+
+  it("mirrors a batch in one _bulk round-trip when the client supports it", async () => {
+    const bulkCalls: Array<{
+      index: string;
+      docs: ReadonlyArray<{ id: string; body: Record<string, unknown> }>;
+    }> = [];
+    const client: OpenSearchClient = {
+      async ensureIndex() {},
+      async indexDoc() {
+        throw new Error("should not fall back to indexDoc when bulkIndex exists");
+      },
+      async bulkIndex(index, docs) {
+        bulkCalls.push({ index, docs });
+      },
+      async searchIds() {
+        return [];
+      },
+    };
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      clientFactory: async () => client,
+    });
+
+    await provider.indexFindingBulk([doc("F-1"), doc("F-2"), doc("F-3")]);
+
+    expect(bulkCalls).toHaveLength(1);
+    expect(bulkCalls[0]!.index).toBe("idx");
+    expect(bulkCalls[0]!.docs.map((d) => d.id)).toEqual(["F-1", "F-2", "F-3"]);
+    // Each doc carries the redacted projection + tenant_id, never raw evidence.
+    expect(bulkCalls[0]!.docs[0]!.body).toMatchObject({
+      tenant_id: "t1",
+      classification: "phi",
+      snippet: "<REDACTED>",
+    });
+    expect(bulkCalls[0]!.docs[0]!.body).not.toHaveProperty("rawEvidence");
+  });
+
+  it("falls back to per-doc indexDoc when the client lacks bulkIndex", async () => {
+    const indexed: Array<{ index: string; id: string }> = [];
+    const client: OpenSearchClient = {
+      async ensureIndex() {},
+      async indexDoc(index, id) {
+        indexed.push({ index, id });
+      },
+      async searchIds() {
+        return [];
+      },
+    };
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      clientFactory: async () => client,
+    });
+
+    await provider.indexFindingBulk([doc("F-1"), doc("F-2")]);
+
+    expect(indexed).toEqual([
+      { index: "idx", id: "F-1" },
+      { index: "idx", id: "F-2" },
+    ]);
+  });
+
+  it("routes a bulk batch to the tenant's own index when per-tenant is on", async () => {
+    const bulkCalls: Array<{ index: string }> = [];
+    const client: OpenSearchClient = {
+      async ensureIndex() {},
+      async indexDoc() {},
+      async bulkIndex(index) {
+        bulkCalls.push({ index });
+      },
+      async searchIds() {
+        return [];
+      },
+    };
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      perTenantIndex: true,
+      clientFactory: async () => client,
+    });
+
+    await provider.indexFindingBulk([doc("F-1", "tenant-a")]);
+    expect(bulkCalls[0]!.index).toBe(`idx-${safeTenantSegment("tenant-a")}`);
+  });
+
+  it("is a no-op for an empty batch", async () => {
+    let called = false;
+    const client: OpenSearchClient = {
+      async ensureIndex() {
+        called = true;
+      },
+      async indexDoc() {
+        called = true;
+      },
+      async bulkIndex() {
+        called = true;
+      },
+      async searchIds() {
+        return [];
+      },
+    };
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      clientFactory: async () => client,
+    });
+    await provider.indexFindingBulk([]);
+    expect(called).toBe(false);
+  });
+});
+
+describe("resolveReindexBatchSize", () => {
+  it("defaults to 500 when unset", () => {
+    expect(resolveReindexBatchSize({})).toBe(500);
+  });
+  it("uses a valid configured value", () => {
+    expect(resolveReindexBatchSize({ SEARCH_REINDEX_BATCH_SIZE: "1000" })).toBe(
+      1000,
+    );
+  });
+  it("falls back to default on non-numeric / non-integer / out-of-range", () => {
+    expect(resolveReindexBatchSize({ SEARCH_REINDEX_BATCH_SIZE: "abc" })).toBe(
+      500,
+    );
+    expect(resolveReindexBatchSize({ SEARCH_REINDEX_BATCH_SIZE: "1.5" })).toBe(
+      500,
+    );
+    expect(resolveReindexBatchSize({ SEARCH_REINDEX_BATCH_SIZE: "0" })).toBe(500);
+    expect(
+      resolveReindexBatchSize({ SEARCH_REINDEX_BATCH_SIZE: "999999" }),
+    ).toBe(500);
+  });
+});
+
+describe("planReindexResume", () => {
+  it("starts every tenant from the top when there is no resume point", () => {
+    expect(planReindexResume(["a", "b", "c"])).toEqual([
+      { tenantId: "a", cursor: null },
+      { tenantId: "b", cursor: null },
+      { tenantId: "c", cursor: null },
+    ]);
+    expect(planReindexResume(["a", "b"], null)).toEqual([
+      { tenantId: "a", cursor: null },
+      { tenantId: "b", cursor: null },
+    ]);
+  });
+
+  it("skips tenants before the resume tenant and seeds it with sinceId", () => {
+    // Interrupted while working tenant "b" at finding id "f5": "a" is already
+    // fully mirrored and must not be re-scanned; "b" resumes after f5; later
+    // tenants start from the top.
+    expect(
+      planReindexResume(["a", "b", "c"], { tenantId: "b", sinceId: "f5" }),
+    ).toEqual([
+      { tenantId: "b", cursor: "f5" },
+      { tenantId: "c", cursor: null },
+    ]);
+  });
+
+  it("resuming on the first tenant only seeds that tenant", () => {
+    expect(
+      planReindexResume(["a", "b"], { tenantId: "a", sinceId: "f9" }),
+    ).toEqual([
+      { tenantId: "a", cursor: "f9" },
+      { tenantId: "b", cursor: null },
+    ]);
+  });
+
+  it("resuming on the last tenant yields just that tenant", () => {
+    expect(
+      planReindexResume(["a", "b", "c"], { tenantId: "c", sinceId: "f1" }),
+    ).toEqual([{ tenantId: "c", cursor: "f1" }]);
+  });
+
+  it("returns nothing when the resume tenant is absent (e.g. deleted)", () => {
+    // A global `id >` filter would instead silently mis-scan other tenants;
+    // here a vanished resume tenant is an explicit no-op the caller can warn on.
+    expect(
+      planReindexResume(["a", "b"], { tenantId: "zz", sinceId: "f1" }),
+    ).toEqual([]);
   });
 });

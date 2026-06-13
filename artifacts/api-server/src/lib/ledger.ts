@@ -1,4 +1,4 @@
-import { sql, desc, asc, gt, gte, lt } from "drizzle-orm";
+import { sql, desc, asc, eq, gt, gte, lt, and, inArray } from "drizzle-orm";
 import {
   db,
   ledgerEntriesTable,
@@ -23,6 +23,32 @@ export interface LedgerWriteInput {
   subjectType?: string;
   subjectId?: string;
   payload: Record<string, unknown>;
+  /**
+   * Optional per-step idempotency key. When set, the write is deduped: if a
+   * ledger row already carries this key, the existing row is returned and NO
+   * new row (and NO post-commit fan-out) is produced. Lets a retried activity
+   * (e.g. the Temporal review steps) re-run safely without writing a duplicate
+   * audit entry. NOT part of the ledger hash, so the chain stays byte-identical.
+   * Omit (the default) for ordinary one-shot writes — those keep the original
+   * always-insert behavior, so the eval gate / in-process path are unchanged.
+   */
+  idempotencyKey?: string;
+}
+
+/** Look up a ledger row by its idempotency key, or null if none exists. Used by
+ *  retryable activities to recover a step's recorded outcome (e.g. the agent
+ *  verdict in the entry payload) without re-running the side effect. The ledger
+ *  has no RLS (reads are global inside the trust boundary), so this uses the
+ *  base `db` handle. The unique `ledger_idempotency_key_uniq` index backs it. */
+export async function getLedgerEntryByIdempotencyKey(
+  idempotencyKey: string,
+): Promise<LedgerEntry | null> {
+  const [row] = await db
+    .select()
+    .from(ledgerEntriesTable)
+    .where(eq(ledgerEntriesTable.idempotencyKey, idempotencyKey))
+    .limit(1);
+  return row ?? null;
 }
 
 // Append a single ledger entry. Runs inside a transaction that:
@@ -32,13 +58,48 @@ export interface LedgerWriteInput {
 //   4. Inserts the row.
 // The transaction wraps everything so a crash between hash computation and
 // insert leaves the chain unchanged.
+/** Result of an idempotency-aware ledger write.
+ *  `deduped=false` ⇒ this call performed the INSERT (the caller "won" the race);
+ *  `deduped=true`  ⇒ a row with this key already existed and was returned as-is.
+ *  Callers that pair a ledger write with another non-idempotent side effect (a
+ *  per-tenant budget charge) MUST gate that side effect on `deduped===false` so
+ *  it runs exactly once even when two attempts execute the step concurrently:
+ *  the global advisory lock serializes the two writes, so exactly one observes
+ *  `deduped===false`. */
+export interface AppendLedgerResult {
+  row: LedgerEntry;
+  deduped: boolean;
+}
+
 export async function appendLedger(
   input: LedgerWriteInput,
 ): Promise<LedgerEntry> {
+  return (await appendLedgerWithStatus(input)).row;
+}
+
+/** Like `appendLedger`, but also reports whether the write was deduped. Use this
+ *  (not `appendLedger`) whenever a NON-idempotent side effect must fire exactly
+ *  once alongside the ledger entry under retry/concurrency — gate the side
+ *  effect on `deduped===false`. See `AppendLedgerResult`. */
+export async function appendLedgerWithStatus(
+  input: LedgerWriteInput,
+): Promise<AppendLedgerResult> {
   return db.transaction(async (tx) => {
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(${LEDGER_LOCK_KEY}::bigint)`,
     );
+    // Idempotency dedupe: if this key already landed a row, return it and skip
+    // the insert + post-commit fan-out. Safe to check inside the lock — the
+    // single global advisory lock serializes all writers, so there is no race
+    // between this read and a concurrent same-key insert.
+    if (input.idempotencyKey !== undefined) {
+      const [existing] = await tx
+        .select()
+        .from(ledgerEntriesTable)
+        .where(eq(ledgerEntriesTable.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existing) return { row: existing, deduped: true as const };
+    }
     const [head] = await tx
       .select({ hash: ledgerEntriesTable.hash })
       .from(ledgerEntriesTable)
@@ -67,10 +128,15 @@ export async function appendLedger(
         payload: input.payload,
         prevHash,
         hash,
+        idempotencyKey: input.idempotencyKey ?? null,
       })
       .returning();
-    return row;
-  }).then((row) => {
+    return { row, deduped: false as const };
+  }).then(({ row, deduped }) => {
+    // On a dedupe hit the row already ran its post-commit hooks when it was
+    // first written; re-running them would double-alert / double-enqueue /
+    // double-dispatch, so return the existing row untouched.
+    if (deduped) return { row, deduped };
     // Post-commit alert hook. Runs OUTSIDE the transaction so a flaky
     // logger or alert sink can never roll back a ledger write. See §25.
     try {
@@ -96,8 +162,51 @@ export async function appendLedger(
     } catch {
       // Same best-effort guarantee.
     }
-    return row;
+    return { row, deduped };
   });
+}
+
+// Ledger event types written once per agent review attempt (initial + every
+// fix-and-replay). The agent review orchestration keys each of these on a stable
+// `{workflowId}:attempt:{N}:{step}` idempotency key, so they reconstruct the
+// per-finding re-run history from the immutable ledger alone.
+export const REVIEW_ATTEMPT_EVENT_TYPES = [
+  "agent.triage_complete",
+  "agent.verifier_complete",
+  "agent.review_skipped_budget",
+  "agent.review_failed",
+] as const;
+
+/** All review-related ledger entries for one finding, oldest-first. Tenant-scoped
+ *  by explicit predicate (the ledger table has no RLS — see routes/findings.ts).
+ *  Powers the finding detail view's review re-run timeline. */
+export async function listFindingReviewEntries(
+  tenantId: string,
+  findingId: string,
+): Promise<LedgerEntry[]> {
+  return db
+    .select()
+    .from(ledgerEntriesTable)
+    .where(
+      and(
+        eq(ledgerEntriesTable.tenantId, tenantId),
+        eq(ledgerEntriesTable.subjectType, "finding"),
+        eq(ledgerEntriesTable.subjectId, findingId),
+        inArray(ledgerEntriesTable.eventType, [...REVIEW_ATTEMPT_EVENT_TYPES]),
+      ),
+    )
+    .orderBy(asc(ledgerEntriesTable.seq))
+    .limit(500);
+}
+
+/** Recover the 1-based review attempt number from a review step's idempotency
+ *  key (`{workflowId}:attempt:{N}:{step}`), or null if it carries no attempt
+ *  segment. The attempt is not stored in the payload, so this is the only
+ *  reconstruction path for grouping ledger entries into per-attempt timelines. */
+export function parseReviewAttempt(idempotencyKey: string | null): number | null {
+  if (!idempotencyKey) return null;
+  const m = idempotencyKey.match(/:attempt:(\d+):/);
+  return m ? Number(m[1]) : null;
 }
 
 export interface VerifyResult {

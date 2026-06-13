@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   useReopenFinding,
   getGetFindingQueryKey,
+  getGetFindingHistoryQueryKey,
   getListFindingsQueryKey,
   type ReopenFindingResult,
 } from "@workspace/api-client-react";
@@ -50,6 +51,7 @@ export default function ReopenFindingModal({
       });
 
       await queryClient.invalidateQueries({ queryKey: getGetFindingQueryKey(findingId) });
+      await queryClient.invalidateQueries({ queryKey: getGetFindingHistoryQueryKey(findingId) });
       await queryClient.invalidateQueries({ queryKey: getListFindingsQueryKey() });
 
       toast({

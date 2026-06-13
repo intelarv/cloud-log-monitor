@@ -46,6 +46,7 @@ function makeFinding(p: {
     triageVerdict: null,
     verifierVerdict: null,
     lastAgentReviewAt: null,
+    agentReviewAttempt: 0,
   };
 }
 

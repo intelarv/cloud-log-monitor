@@ -15,6 +15,12 @@ export interface BootstrapOptions {
    * mismatch is a hard error pointing the operator to DROP + recreate.
    */
   embeddingDim?: number;
+  /**
+   * M12.2: opt-in LIST-partitioning of finding_embeddings by tenant_id (default
+   * false ⇒ original single-table layout, byte-identical). Driven by
+   * EMBEDDINGS_TENANT_PARTITIONING at the API layer. See setup-sql.ts.
+   */
+  tenantPartitioning?: boolean;
 }
 
 export interface BootstrapResult {
@@ -30,7 +36,14 @@ export async function bootstrap(
   const result: BootstrapResult = { setup: false, seeded: false, embeddingDim };
 
   if (opts.setup !== false) {
-    await db.execute(sql.raw(buildSetupSql({ embeddingDim })));
+    await db.execute(
+      sql.raw(
+        buildSetupSql({
+          embeddingDim,
+          tenantPartitioning: opts.tenantPartitioning === true,
+        }),
+      ),
+    );
     result.setup = true;
 
     // Runtime dim invariant check: if the column already existed with a

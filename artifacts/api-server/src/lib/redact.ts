@@ -68,6 +68,31 @@ function deaValid(match: string): boolean {
   return check % 10 === d[6]!;
 }
 
+// HTTP Basic-auth credential validator. RFC 7617 carries credentials as
+// `Authorization: Basic <base64(user:pass)>`. The `Basic ` scheme marker is the
+// anchor (a bare base64 blob is indistinguishable from ordinary base64), and on
+// top of that we require the token to decode to a printable `user:pass` shape —
+// i.e. valid base64 that round-trips, yields no replacement chars (so binary
+// blobs that merely happen to contain a 0x3a byte are rejected), and contains a
+// non-empty username before a colon. Both conditions together hold precision at
+// 1.0: a `Basic ` token that does NOT decode to credentials is ignored, and any
+// colon-bearing base64 without the scheme marker never reaches this validator.
+function basicAuthCredValid(token: string): boolean {
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(token, "base64");
+  } catch {
+    return false;
+  }
+  // Reject non-canonical base64 (decode is lenient; the round-trip is the gate).
+  if (buf.toString("base64") !== token) return false;
+  const decoded = buf.toString("utf8");
+  if (decoded.includes("\uFFFD")) return false; // lossy decode ⇒ binary, not creds
+  // Printable `user:pass`: non-empty username, then a colon, then any printable
+  // (possibly empty) password. Control chars / non-ASCII fail the shape test.
+  return /^[\x20-\x7e]+:[\x20-\x7e]*$/.test(decoded);
+}
+
 // Shannon entropy in bits/char. Used by the generic high-entropy secret
 // detector to tell a real credential ("9f8e7d6c…") from an ordinary slug
 // ("service-mesh-cluster") assigned to the same key.
@@ -104,6 +129,40 @@ function scanHighEntropySecret(
       spans.push({ start, end: start + value.length, match: value });
     }
     if (m.index === HIGH_ENTROPY_KEY_RE.lastIndex) HIGH_ENTROPY_KEY_RE.lastIndex++;
+  }
+  return spans;
+}
+
+// URL detector. A blanket "flag every http(s) URL" rule drowns real cloud logs
+// in benign infrastructure URLs (health checks, service-to-service calls, asset
+// CDNs), burying the URLs that actually identify a patient/member. Decision:
+// SUPPRESS infra URLs — a URL is flagged ONLY when its PATH or QUERY carries a
+// patient/member-identifying signal (an MRN / patient / member / subscriber id,
+// or an ssn/dob/name/email/phone parameter, or a `/patients|/members/<id>`
+// path). The scheme+host is deliberately excluded from the signal scan, so a
+// service named `patient-records-svc.internal` is not mistaken for patient data.
+// This only drops the low-value "a URL exists" finding: a direct identifier
+// embedded in a URL value (an SSN or email in a query string) is still caught by
+// its own detector, so no real PHI is lost. `name` is intentionally NOT a
+// signal on its own (too common as a benign resource name) — only the qualified
+// first_name/last_name/patient_name/fname/lname forms are.
+const URL_RE = /\bhttps?:\/\/\S+/gi;
+const URL_PHI_SIGNAL =
+  /[?&/](?:mrn|patient(?:s|[_-]?id|[_-]?name)?|members?|member[_-]?id|memberid|subscriber|beneficiar(?:y|ies)|ssn|dob|date[_-]?of[_-]?birth|birth[_-]?date|birthdate|first[_-]?name|last[_-]?name|full[_-]?name|fname|lname|email|phone)[=/]/i;
+function scanIdentifyingUrls(
+  text: string,
+): { start: number; end: number; match: string }[] {
+  const spans: { start: number; end: number; match: string }[] = [];
+  URL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = URL_RE.exec(text)) !== null) {
+    const url = m[0];
+    // Scan path/query/fragment only — strip `scheme://host[:port]` first so a
+    // benign service hostname can never trip the identifying signal.
+    const afterHost = url.replace(/^https?:\/\/[^/?#\s]*/i, "");
+    if (URL_PHI_SIGNAL.test(afterHost)) {
+      spans.push({ start: m.index, end: m.index + url.length, match: url });
+    }
   }
   return spans;
 }
@@ -463,11 +522,12 @@ const DETECTORS: Detector[] = [
     regex:
       /\b(?=[0-9A-HJ-NPR-Z]*[A-Z])(?=[0-9A-HJ-NPR-Z]*\d)[0-9A-HJ-NPR-Z]{17}\b/g,
   },
-  // URL.
+  // URL — only patient/member-identifying URLs are flagged; plain infra URLs
+  // are suppressed (see scanIdentifyingUrls) so finding volume stays meaningful.
   {
     classification: "pii",
     name: "url",
-    regex: /\bhttps?:\/\/\S+/gi,
+    scan: scanIdentifyingUrls,
   },
   // IPv4 address with per-octet 0-255 validation (so "1.2.3" version strings
   // do not match — they have only three octets anyway).
@@ -609,6 +669,17 @@ const DETECTORS: Detector[] = [
     name: "aws_secret_key",
     regex:
       /(?<=\b(?:aws_secret_access_key|secret_access_key|aws[._]?secret[._]?(?:access[._]?)?key)["']?\s*[:=]\s*["']?)[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/gi,
+  },
+  // HTTP Basic-auth credentials — `Authorization: Basic <base64(user:pass)>`
+  // (RFC 7617). Anchored on the `Basic ` scheme marker so a bare base64 blob is
+  // never flagged on shape alone, then `basicAuthCredValid` gates the token to a
+  // printable `user:pass` decode. Closes the documented Basic-auth detector gap
+  // without regressing precision (ordinary base64 has no scheme marker).
+  {
+    classification: "secrets",
+    name: "http_basic_auth",
+    regex: /(?<=\bBasic\s+["']?)[A-Za-z0-9+/]{8,}={0,2}(?![A-Za-z0-9+/=])/g,
+    validate: basicAuthCredValid,
   },
   // Stripe live/test keys (secret, restricted, publishable).
   {

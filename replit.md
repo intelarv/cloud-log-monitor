@@ -2,9 +2,9 @@
 
 Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/secrets, maintains a tamper-evident audit ledger, and exposes a chat-over-audit dashboard for healthcare compliance analysts. See `docs/ARCHITECTURE.md`.
 
-Current milestone: **M13** (deterministic detector slices) on top of the eval suite, pluggable lexical search + WORM raw-PHI store, and multi-tenant hardening. All optional cloud/security seams (NER, A2A mTLS, cloud embedders, brokers, etc.) are **default-inert** — they load no SDK and change no behavior unless their env is set, so the credential-free offline eval gate stays byte-identical.
+Current milestone: **M14** (HITL remediation/proposal plane + `structured_query` typed-filter tool) on top of **M12** (multi-tenant hardening), the M13 deterministic detector slices, the eval suite, pluggable lexical search + WORM raw-PHI store. M14 adds the agent-plane `structured_query` tool (Zod-validated typed filter through `findingSafeColumns` — never LLM SQL) and the human-in-the-loop remediation plane: the `propose_remediation` tool writes a PENDING `remediation_proposals` row + ledgers `remediation.proposed` and **never executes**; humans confirm (session + step-up, ledgers `remediation.confirmed`) or reject via `/api/admin/remediation/proposals`. A standing **"Implemented vs not" survey** now lives in `docs/MILESTONES.md`. Deferred by design: the proposal-inbox dashboard UI + an executing remediation worker (the plane stops at "confirmed"; code-touching steps stay operator/out-of-band). M12 status (verified against code): all four slices **done** — **M12.4** cross-tenant escalation guard (`cross-tenant-isolation.route.test.ts`); **M12.1** per-tenant KMS keys (`tenant_kms_keys` table + `lib/tenant-kms.ts` resolver seam, derived/external providers, per-tenant cookie signing); **M12.2** per-tenant pgvector partitioning (opt-in `EMBEDDINGS_TENANT_PARTITIONING` LIST-by-tenant with a catch-all DEFAULT partition); and **M12.3** per-tenant LLM budget isolation (supervisor budget keyed by `tenantId`). The cloud-KMS *provisioning + rotation* lifecycle (M12.1) remains operator/Terraform; the app-side seam is complete. All optional cloud/security seams (NER, A2A mTLS, cloud embedders, brokers, per-tenant KMS, per-tenant pgvector partitioning, etc.) are **default-inert** — they load no SDK and change no behavior unless their env/data is set, so the credential-free offline eval gate stays byte-identical.
 
-**Docs:** full per-milestone history (M0 → M13) in `docs/MILESTONES.md`; architecture + implementation decisions in `docs/ARCHITECTURE.md`; optional env reference in `docs/CONFIGURATION.md`.
+**Docs:** full per-milestone history (M0 → M14) + a standing "Implemented vs not" survey in `docs/MILESTONES.md`; architecture + implementation decisions in `docs/ARCHITECTURE.md`; optional env reference in `docs/CONFIGURATION.md`.
 
 ## Run & Operate
 
@@ -18,7 +18,9 @@ Current milestone: **M13** (deterministic detector slices) on top of the eval su
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required env: `DATABASE_URL`, `SESSION_SECRET`. **Every optional subsystem — full env vars, defaults, credentials, and the cloud-aware embedder-selection table — is documented in `docs/CONFIGURATION.md` ("Optional env (by subsystem)").** All seams are **default-inert**: unset ⇒ no SDK loaded, no behavior change, eval gate byte-identical. Quick index of the switches (see CONFIGURATION.md for each):
   - Embedder — `EMBEDDING_PROVIDER` / `DEPLOYMENT_TARGET` / `EMBEDDING_DIM`.
-  - Lexical search (M10.1) — `SEARCH_PROVIDER=postgres|opensearch`.
+  - Per-tenant pgvector partitioning (M12.2) — `EMBEDDINGS_TENANT_PARTITIONING` (switch; off ⇒ single `finding_embeddings` table identical to pre-M12.2, on ⇒ LIST-by-tenant with a catch-all DEFAULT partition + opt-in per-tenant partitions).
+  - Per-tenant KMS keys (M12.1) — data-driven via the `tenant_kms_keys` table (no env switch); empty table ⇒ global `SESSION_SECRET` fallback, byte-identical to pre-M12.1.
+  - Lexical search (M10.1) — `SEARCH_PROVIDER=postgres|opensearch`; opt-in per-tenant index isolation `OPENSEARCH_PER_TENANT_INDEX` (off ⇒ single shared index + `tenant_id` filter, byte-identical; on ⇒ each tenant gets a physically separate index `${prefix}-${safeTenantSegment(tenantId)}`, term filter kept as defense-in-depth). Full external-index rebuild is batched + resumable: `SEARCH_REINDEX_BATCH_SIZE` (page size, default 500, clamped 1..10000) drives both the boot reconcile and the on-demand operator command (`pnpm --filter @workspace/api-server run reindex:search` — supports `--batch-size=N` and a composite `--since-tenant=<tenantId> --since-id=<findingId>` resume token (both required together — tenants are scanned in tenant_id order, so a bare id is ambiguous); no-op for Postgres).
   - Raw-evidence store (M10.2/M10.3) — `RAW_EVIDENCE_PROVIDER=database|s3|gcs|azure-blob`.
   - Raw-evidence tiering (M10.4) — `RAW_EVIDENCE_TIER_AGE_DAYS` (switch) / `_INTERVAL_MS` / `_BATCH_SIZE`.
   - Raw-evidence write retry — `RAW_EVIDENCE_WRITE_MAX_ATTEMPTS` / `RAW_EVIDENCE_WRITE_BACKOFF_MS` (bounded retry+backoff before the WORM write is declared degraded; default-inert without an external store).
@@ -30,13 +32,16 @@ Current milestone: **M13** (deterministic detector slices) on top of the eval su
   - NER detector (M13.3) — `NER_PROVIDER=none|aws-comprehend|gcp-dlp|azure-language`.
   - Cloud LLM runtime — `LLM_PROVIDER=bedrock|vertex|azure-openai`.
   - A2A cross-cloud mTLS + peer ABAC — `A2A_REQUIRE_MTLS` / `A2A_MTLS_*`.
-  - Cloud log source (M8) — `LOG_SOURCE=cloudwatch`.
+  - Cloud log source (M8 / M8.1) — `LOG_SOURCE=cloudwatch|cloud_logging|azure_monitor` (unified dispatcher; all three share the `PollingLogSource` loop, lazy SDKs). CloudWatch gained opt-in `CLOUDWATCH_MAX_CONCURRENT_GROUPS` (default 1 = byte-identical).
+  - Stuck-cursor reaper (M8.1) — `INGEST_SOURCE_STALL_AFTER_MS` (switch) / `INGEST_SOURCE_STALL_CHECK_INTERVAL_MS`: leader-locked edge-triggered scan of `log_source_checkpoints` ⇒ warning-level `ingest.source_stalled`.
+  - Ingest dead-letter queue (M8.1) — `INGEST_DEAD_LETTER_ENABLED` (switch) / `INGEST_DLQ_MAX_ATTEMPTS` / `INGEST_DLQ_BACKOFF_MS`: bounded retry+backoff, on terminal failure persists a metadata-only `ingest_dead_letter` marker + ledgers `ingest.dead_lettered` + ACKs (off ⇒ rethrow, byte-identical).
   - Event-bus transport — `LOG_BUS_PROVIDER=memory|kafka|nats`.
+  - Supervisor orchestration engine — `WORKFLOW_ENGINE=inprocess|temporal` (default `inprocess` = in-memory queue + CAS, byte-identical; `temporal` opt-in needs `TEMPORAL_ADDRESS` [+ `TEMPORAL_NAMESPACE`/`TEMPORAL_TASK_QUEUE`/`TEMPORAL_TLS`/`TEMPORAL_API_KEY`/`TEMPORAL_WORKFLOWS_PATH`], lazy `@temporalio/*` SDK, durable replay + workflow-id idempotency on top of the DB CAS; boot fails fast if selected without an address; cluster stays operator-provided).
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5; **AG-UI** (`@ag-ui/encoder` / `@ag-ui/core`) for UI↔agent SSE; **A2A** (`@a2a-js/sdk`) for agent↔agent (Supervisor → Triage/Verifier)
+- API: Express 5; **AG-UI** (`@ag-ui/encoder` / `@ag-ui/core`) for UI↔agent SSE; **A2A** (`@a2a-js/sdk`) for agent↔agent (Supervisor → Triage/Verifier); **Temporal** (`@temporalio/*`, optional/lazy) as a selectable durable supervisor-orchestration backend behind the `WorkflowEngine` seam (default in-process)
 - DB: PostgreSQL + Drizzle ORM, pgvector 0.8
 - Validation: Zod v4, `drizzle-zod`
 - API codegen: Orval (from OpenAPI spec)
@@ -60,7 +65,7 @@ Moved to `docs/ARCHITECTURE.md` **Appendix A — Implementation decisions log** 
 
 - Pluggable + PHI-guarded embedder; cloud-aware factory; deterministic dev feature-hash.
 - Hybrid retrieval = BM25 ∪ pgvector cosine, fused via RRF (k=60).
-- Lexical (BM25) leg is pluggable (`SEARCH_PROVIDER`): Postgres FTS (dev) or OpenSearch (prod), behind a `LexicalSearchProvider` seam; redacted-only mirror, no raw PHI in the searchable tier.
+- Lexical (BM25) leg is pluggable (`SEARCH_PROVIDER`): Postgres FTS (dev) or OpenSearch (prod), behind a `LexicalSearchProvider` seam; redacted-only mirror, no raw PHI in the searchable tier. Opt-in per-tenant index isolation (`OPENSEARCH_PER_TENANT_INDEX`) routes each tenant to a physically separate, collision-free index (sanitized prefix + raw-id hash suffix) with the `tenant_id` term filter kept as defense-in-depth; off ⇒ shared index byte-identical. Cluster-side per-index RBAC/alias provisioning is operator-deferred.
 - Agent context = hybrid top-K ∪ severity floor; full preloaded id list ledgered.
 - Bounded tool loop (`MAX_TOOL_CALLS=2`); per-agent allow-list in `policy.ts`.
 - Append-only ledger via advisory-locked writer + `ENABLE ALWAYS` triggers on `ledger_entries` AND `ledger_checkpoints`.
@@ -85,6 +90,8 @@ Moved to `docs/ARCHITECTURE.md` **Appendix A — Implementation decisions log** 
 - Auth (session cookies), per-tenant chat sessions, AG-UI SSE chat over findings.
 - Findings browse + single-finding read, all RLS-scoped, raw evidence excluded by safe projection.
 - Hybrid search exposed to the chat agent as a tool; agents cite findings as `[F:<id>]`.
+- `structured_query` agent tool: a Zod-validated **typed filter** (classification/severity/status/source[]/limit) resolved through `findingSafeColumns` — the agent plane never emits SQL (threat_model §EoP "no raw SQL from LLMs").
+- HITL remediation/proposal plane: the `propose_remediation` tool writes a PENDING `remediation_proposals` row (ledgers `remediation.proposed`) and **never executes**; humans decide via `GET /api/admin/remediation/proposals`, `POST …/:id/confirm` (session + step-up, ledgers `remediation.confirmed`) and `POST …/:id/reject` (ledgers `remediation.rejected`), CAS-guarded `pending→confirmed|rejected`. Proposal-inbox UI + an executing worker are deferred by design.
 - Tool-arg revalidation refuses canary tokens, PHI, oversize payloads, or malformed ids on every agent tool call; refusals materialize as critical/high incident findings.
 - Step-up auth (`POST /api/auth/step-up`) + break-glass raw-PHI view (`POST /api/admin/break-glass/grants`, `GET /api/admin/findings/:id/raw`) with per-access ledger events. Critical-severity grants require a second-analyst approval (`POST /api/admin/break-glass/grants/:id/approve`, `GET /api/admin/break-glass/pending-approvals`).
 - Per-user rate limits on chat, tools, and break-glass issuance; per-IP on login + step-up.
@@ -112,5 +119,6 @@ _None recorded._
 
 - See `.local/skills/pnpm-workspace/SKILL.md` for workspace structure, TypeScript setup, and package details.
 - Agent continuity / crash-recovery notes (gitignored): `.agent-context.md`.
+- Temporal supervisor backend (`WORKFLOW_ENGINE=temporal`) has an opt-in live-cluster verification harness: `pnpm --filter @workspace/api-server run test:temporal` (gated `temporal-integration.test.ts` + `scripts/run-temporal-integration.sh`, starts a local `temporal server start-dev`, no Docker). `@temporalio/*` are `optionalDependencies` (inert for the normal suite + eval gate). See `deploy/README.md` → "Live-cluster verification harness". Note: a live native worker can't execute in the Replit dev sandbox (OOM under host memory pressure) — run the harness on a resourced machine.
 - Deployment (M9.1 Helm + Docker, M9.4 Replit deploy path): `deploy/README.md`. Per-cloud overlays: `deploy/helm/phi-audit/values-{aws,gcp,azure}.yaml`. Terraform IaC is **built**: M9.2 `deploy/terraform/modules/postgres` (4 branches) + M9.3 `deploy/terraform/roots/{aws,gcp,azure}` (each consumes the module, emits Helm-overlay values, provisions the notarization key in a separate account/project/subscription). `pnpm run tf:fmt` validates. CI pipeline (`.github/workflows/ci.yml`) runs typecheck / eval-gate / api+dashboard tests / IaC-lint on push + PR. Deferred (cluster/cloud operator policy): service-mesh mTLS enforcement, per-tenant KMS lifecycle — see `deploy/README.md` "Still deferred".
 - Full env + embedder config reference: `docs/CONFIGURATION.md`. Per-milestone history (M0 → M13): `docs/MILESTONES.md`. Architecture + implementation decisions: `docs/ARCHITECTURE.md`.

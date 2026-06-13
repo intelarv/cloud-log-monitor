@@ -6,6 +6,7 @@
     "types": ["node"]
   },
   "include": ["src"],
+  "exclude": ["src/lib/agents/temporal-workflows.ts"],
   "references": [
     { "path": "../../lib/db" },
     { "path": "../../lib/api-zod" },

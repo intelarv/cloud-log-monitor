@@ -1,0 +1,98 @@
+# Live-cluster Temporal integration gate.
+#
+# This runs the opt-in `temporal-integration.test.ts` against a REAL
+# `temporal server start-dev` so the three behavioral guarantees of the
+# Temporal supervisor backend (WORKFLOW_ENGINE=temporal) are exercised
+# automatically instead of by hand:
+#   - Triage -> Verifier in-process activity sequence end-to-end,
+#   - duplicate-emit dedupe via workflow-id idempotency (AlreadyStarted),
+#   - worker-crash resume from the last completed activity (history replay).
+#
+# It is split out of ci.yml on purpose: the test boots a real Temporal dev
+# server + a native worker (which webpack-bundles the workflow graph), so it is
+# heavier and slower than the per-PR gates and cannot run in the Replit dev
+# sandbox (the native worker + dev server OOM-kill under host memory pressure).
+# A GitHub-hosted ubuntu-latest runner has enough memory, so it runs here on a
+# nightly schedule (a standing gate), on manual dispatch, and on PRs that touch
+# the Temporal backend itself.
+#
+# The optional @temporalio/* packages live in optionalDependencies, so the plain
+# `pnpm install --frozen-lockfile` already installs them on this runner; the
+# run-temporal-integration.sh script finds the `temporal` CLI that
+# setup-temporal puts on PATH, starts the dev server, runs only the gated spec,
+# and tears the server down afterwards.
+
+name: Temporal integration (live cluster)
+
+on:
+  schedule:
+    # Nightly at 04:00 UTC (offset from other nightly jobs).
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+  pull_request:
+    # Only gate PRs that touch the Temporal backend or this workflow.
+    paths:
+      - "artifacts/api-server/src/lib/agents/temporal-engine.ts"
+      - "artifacts/api-server/src/lib/agents/temporal-workflows.ts"
+      - "artifacts/api-server/src/lib/agents/temporal-integration.test.ts"
+      - "artifacts/api-server/src/lib/agents/review-orchestration.ts"
+      - "artifacts/api-server/scripts/run-temporal-integration.sh"
+      - ".github/workflows/temporal-integration.yml"
+
+# Cancel superseded runs on the same ref so a fresh push wins.
+concurrency:
+  group: temporal-integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin the toolchain to what the repo develops against (Node 24, pnpm 10).
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10"
+
+jobs:
+  temporal-integration:
+    name: Temporal live-cluster integration test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      # Puts the single-binary `temporal` CLI on PATH; the runner script then
+      # starts `temporal server start-dev` itself (no Docker, no service
+      # container needed).
+      - name: Install Temporal CLI
+        uses: temporalio/setup-temporal@v0
+      # --frozen-lockfile installs optionalDependencies by default, so the
+      # @temporalio/* SDK the live test needs is present.
+      - run: pnpm install --frozen-lockfile
+      - name: Temporal live-cluster integration test
+        id: temporal_test
+        run: pnpm --filter @workspace/api-server run test:temporal
+      # Page on-call when the NIGHTLY scheduled run goes red. A red run otherwise
+      # only shows up in the Actions tab — nobody is paged. This reuses the same
+      # CHANNEL_* notifier path + severity gating as the eval gate (Slack / HMAC
+      # webhook / PagerDuty); it is inert (logs only) when no channel secret is
+      # set, so a fork or a repo without secrets pages nothing. It runs ONLY on
+      # the nightly schedule, so manual (workflow_dispatch) and PR re-runs never
+      # page — a red result there is already visible to whoever triggered it. The
+      # notifier always exits 0, so it never changes the job result: the failed
+      # test step above is what keeps the run red.
+      - name: Alert on-call (nightly failure only)
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        run: node artifacts/api-server/evals/temporal-notify.mjs --exit-code=1
+        env:
+          CHANNEL_SLACK_WEBHOOK_URL: ${{ secrets.CHANNEL_SLACK_WEBHOOK_URL }}
+          CHANNEL_SLACK_MIN_SEVERITY: ${{ vars.CHANNEL_SLACK_MIN_SEVERITY }}
+          CHANNEL_WEBHOOK_URL: ${{ secrets.CHANNEL_WEBHOOK_URL }}
+          CHANNEL_WEBHOOK_SECRET: ${{ secrets.CHANNEL_WEBHOOK_SECRET }}
+          CHANNEL_WEBHOOK_ALLOWED_HOSTS: ${{ vars.CHANNEL_WEBHOOK_ALLOWED_HOSTS }}
+          CHANNEL_WEBHOOK_MIN_SEVERITY: ${{ vars.CHANNEL_WEBHOOK_MIN_SEVERITY }}
+          CHANNEL_PAGERDUTY_ROUTING_KEY: ${{ secrets.CHANNEL_PAGERDUTY_ROUTING_KEY }}
+          CHANNEL_PAGERDUTY_MIN_SEVERITY: ${{ vars.CHANNEL_PAGERDUTY_MIN_SEVERITY }}
+          CHANNEL_PAGERDUTY_EVENTS_URL: ${{ vars.CHANNEL_PAGERDUTY_EVENTS_URL }}
+          CHANNEL_PAGERDUTY_DEDUP_KEY: ${{ vars.CHANNEL_PAGERDUTY_DEDUP_KEY }}

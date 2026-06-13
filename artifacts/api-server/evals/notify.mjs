@@ -761,6 +761,19 @@ export function defaultHeartbeatDedupKey() {
   return "eval-gate-heartbeat";
 }
 
+/** Default dedup key for the nightly Temporal live-cluster integration gate page
+ *  when CHANNEL_PAGERDUTY_DEDUP_KEY is unset: a single STABLE key (no date), for
+ *  the same reason as the other two defaults — re-runs fold into one incident.
+ *
+ *  Kept DISTINCT from both defaultPagerDutyDedupKey() (the eval-gate run) and
+ *  defaultHeartbeatDedupKey() (the dead-man's switch) so a failing Temporal gate
+ *  is its own incident: a broken durable-orchestration backend is a different
+ *  problem from a failing detector/agent quality suite or a quiet nightly job,
+ *  and on-call must see them independently. */
+export function defaultTemporalDedupKey() {
+  return "temporal-integration-nightly";
+}
+
 /** Send a PagerDuty Events API v2 `resolve` to clear an open heartbeat "went
  *  quiet" incident. Keyed on the SAME dedup_key the staleness trigger uses
  *  (`channel.dedupKey || defaultHeartbeatDedupKey()`), so a healthy check
@@ -969,7 +982,15 @@ async function sendToChannel(channel, text, summary, fetchImpl, { outcome, sever
  *  notifier (notifyEvalGate) AND the heartbeat / dead-man's-switch checker
  *  (heartbeat.mjs) so both land in the SAME place via the SAME CHANNEL_*
  *  config + severity gating. */
-export async function postToChannels({ env = process.env, severity, text, payload, fetchImpl = fetch }) {
+export async function postToChannels({
+  env = process.env,
+  severity,
+  text,
+  payload,
+  fetchImpl = fetch,
+  pagerDutyDedupKey = defaultHeartbeatDedupKey(),
+  pagerDutySource = "phi-audit eval-gate.heartbeat",
+}) {
   const channels = parseChannels(env);
   if (channels.length === 0) {
     console.log(
@@ -1002,14 +1023,14 @@ export async function postToChannels({ env = process.env, severity, text, payloa
         // A single STABLE dedup_key (no date) so a still-stale check folds into
         // the one open "went quiet" incident AND the resolve a later healthy
         // check sends (resolveHeartbeat) targets exactly this incident.
-        const dedupKey = channel.dedupKey || defaultHeartbeatDedupKey();
+        const dedupKey = channel.dedupKey || pagerDutyDedupKey;
         const event = {
           routing_key: channel.routingKey,
           event_action: "trigger",
           dedup_key: dedupKey,
           payload: {
             summary: String(text).slice(0, 1024),
-            source: "phi-audit eval-gate.heartbeat",
+            source: pagerDutySource,
             severity: PAGERDUTY_SEVERITY[severity] ?? "error",
             timestamp: new Date().toISOString(),
             component: "eval-gate",

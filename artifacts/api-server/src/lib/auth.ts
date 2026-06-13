@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Request, Response, NextFunction, RequestHandler } from "express";
+import { resolveTenantSecret } from "./tenant-kms";
 
 const COOKIE_NAME = "phia_sess";
 const STEP_UP_COOKIE_NAME = "phia_stepup";
@@ -51,13 +52,27 @@ function b64url(buf: Buffer): string {
   return buf.toString("base64url");
 }
 
+// M12.1: per-tenant signing key. When a tenant has a dedicated key registered
+// (tenant_kms_keys), cookies for that tenant are HMAC'd under the tenant's key
+// instead of the single global SESSION_SECRET, so a compromise of one tenant's
+// key cannot forge another tenant's session/step-up cookie. Default-inert: with
+// no registered key (the dev/eval default) this returns the global secret and
+// every signature is byte-identical to pre-M12.1.
+function keyFor(tenantId?: string): string {
+  if (tenantId) {
+    const perTenant = resolveTenantSecret(tenantId, "auth");
+    if (perTenant) return perTenant;
+  }
+  return secret();
+}
+
 // Step-up signatures are domain-separated from session signatures by mixing in
 // a constant tag. Otherwise a session-cookie value could be replayed as a
 // step-up cookie and vice-versa (a "type confusion" if both used the same
 // HMAC). Using a tag in the signing input is the standard fix.
-function sign(payload: string, tag = "session"): string {
+function sign(payload: string, tag = "session", tenantId?: string): string {
   return b64url(
-    createHmac("sha256", secret()).update(`${tag}:${payload}`).digest(),
+    createHmac("sha256", keyFor(tenantId)).update(`${tag}:${payload}`).digest(),
   );
 }
 
@@ -72,7 +87,7 @@ export function issueCookie(res: Response, session: Omit<Session, "exp">): Sessi
   const exp = Math.floor(Date.now() / 1000) + DEFAULT_TTL_SECONDS;
   const full: Session = { ...session, exp };
   const payload = b64url(Buffer.from(JSON.stringify(full)));
-  const sig = sign(payload, "session");
+  const sig = sign(payload, "session", full.tenant_id);
   const value = `${payload}.${sig}`;
   res.cookie(COOKIE_NAME, value, {
     httpOnly: true,
@@ -95,19 +110,27 @@ export function parseCookie(raw: string | undefined): Session | null {
   if (dot < 0) return null;
   const payload = raw.slice(0, dot);
   const sig = raw.slice(dot + 1);
-  if (!safeEqual(sig, sign(payload, "session"))) return null;
+  // M12.1: decode the (still-unverified) payload first to learn which tenant's
+  // key to verify under. This is safe — JSON.parse on attacker input only
+  // SELECTS the key; the HMAC below must still validate, so forging a cookie for
+  // a tenant with a dedicated key requires that tenant's key, and a tenant with
+  // no dedicated key falls back to the global secret (identical to pre-M12.1).
+  let session: Session;
   try {
-    const session = JSON.parse(
+    session = JSON.parse(
       Buffer.from(payload, "base64url").toString("utf8"),
     ) as Session;
-    if (typeof session.exp !== "number" || session.exp * 1000 < Date.now()) {
-      return null;
-    }
-    if (!session.sub || !session.tenant_id) return null;
-    return session;
   } catch {
     return null;
   }
+  const tenantId =
+    typeof session?.tenant_id === "string" ? session.tenant_id : undefined;
+  if (!safeEqual(sig, sign(payload, "session", tenantId))) return null;
+  if (typeof session.exp !== "number" || session.exp * 1000 < Date.now()) {
+    return null;
+  }
+  if (!session.sub || !session.tenant_id) return null;
+  return session;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +158,7 @@ export function issueStepUpCookie(
   const exp = Math.floor(Date.now() / 1000) + STEP_UP_TTL_SECONDS;
   const full: StepUpSession = { ...s, exp };
   const payload = b64url(Buffer.from(JSON.stringify(full)));
-  const sig = sign(payload, "stepup");
+  const sig = sign(payload, "stepup", full.tenant_id);
   res.cookie(STEP_UP_COOKIE_NAME, `${payload}.${sig}`, {
     httpOnly: true,
     sameSite: "lax",
@@ -152,17 +175,21 @@ export function parseStepUpCookie(raw: string | undefined): StepUpSession | null
   if (dot < 0) return null;
   const payload = raw.slice(0, dot);
   const sig = raw.slice(dot + 1);
-  if (!safeEqual(sig, sign(payload, "stepup"))) return null;
+  // M12.1: select the tenant's key from the unverified payload, then verify
+  // (see parseCookie for why this ordering is safe).
+  let s: StepUpSession;
   try {
-    const s = JSON.parse(
+    s = JSON.parse(
       Buffer.from(payload, "base64url").toString("utf8"),
     ) as StepUpSession;
-    if (typeof s.exp !== "number" || s.exp * 1000 < Date.now()) return null;
-    if (!s.sub || !s.tenant_id) return null;
-    return s;
   } catch {
     return null;
   }
+  const tenantId = typeof s?.tenant_id === "string" ? s.tenant_id : undefined;
+  if (!safeEqual(sig, sign(payload, "stepup", tenantId))) return null;
+  if (typeof s.exp !== "number" || s.exp * 1000 < Date.now()) return null;
+  if (!s.sub || !s.tenant_id) return null;
+  return s;
 }
 
 /**

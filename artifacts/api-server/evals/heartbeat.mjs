@@ -85,12 +85,27 @@ export const DEFAULT_PING_TIMEOUT_MS = 10000;
 
 const HEARTBEAT_TABLE = "eval_gate_heartbeats";
 
+// `last_success_at` is nullable by design: a run that has only signalled --start
+// (no completion yet) has a `last_start_at` but no success stamp, and that
+// "started-but-not-yet-finished" state is exactly what the hung-run check reads.
 const DDL = `CREATE TABLE IF NOT EXISTS ${HEARTBEAT_TABLE} (
   gate_name text PRIMARY KEY,
-  last_success_at timestamptz NOT NULL,
+  last_success_at timestamptz,
+  last_start_at timestamptz,
   outcome text,
   updated_at timestamptz NOT NULL DEFAULT now()
 )`;
+
+/** Idempotently create/upgrade the heartbeat table. Older deployments created
+ *  the table before the hung-run columns existed, so we additively migrate in
+ *  place: add `last_start_at` if missing and relax the original NOT NULL on
+ *  `last_success_at` (a start-only row legitimately has no success stamp yet).
+ *  All three statements are safe to re-run on every connection. */
+async function ensureSchema(pool) {
+  await pool.query(DDL);
+  await pool.query(`ALTER TABLE ${HEARTBEAT_TABLE} ADD COLUMN IF NOT EXISTS last_start_at timestamptz`);
+  await pool.query(`ALTER TABLE ${HEARTBEAT_TABLE} ALTER COLUMN last_success_at DROP NOT NULL`);
+}
 
 /** Which gate this heartbeat tracks (single-valued for now). */
 export function gateName(env = process.env) {
@@ -114,6 +129,27 @@ export function parseMaxAgeMinutes(env = process.env) {
   return n;
 }
 
+// Default max run-duration (minutes) before a started-but-uncompleted run is
+// declared hung: 2h. Must exceed the longest legitimate eval run (the LLM
+// suites dominate) plus scheduling slack, or a slow-but-healthy run would
+// false-page. Operators tune via EVAL_HEARTBEAT_MAX_RUN_MINUTES.
+export const DEFAULT_MAX_RUN_MINUTES = 120;
+
+/** Parse EVAL_HEARTBEAT_MAX_RUN_MINUTES (default 2h). Non-positive / non-numeric
+ *  warns + falls back so a typo can never silently disable the hung-run switch. */
+export function parseMaxRunMinutes(env = process.env) {
+  const raw = env.EVAL_HEARTBEAT_MAX_RUN_MINUTES;
+  if (raw === undefined || String(raw).trim() === "") return DEFAULT_MAX_RUN_MINUTES;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.warn(
+      `[eval-heartbeat] invalid EVAL_HEARTBEAT_MAX_RUN_MINUTES=${raw}; defaulting to ${DEFAULT_MAX_RUN_MINUTES}`,
+    );
+    return DEFAULT_MAX_RUN_MINUTES;
+  }
+  return n;
+}
+
 /** Age of a heartbeat in minutes, or null when there is no heartbeat. */
 export function ageMinutes(lastSuccessAt, now = Date.now()) {
   if (!lastSuccessAt) return null;
@@ -128,6 +164,26 @@ export function isStale(lastSuccessAt, maxAgeMinutes, now = Date.now()) {
   const age = ageMinutes(lastSuccessAt, now);
   if (age === null) return true;
   return age > maxAgeMinutes;
+}
+
+/** A run is hung (→ page) when it signalled --start but no matching completion
+ *  arrived within the max run-duration window. Concretely: a `last_start_at`
+ *  exists, no completion is at/after it (`last_success_at` is missing or older
+ *  than the start), and the start is older than `maxRunMinutes`.
+ *
+ *  A completion at/after the start means the run finished (or a newer run did),
+ *  so it is NOT hung — this is what makes a normal completed run, and a job that
+ *  simply never started (start stamp older than the last success), both read as
+ *  healthy here and leaves them to the slower completion-staleness check. */
+export function isHung(lastStartAt, lastSuccessAt, maxRunMinutes, now = Date.now()) {
+  if (!lastStartAt) return false;
+  const startTs = new Date(lastStartAt).getTime();
+  if (Number.isNaN(startTs)) return false;
+  if (lastSuccessAt) {
+    const successTs = new Date(lastSuccessAt).getTime();
+    if (!Number.isNaN(successTs) && successTs >= startTs) return false;
+  }
+  return (now - startTs) / 60000 > maxRunMinutes;
 }
 
 /** Human-readable Slack body. Liveness metadata only — no scores, no PHI. */
@@ -215,6 +271,88 @@ export async function evaluateHeartbeat({
     fetchImpl,
   });
   return { stale: true, skipped, sent, severity: HEARTBEAT_SEVERITY, ageMinutes: age, maxAgeMinutes };
+}
+
+/** Human-readable Slack body for a hung run. Liveness metadata only — no PHI. */
+export function buildHungText({ name, lastStartAt, lastSuccessAt, maxRunMinutes, now = Date.now() }) {
+  const runMin = ageMinutes(lastStartAt, now);
+  const started = lastStartAt ? new Date(lastStartAt).toISOString() : "unknown";
+  const lastOk = lastSuccessAt ? new Date(lastSuccessAt).toISOString() : "never";
+  const runStr = runMin === null ? "n/a" : `${Math.round(runMin)}min`;
+  return [
+    `[ALERT ${HEARTBEAT_SEVERITY}] eval-gate.run_hung — eval run for gate '${name}' started ${runStr} ago but never completed (limit ${maxRunMinutes}min)`,
+    `started: ${started}; last clean completion: ${lastOk}; expected to finish within ${maxRunMinutes}min`,
+    "cause: a run signalled --start but no matching --record completion arrived within the max-run window — a hung suite, a wedged LLM call past its timeout, or a pod killed mid-run. The completion-staleness switch would not catch this until a full interval later; this is the fast signal.",
+  ].join("\n");
+}
+
+/** Signed-webhook payload for a hung run. Liveness metadata only — no PHI. */
+export function buildHungPayload({ name, lastStartAt, lastSuccessAt, maxRunMinutes, now = Date.now() }) {
+  return {
+    kind: "eval_gate_run_hung",
+    severity: HEARTBEAT_SEVERITY,
+    gateName: name,
+    lastStartAt: lastStartAt ? new Date(lastStartAt).toISOString() : null,
+    lastSuccessAt: lastSuccessAt ? new Date(lastSuccessAt).toISOString() : null,
+    runMinutes: ageMinutes(lastStartAt, now),
+    maxRunMinutes,
+    occurredAt: new Date(now).toISOString(),
+  };
+}
+
+/** Decide on a started-but-uncompleted run and, if hung, post the alert. Pure
+ *  w.r.t. the DB — it takes the already-fetched `lastStartAt`/`lastSuccessAt`
+ *  and an injectable `fetchImpl`, so it is unit-testable without a database.
+ *
+ *  The hung page rides the SAME channels + severity gating as the "went quiet"
+ *  page and intentionally reuses the SAME PagerDuty liveness dedup_key (via
+ *  postToChannels): a hung run and a quiet job are both "the nightly mechanism
+ *  is unhealthy", so they fold into one liveness incident whose summary reflects
+ *  the current cause, and the SAME resolveHeartbeat auto-clears it when a later
+ *  run completes. Only the message text + payload `kind` differ.
+ *
+ *  Returns `{ hung, skipped, sent, severity, runMinutes, maxRunMinutes }`. */
+export async function evaluateHungRun({
+  env = process.env,
+  name = gateName(env),
+  lastStartAt,
+  lastSuccessAt,
+  maxRunMinutes = parseMaxRunMinutes(env),
+  now = Date.now(),
+  fetchImpl = fetch,
+} = {}) {
+  const runMin = ageMinutes(lastStartAt, now);
+  if (!isHung(lastStartAt, lastSuccessAt, maxRunMinutes, now)) {
+    return { hung: false, skipped: true, sent: [], severity: HEARTBEAT_SEVERITY, runMinutes: runMin, maxRunMinutes };
+  }
+
+  console.warn(
+    `[eval-heartbeat] gate '${name}' RUN HUNG (started ${
+      lastStartAt ? new Date(lastStartAt).toISOString() : "?"
+    }, ${runMin === null ? "n/a" : `${Math.round(runMin)}min`} ago > ${maxRunMinutes}min, no completion); alerting`,
+  );
+
+  // Same config-suppression visibility as the staleness path.
+  if (parseChannels(env).length === 0) {
+    console.warn(
+      "[eval-heartbeat] RUN HUNG but no channel configured — on-call will NOT be paged; configure CHANNEL_* on the heartbeat CronJob",
+    );
+  } else if (selectForSeverity(parseChannels(env), HEARTBEAT_SEVERITY).length === 0) {
+    console.warn(
+      `[eval-heartbeat] RUN HUNG but no channel accepts '${HEARTBEAT_SEVERITY}' severity — check CHANNEL_*_MIN_SEVERITY`,
+    );
+  }
+
+  const text = buildHungText({ name, lastStartAt, lastSuccessAt, maxRunMinutes, now });
+  const payload = buildHungPayload({ name, lastStartAt, lastSuccessAt, maxRunMinutes, now });
+  const { skipped, sent } = await postToChannels({
+    env,
+    severity: HEARTBEAT_SEVERITY,
+    text,
+    payload,
+    fetchImpl,
+  });
+  return { hung: true, skipped, sent, severity: HEARTBEAT_SEVERITY, runMinutes: runMin, maxRunMinutes };
 }
 
 /** The external uptime / dead-man's-switch ping URL (healthchecks.io /
@@ -384,25 +522,33 @@ export async function recordHeartbeat({ env = process.env, evalsDir, outcome, ex
 
   // In-cluster leg: stamp the durable row. Wrapped so a DB failure cannot stop
   // the external leg below — the two legs are independent dead-man's switches.
+  // Skipped quietly without a database (e.g. the per-change gate, which is
+  // external-monitor-only) so there is no connection attempt against a missing
+  // or placeholder DB.
   let recorded = false;
-  try {
-    const pool = newPool(env);
+  if (env.DATABASE_URL) {
     try {
-      await pool.query(DDL);
-      await pool.query(
-        `INSERT INTO ${HEARTBEAT_TABLE} (gate_name, last_success_at, outcome, updated_at)
-         VALUES ($1, now(), $2, now())
-         ON CONFLICT (gate_name)
-         DO UPDATE SET last_success_at = now(), outcome = EXCLUDED.outcome, updated_at = now()`,
-        [name, resolvedOutcome],
-      );
-      recorded = true;
-      console.log(`[eval-heartbeat] recorded heartbeat for gate '${name}' (outcome ${resolvedOutcome})`);
-    } finally {
-      await pool.end();
+      const pool = newPool(env);
+      try {
+        await ensureSchema(pool);
+        // Stamp the completion. `last_start_at` is left untouched: a completion
+        // after a start makes `last_success_at >= last_start_at`, which clears the
+        // hung-run condition for that started run.
+        await pool.query(
+          `INSERT INTO ${HEARTBEAT_TABLE} (gate_name, last_success_at, outcome, updated_at)
+           VALUES ($1, now(), $2, now())
+           ON CONFLICT (gate_name)
+           DO UPDATE SET last_success_at = now(), outcome = EXCLUDED.outcome, updated_at = now()`,
+          [name, resolvedOutcome],
+        );
+        recorded = true;
+        console.log(`[eval-heartbeat] recorded heartbeat for gate '${name}' (outcome ${resolvedOutcome})`);
+      } finally {
+        await pool.end();
+      }
+    } catch (err) {
+      console.error(`[eval-heartbeat] DB heartbeat record failed (non-fatal): ${err?.message ?? err}`);
     }
-  } catch (err) {
-    console.error(`[eval-heartbeat] DB heartbeat record failed (non-fatal): ${err?.message ?? err}`);
   }
 
   // External leg: ping the external uptime monitor so a cluster-down condition
@@ -413,30 +559,83 @@ export async function recordHeartbeat({ env = process.env, evalsDir, outcome, ex
   return { recorded, gateName: name, outcome: resolvedOutcome, ping };
 }
 
-/** --start: ping the external monitor that a nightly run is BEGINNING, before
- *  the eval suite executes. Purely the external leg — no DB row is stamped here,
- *  because the in-cluster checker tracks completion liveness, while the start
- *  signal exists so the external monitor can flag a run that began but never
- *  reported completion (a hung suite). Inert + non-fatal like the record leg. */
+/** --start: signal a nightly run is BEGINNING, before the eval suite executes.
+ *  Two independent legs, mirroring --record:
+ *    - in-cluster: stamp `last_start_at = now()` so the in-cluster --check can
+ *      flag a run that began but never completed (hung), even with NO external
+ *      monitor configured. `last_success_at` is left untouched. Stamped only
+ *      when DATABASE_URL is set; an external-only deployment skips it quietly
+ *      (hung detection is unavailable without the durable row, by design).
+ *    - external: ping the monitor's "start" endpoint so it too can flag a run
+ *      that began but never reported completion.
+ *  Both legs are best-effort + non-fatal: a failure is logged and swallowed so
+ *  the start signal can never block or fail the eval run that follows it. */
 export async function startHeartbeat({ env = process.env, fetchImpl = fetch } = {}) {
+  const name = gateName(env);
+
+  // In-cluster leg: stamp the run-start marker. Wrapped so a DB failure cannot
+  // stop the external leg below. Skipped quietly without a database.
+  let recorded = false;
+  if (env.DATABASE_URL) {
+    try {
+      const pool = newPool(env);
+      try {
+        await ensureSchema(pool);
+        await pool.query(
+          `INSERT INTO ${HEARTBEAT_TABLE} (gate_name, last_start_at, updated_at)
+           VALUES ($1, now(), now())
+           ON CONFLICT (gate_name)
+           DO UPDATE SET last_start_at = now(), updated_at = now()`,
+          [name],
+        );
+        recorded = true;
+        console.log(`[eval-heartbeat] recorded run-start for gate '${name}'`);
+      } finally {
+        await pool.end();
+      }
+    } catch (err) {
+      console.error(`[eval-heartbeat] DB run-start record failed (non-fatal): ${err?.message ?? err}`);
+    }
+  }
+
+  // External leg: ping the monitor's start endpoint.
   const ping = await pingExternalHeartbeat({ env, fetchImpl, stage: "start" });
-  return { gateName: gateName(env), ping };
+  return { recorded, gateName: name, ping };
 }
 
-/** --check: fetch the heartbeat and page if stale. */
+/** --check: fetch the heartbeat and page if the nightly mechanism is unhealthy.
+ *  Two failure modes, evaluated against one fetch of both stamps:
+ *    1. hung run — a --start with no matching completion past the max-run window
+ *       (the fast, specific signal; catches a wedged run within ~hours).
+ *    2. went quiet — the last completion is older than the max-age window
+ *       (the slow, broad signal; catches a job that stopped running entirely).
+ *  Hung takes priority: when a run is hung we page the hung incident and skip
+ *  the completion-staleness branch this cycle, because both describe "the
+ *  nightly is unhealthy" and the hung message is the actionable one. They share
+ *  one PagerDuty liveness incident, so a later completed run auto-resolves it via
+ *  the staleness branch's resolveHeartbeat. An old row with no `last_start_at`
+ *  (pre-upgrade, or a job that has never signalled --start) is never hung, so
+ *  the behavior is byte-identical to before for those deployments. */
 export async function checkHeartbeat({ env = process.env, now = Date.now(), fetchImpl = fetch } = {}) {
   const name = gateName(env);
   const pool = newPool(env);
   let lastSuccessAt = null;
+  let lastStartAt = null;
   try {
-    await pool.query(DDL);
+    await ensureSchema(pool);
     const res = await pool.query(
-      `SELECT last_success_at FROM ${HEARTBEAT_TABLE} WHERE gate_name = $1`,
+      `SELECT last_success_at, last_start_at FROM ${HEARTBEAT_TABLE} WHERE gate_name = $1`,
       [name],
     );
     lastSuccessAt = res.rows[0]?.last_success_at ?? null;
+    lastStartAt = res.rows[0]?.last_start_at ?? null;
   } finally {
     await pool.end();
+  }
+
+  const maxRunMinutes = parseMaxRunMinutes(env);
+  if (isHung(lastStartAt, lastSuccessAt, maxRunMinutes, now)) {
+    return evaluateHungRun({ env, name, lastStartAt, lastSuccessAt, maxRunMinutes, now, fetchImpl });
   }
   return evaluateHeartbeat({ env, name, lastSuccessAt, now, fetchImpl });
 }

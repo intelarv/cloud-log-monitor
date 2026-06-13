@@ -235,9 +235,23 @@ export interface CheckpointVerifyResult {
   mismatch_count: number;
   /** Capped sample of mismatch descriptions for the alert payload. */
   first_mismatches: string[];
+  /** Checkpoints whose notarized head hash is the all-zero placeholder: never
+   *  externally notarized (e.g. a forged/placeholder row, or dev test
+   *  pollution), as opposed to a genuine live≠notarized tamper. Counted
+   *  separately so it does NOT raise the critical tamper alert. */
+  unnotarized_count: number;
+  /** Capped sample of "not yet notarized" descriptions. */
+  first_unnotarized: string[];
 }
 
 const MAX_MISMATCHES_IN_PAYLOAD = 5;
+
+// An all-zero (or empty) notarized head hash is never a value the real notarizer
+// produces over a non-empty ledger (a head hash is a SHA-256 of real content);
+// it marks a checkpoint that was never externally notarized — a placeholder.
+function isUnnotarizedHash(h: string): boolean {
+  return h.length === 0 || /^0+$/.test(h);
+}
 
 /** Walk every checkpoint with seq > `sinceSeq` and verify two things:
  *    (a) signature is a valid HMAC over (seq, head_hash, notarized_at, key_id)
@@ -248,14 +262,21 @@ const MAX_MISMATCHES_IN_PAYLOAD = 5;
  *  commit alert hook routes critical per §25. */
 export async function verifyCheckpoints(
   sinceSeq = 0,
+  // Optional db handle so tests can run the verifier inside a transaction and
+  // roll it back — that lets the genuine-tamper path be exercised against the
+  // real schema WITHOUT persisting a forged mismatch row into the shared dev
+  // ledger (which would re-introduce perpetual checkpoint_mismatch ERRORs).
+  // Production always uses the module-level `db`.
+  dbh: Pick<typeof db, "select"> = db,
 ): Promise<CheckpointVerifyResult> {
-  const checkpoints = await db
+  const checkpoints = await dbh
     .select()
     .from(ledgerCheckpointsTable)
     .where(gt(ledgerCheckpointsTable.seq, sinceSeq))
     .orderBy(ledgerCheckpointsTable.seq);
 
   const mismatches: string[] = [];
+  const unnotarized: string[] = [];
   let walked = 0;
 
   for (const c of checkpoints) {
@@ -287,7 +308,7 @@ export async function verifyCheckpoints(
       continue;
     }
     // (b) live ledger row hashes to head_hash
-    const [live] = await db
+    const [live] = await dbh
       .select({ hash: ledgerEntriesTable.hash })
       .from(ledgerEntriesTable)
       .where(eq(ledgerEntriesTable.seq, c.seq))
@@ -299,6 +320,17 @@ export async function verifyCheckpoints(
       continue;
     }
     if (live.hash !== c.headHash) {
+      if (isUnnotarizedHash(c.headHash)) {
+        // Placeholder head hash: this checkpoint was never externally notarized
+        // (forged/placeholder row, e.g. dev test pollution), NOT a tamper. A
+        // genuine tamper carries a real notarized hash that disagrees with the
+        // live row. Track separately so `ok` stays true and the critical
+        // tamper alert is not raised for an expected/benign placeholder.
+        unnotarized.push(
+          `checkpoint seq=${c.seq}: not yet notarized (placeholder head_hash; live ${live.hash})`,
+        );
+        continue;
+      }
       mismatches.push(
         `checkpoint seq=${c.seq}: live hash ${live.hash} != notarized ${c.headHash}`,
       );
@@ -311,6 +343,8 @@ export async function verifyCheckpoints(
     walked,
     mismatch_count: mismatches.length,
     first_mismatches: mismatches.slice(0, MAX_MISMATCHES_IN_PAYLOAD),
+    unnotarized_count: unnotarized.length,
+    first_unnotarized: unnotarized.slice(0, MAX_MISMATCHES_IN_PAYLOAD),
   };
 }
 
@@ -322,5 +356,6 @@ export const __test__ = {
   computeSignature,
   constantTimeEq,
   resetRetiredKeysCache,
+  isUnnotarizedHash,
   MAX_MISMATCHES_IN_PAYLOAD,
 };

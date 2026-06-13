@@ -25,7 +25,7 @@
 
 import { randomUUID, createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { findingsTable } from "@workspace/db";
+import { db, findingsTable, ingestDeadLetterTable } from "@workspace/db";
 import { withTenant } from "./db-context";
 import { appendLedger } from "./ledger";
 import { scanForPhi, redactInline, mergePhiHits, type PhiHit } from "./redact";
@@ -62,6 +62,55 @@ const MAX_PAYLOAD_BYTES = 64 * 1024;
 const TENANT_ID_RE = /^[A-Za-z0-9_-]+$/;
 const SOURCE_NAME_RE = /^[A-Za-z0-9._/-]+$/;
 const SOURCE_RECORD_ID_RE = /^[A-Za-z0-9._:/-]+$/;
+
+/** Parse a bounded positive-integer env var, clamping into `[min, max]` and
+ *  falling back to `def` when unset/blank/non-numeric. Keeps misconfigured
+ *  env from disabling the retry or wedging it at an absurd value. */
+function intEnv(raw: string | undefined, def: number, min: number, max: number) {
+  const n = raw === undefined || raw.trim() === "" ? NaN : Number(raw);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+// External raw-evidence write retry. Many object-store `put` failures
+// (throttling, brief 5xx, connection resets) are transient and clear on a
+// quick retry. We retry the WORM write a bounded number of times with
+// exponential backoff BEFORE declaring durable capture degraded (latch +
+// `ingest.raw_evidence_store_failed`). This recovers most blips automatically
+// and cuts operator alert noise. The retry sits OUTSIDE the dedup advisory
+// lock (the `put` already runs there), so backoff never serializes concurrent
+// ingests of the same fingerprint. Default-inert end-to-end: only reachable
+// when an external store is configured, so the credential-free eval path and
+// the inline-DB dev path are byte-identical. `MAX_ATTEMPTS=1` disables retry.
+const RAW_EVIDENCE_WRITE_MAX_ATTEMPTS = intEnv(
+  process.env.RAW_EVIDENCE_WRITE_MAX_ATTEMPTS,
+  3,
+  1,
+  10,
+);
+const RAW_EVIDENCE_WRITE_BACKOFF_MS = intEnv(
+  process.env.RAW_EVIDENCE_WRITE_BACKOFF_MS,
+  100,
+  0,
+  60_000,
+);
+// Hard ceiling on any single computed backoff delay, so exponential growth
+// from a large base can't stall a raw write for an unbounded time.
+const RAW_EVIDENCE_WRITE_BACKOFF_MAX_MS = 60_000;
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** In-memory degraded-state latch for the external raw-evidence WORM store,
+ *  keyed by `${provider}::${tenant}`. A failed `store.put` adds the key; the
+ *  next successful `store.put` for the same key deletes it and emits the
+ *  `ingest.raw_evidence_store_recovered` signal (the recovery edge). In-memory
+ *  by design: the healthy high-volume success path must stay free of any
+ *  DB/ledger round-trip, and the latch is a best-effort operator convenience,
+ *  NOT an audit record — every failure and every recovery is independently
+ *  ledgered. A process restart simply re-learns the state from the next
+ *  failure. Exported only so tests can reset it between cases. */
+export const rawEvidenceStoreDegraded = new Set<string>();
 
 /** Classification → severity. One finding per (source, classification) so a
  *  multi-class record fans out to multiple findings, each with its own
@@ -164,6 +213,11 @@ export interface IngestDeps {
   // provider (or none); explicit `null` disables Stage-2 (test default). The
   // default path is unchanged unless an operator sets `NER_PROVIDER`.
   ner?: NerProvider | null;
+  // Optional override for the external raw-evidence write retry policy. Unset →
+  // the env-configured module defaults (`RAW_EVIDENCE_WRITE_MAX_ATTEMPTS` /
+  // `_BACKOFF_MS`). Mainly a test seam so cases can disable retry
+  // (`maxAttempts: 1`) or drop backoff to 0 without real sleeps.
+  rawEvidenceWriteRetry?: { maxAttempts?: number; backoffMs?: number };
 }
 
 /** Process a single `LogRecord`. Idempotent at the fingerprint level: a
@@ -195,6 +249,15 @@ export async function ingestRecord(
       ? getRawEvidenceStoreOrNull()
       : deps.rawEvidenceStore;
   const externalRaw = rawEvidenceStore?.external ?? false;
+  // Retry policy for the external WORM write below. Deps override → env default.
+  const writeMaxAttempts = Math.max(
+    1,
+    deps.rawEvidenceWriteRetry?.maxAttempts ?? RAW_EVIDENCE_WRITE_MAX_ATTEMPTS,
+  );
+  const writeBackoffMs = Math.max(
+    0,
+    deps.rawEvidenceWriteRetry?.backoffMs ?? RAW_EVIDENCE_WRITE_BACKOFF_MS,
+  );
 
   const result: IngestResult = {
     hits: 0,
@@ -463,12 +526,47 @@ export async function ingestRecord(
     // committed and a throw would only drive a bus retry that double-counts the
     // occurrence.
     if (externalRaw && rawEvidenceStore) {
+      // Provider+tenant key for the degraded/recovery latch below.
+      const degradedKey = `${rawEvidenceStore.name}::${record.tenantId}`;
       try {
-        const uri = await rawEvidenceStore.put({
-          findingId: upsert.id,
-          tenantId: record.tenantId,
-          evidence: occurrenceSnapshot,
-        });
+        // Bounded retry with exponential backoff: most object-store put
+        // failures are transient. Retry up to `writeMaxAttempts` before letting
+        // the error fall through to the catch (latch + failure alert). On
+        // exhaustion the last error is rethrown so the existing degraded path
+        // runs unchanged. This loop is inside the existing try but OUTSIDE the
+        // dedup advisory lock, so retries never serialize concurrent ingests.
+        let uri: string;
+        for (let attempt = 1; ; attempt++) {
+          try {
+            uri = await rawEvidenceStore.put({
+              findingId: upsert.id,
+              tenantId: record.tenantId,
+              evidence: occurrenceSnapshot,
+            });
+            break;
+          } catch (putErr) {
+            if (attempt >= writeMaxAttempts) throw putErr;
+            // Exponential backoff, capped so an aggressive operator setting
+            // (large base × high attempt count) can't stall this occurrence's
+            // raw write for an unbounded time.
+            const delayMs = Math.min(
+              RAW_EVIDENCE_WRITE_BACKOFF_MAX_MS,
+              writeBackoffMs * 2 ** (attempt - 1),
+            );
+            logger.warn(
+              {
+                err: putErr,
+                finding_id: upsert.id,
+                provider: rawEvidenceStore.name,
+                attempt,
+                max_attempts: writeMaxAttempts,
+                retry_in_ms: delayMs,
+              },
+              "external raw-evidence write failed; retrying before declaring degraded",
+            );
+            if (delayMs > 0) await sleep(delayMs);
+          }
+        }
         await withTenant(record.tenantId, async (tx) => {
           await tx.execute(sql`
             UPDATE findings
@@ -479,11 +577,38 @@ export async function ingestRecord(
             WHERE id = ${upsert.id} AND tenant_id = ${record.tenantId}
           `);
         });
+        // Recovery edge: the write succeeded AND this provider/tenant was
+        // latched degraded by a prior failure. Emit the paired recovery signal
+        // so on-call learns the WORM outage cleared, mirroring the failure
+        // alert. NO PHI — provider + finding id + source only. Inert in steady
+        // state: a success with no preceding failure leaves the latch absent,
+        // so `delete` returns false and nothing is emitted.
+        if (rawEvidenceStoreDegraded.delete(degradedKey)) {
+          logger.info(
+            { finding_id: upsert.id, provider: rawEvidenceStore.name },
+            "external raw-evidence write recovered; durable WORM capture restored",
+          );
+          await appendLedger({
+            tenantId: record.tenantId,
+            actor: { kind: "system", id: "ingest" },
+            eventType: "ingest.raw_evidence_store_recovered",
+            subjectType: "finding",
+            subjectId: upsert.id,
+            payload: {
+              finding_id: upsert.id,
+              provider: rawEvidenceStore.name,
+              source: sourceStr,
+            },
+          });
+        }
       } catch (err) {
         logger.error(
           { err, finding_id: upsert.id, provider: rawEvidenceStore.name },
           "external raw-evidence write failed; finding persisted WITHOUT retrievable raw evidence (raw_evidence_ref left null)",
         );
+        // Latch this provider/tenant degraded so the next successful write for
+        // the same key emits the recovery signal above.
+        rawEvidenceStoreDegraded.add(degradedKey);
         // Proactive operator signal: durable raw-evidence capture to the WORM
         // tier is degraded. The finding is committed (the leak is recorded),
         // but its raw PHI is NOT being persisted to durable storage — today
@@ -539,38 +664,164 @@ export async function ingestRecord(
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Dead-letter queue (DLQ) — bounded per-record retry + terminal dead-letter
+// ---------------------------------------------------------------------------
+//
+// Default-INERT. With the DLQ off (the default), the pipeline behaves exactly
+// as before: process the record once and RETHROW on failure so a real broker
+// no-acks and redelivers (at-least-once) and `/api/admin/ingest/replay`
+// surfaces the error in PublishResult.errors[]. The catch is that a genuine
+// POISON record (one that will never process — schema-incompatible, etc.)
+// then redelivers forever, wedging the consume loop.
+//
+// When the operator opts in (`INGEST_DEAD_LETTER_ENABLED`), the handler instead
+// retries the record a bounded number of times with exponential backoff, and on
+// terminal failure persists a METADATA-ONLY marker to `ingest_dead_letter`,
+// ledgers `ingest.dead_lettered`, and ACKs (does NOT rethrow) so the broker
+// stops redelivering the poison message. PHI posture: the raw payload is never
+// stored — only the source pointer + a hash — mirroring the malformed-record
+// drop. Inert ⇒ dev boot + the offline eval gate are byte-identical.
+
+export interface DeadLetterConfig {
+  /** Total attempts per record before dead-lettering (includes the first). */
+  maxAttempts: number;
+  /** Base backoff between attempts; doubles each retry, capped at 60s. */
+  backoffMs: number;
+}
+
+/** Parse the DLQ policy from env. Returns null (disabled) unless the opt-in
+ *  `INGEST_DEAD_LETTER_ENABLED` is truthy (`1`/`true`). Dead-lettering changes
+ *  the failure contract (ACK instead of rethrow), so it never turns on
+ *  implicitly. Pure: no I/O. */
+export function getDeadLetterConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): DeadLetterConfig | null {
+  const enabled = (env["INGEST_DEAD_LETTER_ENABLED"] ?? "").trim().toLowerCase();
+  if (enabled !== "1" && enabled !== "true") return null;
+  return {
+    maxAttempts: intEnv(env["INGEST_DLQ_MAX_ATTEMPTS"], 3, 1, 10),
+    backoffMs: intEnv(env["INGEST_DLQ_BACKOFF_MS"], 100, 0, 60_000),
+  };
+}
+
+const DLQ_BACKOFF_MAX_MS = 60_000;
+
+/** Persist a metadata-only dead-letter marker + ledger the drop. NO raw
+ *  payload — only the source pointer, a payload hash for correlation, the
+ *  error name, and the attempt count. */
+async function deadLetterRecord(
+  record: LogRecord,
+  err: unknown,
+  attempts: number,
+): Promise<void> {
+  const sourceStr = `${record.sourceType}:${record.sourceName}:${record.sourceRecordId}`;
+  const errorName = err instanceof Error ? err.name : "unknown";
+  const payloadSha256 = createHash("sha256")
+    .update(record.payload)
+    .digest("hex");
+  const payloadBytes = Buffer.byteLength(record.payload, "utf8");
+
+  // `ingest_dead_letter` is operator/system-scoped (no RLS), so a plain `db`
+  // insert is correct here — no tenant GUC needed.
+  await db.insert(ingestDeadLetterTable).values({
+    id: `DLQ-${randomUUID().slice(0, 8)}`,
+    tenantId: record.tenantId,
+    sourceType: record.sourceType,
+    sourceName: record.sourceName,
+    sourceRecordId: record.sourceRecordId,
+    payloadSha256,
+    payloadBytes,
+    error: errorName,
+    attempts,
+  });
+
+  await appendLedger({
+    tenantId: record.tenantId,
+    actor: { kind: "system", id: "ingest" },
+    eventType: "ingest.dead_lettered",
+    subjectType: "log_record",
+    subjectId: sourceStr,
+    payload: {
+      source: sourceStr,
+      // Error NAME + counts + hash only — never the raw payload.
+      error: errorName,
+      attempts,
+      payload_sha256: payloadSha256,
+    },
+  });
+}
+
 /** Subscribe the ingest pipeline to the bus. Returns the unsubscribe
- *  handle so boot ordering / shutdown / tests can release it. */
-export function startIngestPipeline(bus: LogBus): () => void {
+ *  handle so boot ordering / shutdown / tests can release it.
+ *
+ *  `dlqOverride`: `undefined` → read env (`INGEST_DEAD_LETTER_ENABLED`);
+ *  explicit `null` → DLQ disabled (test default → byte-identical rethrow
+ *  behavior); an object → use it (tests). */
+export function startIngestPipeline(
+  bus: LogBus,
+  dlqOverride?: DeadLetterConfig | null,
+): () => void {
+  const dlq =
+    dlqOverride === undefined ? getDeadLetterConfigFromEnv() : dlqOverride;
+  const maxAttempts = dlq ? dlq.maxAttempts : 1;
+
   const handler: LogHandler = async (record) => {
-    try {
-      const r = await ingestRecord(record);
-      if (r.hits > 0) {
-        logger.debug(
-          {
-            source: `${record.sourceType}:${record.sourceName}:${record.sourceRecordId}`,
-            hits: r.hits,
-            created: r.findingsCreated,
-            updated: r.findingsUpdated,
-            regressions: r.redactionRegressions,
-          },
-          "ingest processed record with detector hits",
+    const source = `${record.sourceType}:${record.sourceName}:${record.sourceRecordId}`;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const r = await ingestRecord(record);
+        if (r.hits > 0) {
+          logger.debug(
+            {
+              source,
+              hits: r.hits,
+              created: r.findingsCreated,
+              updated: r.findingsUpdated,
+              regressions: r.redactionRegressions,
+            },
+            "ingest processed record with detector hits",
+          );
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        // Log here for pipeline-attributable triage context.
+        logger.error(
+          { err, source, attempt, max_attempts: maxAttempts },
+          "ingest pipeline failed for record",
+        );
+        if (attempt < maxAttempts) {
+          const delayMs = Math.min(
+            DLQ_BACKOFF_MAX_MS,
+            (dlq?.backoffMs ?? 0) * 2 ** (attempt - 1),
+          );
+          if (delayMs > 0) await sleep(delayMs);
+        }
+      }
+    }
+
+    // All attempts exhausted.
+    if (dlq) {
+      // DLQ on: persist a metadata-only marker + ledger, then ACK (do NOT
+      // rethrow) so a real broker stops redelivering the poison message.
+      // Best-effort: if the dead-letter write itself fails, fall through to a
+      // rethrow so the failure is not silently lost.
+      try {
+        await deadLetterRecord(record, lastErr, maxAttempts);
+        return;
+      } catch (dlqErr) {
+        logger.error(
+          { err: dlqErr, source },
+          "ingest dead-letter write failed; rethrowing original error",
         );
       }
-    } catch (err) {
-      // Log here for pipeline-attributable triage context, then RETHROW so
-      // bus.publish() can surface the failure in PublishResult.errors[].
-      // Swallowing would defeat fix #5 — `/api/admin/ingest/replay` would
-      // report `errors: 0` even when ingest actually failed.
-      logger.error(
-        {
-          err,
-          source: `${record.sourceType}:${record.sourceName}:${record.sourceRecordId}`,
-        },
-        "ingest pipeline failed for record",
-      );
-      throw err;
     }
+    // DLQ off (default): RETHROW so bus.publish() surfaces the failure in
+    // PublishResult.errors[] and a real broker no-acks + redelivers. Byte-
+    // identical to the pre-DLQ behavior.
+    throw lastErr;
   };
   return bus.subscribe("raw.logs", handler);
 }

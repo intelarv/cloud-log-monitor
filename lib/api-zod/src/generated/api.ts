@@ -178,6 +178,45 @@ export const GetFindingHistoryResponse = zod.array(GetFindingHistoryResponseItem
 
 
 /**
+ * @summary Agent review re-run history for a single finding, reconstructed from the
+tamper-evident ledger. Each agent review (initial + every fix-and-replay)
+is grouped into a numbered attempt carrying its triage and verifier
+verdicts so an analyst can see why a verdict changed across re-runs.
+Tenant-scoped; redacted rationale only (PHI was scanned out at write time).
+
+ */
+export const GetFindingReviewHistoryParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const GetFindingReviewHistoryResponse = zod.object({
+  "current_attempt": zod.number(),
+  "attempts": zod.array(zod.object({
+  "attempt": zod.number(),
+  "outcome": zod.enum(['completed', 'skipped', 'failed', 'incomplete']),
+  "triage_verdict": zod.union([zod.null(),zod.object({
+  "recommended_severity": zod.enum(['low', 'medium', 'high', 'critical']),
+  "recommended_action": zod.enum(['page_oncall', 'open_ticket', 'human_review', 'auto_resolve']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean()
+})]).optional(),
+  "triage_at": zod.union([zod.null(),zod.coerce.date()]).optional(),
+  "verifier_verdict": zod.union([zod.null(),zod.object({
+  "verdict": zod.enum(['true_positive', 'likely_false_positive', 'needs_human_review']),
+  "rationale": zod.string(),
+  "confidence": zod.number(),
+  "prompt_injection_suspected": zod.boolean(),
+  "agrees_with_triage": zod.boolean()
+})]).optional(),
+  "verifier_at": zod.union([zod.null(),zod.coerce.date()]).optional(),
+  "note": zod.string().nullish(),
+  "last_event_seq": zod.number().optional()
+}))
+})
+
+
+/**
  * @summary List chat sessions for the current user.
  */
 export const ListChatSessionsResponseItem = zod.object({
@@ -327,6 +366,28 @@ export const ListLedgerCheckpointsResponse = zod.object({
   "checked": zod.number(),
   "errors": zod.array(zod.string())
 }),zod.null()]).optional()
+})
+
+
+/**
+ * @summary Aggregate counts for the two opt-in cache-pruning maintenance jobs
+(M10.4 raw-evidence tiering, M10.5 memory eviction) from the audit
+ledger, scoped to the caller's tenant. Counts only — no PHI, no finding
+ids, no object URIs.
+
+ */
+export const GetMaintenanceMetricsResponse = zod.object({
+  "memory": zod.object({
+  "runs": zod.number(),
+  "embeddings_evicted": zod.number(),
+  "failures": zod.number(),
+  "last_run_at": zod.union([zod.coerce.date(),zod.null()])
+}),
+  "tiering": zod.object({
+  "findings_tiered": zod.number(),
+  "failures": zod.number(),
+  "last_run_at": zod.union([zod.coerce.date(),zod.null()])
+})
 })
 
 
@@ -561,6 +622,36 @@ export const ReopenFindingResponse = zod.object({
   "finding_id": zod.string(),
   "status": zod.enum(['open']),
   "transitioned": zod.boolean()
+})
+
+
+/**
+ * @summary Operator-initiated re-review (replay) of a finding's Triage -> Verifier
+LLM analysis. Resets the finding's agent review status back to "pending"
+and re-enqueues the review; the supervisor's compare-and-swap bumps the
+review attempt so the agents re-run from scratch (fresh per-attempt
+idempotency keys) rather than recovering the prior verdict. Refuses with
+409 when a review is already in progress so a replay cannot clobber a
+run mid-flight. Accepts an optional free-text reason (scanned by the
+content policy) recorded in the audit ledger. Requires session only.
+
+ */
+export const ReReviewFindingParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const reReviewFindingBodyReasonMax = 2000;
+
+
+
+export const ReReviewFindingBody = zod.object({
+  "reason": zod.string().min(1).max(reReviewFindingBodyReasonMax).optional().describe('Optional free-text reason (\"why\") for the operator-initiated replay.\nScanned by the same content policy as resolve\/reopen reasons before\nit lands in the immutable audit ledger.\n')
+})
+
+export const ReReviewFindingResponse = zod.object({
+  "finding_id": zod.string(),
+  "agent_review_status": zod.enum(['pending']),
+  "enqueued": zod.boolean()
 })
 
 

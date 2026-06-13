@@ -164,6 +164,33 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /findings/{id}/review-history:
+    get:
+      operationId: getFindingReviewHistory
+      tags: [findings]
+      summary: |
+        Agent review re-run history for a single finding, reconstructed from the
+        tamper-evident ledger. Each agent review (initial + every fix-and-replay)
+        is grouped into a numbered attempt carrying its triage and verifier
+        verdicts so an analyst can see why a verdict changed across re-runs.
+        Tenant-scoped; redacted rationale only (PHI was scanned out at write time).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Finding review-attempt history (most-recent attempt first)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReviewHistory" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /chat/sessions:
     get:
       operationId: listChatSessions
@@ -299,6 +326,22 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/LedgerCheckpointsPage" }
+
+  /admin/metrics/maintenance:
+    get:
+      operationId: getMaintenanceMetrics
+      tags: [ledger]
+      summary: |
+        Aggregate counts for the two opt-in cache-pruning maintenance jobs
+        (M10.4 raw-evidence tiering, M10.5 memory eviction) from the audit
+        ledger, scoped to the caller's tenant. Counts only — no PHI, no finding
+        ids, no object URIs.
+      responses:
+        "200":
+          description: Maintenance-job activity counts
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MaintenanceMetrics" }
 
   /auth/step-up:
     post:
@@ -605,6 +648,56 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /admin/findings/{id}/re-review:
+    post:
+      operationId: reReviewFinding
+      tags: [admin]
+      summary: |
+        Operator-initiated re-review (replay) of a finding's Triage -> Verifier
+        LLM analysis. Resets the finding's agent review status back to "pending"
+        and re-enqueues the review; the supervisor's compare-and-swap bumps the
+        review attempt so the agents re-run from scratch (fresh per-attempt
+        idempotency keys) rather than recovering the prior verdict. Refuses with
+        409 when a review is already in progress so a replay cannot clobber a
+        run mid-flight. Accepts an optional free-text reason (scanned by the
+        content policy) recorded in the audit ledger. Requires session only.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReReviewFindingInput" }
+      responses:
+        "200":
+          description: Re-review enqueued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReReviewFindingResult" }
+        "400":
+          description: Invalid input or reason rejected by content policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Finding not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "409":
+          description: A review is already in progress for this finding
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /admin/ingest/replay:
     post:
       operationId: replayIngestFixture
@@ -769,6 +862,44 @@ components:
         prompt_injection_suspected: { type: boolean }
         agrees_with_triage: { type: boolean }
 
+    ReviewAttempt:
+      type: object
+      required: [attempt, outcome]
+      properties:
+        attempt: { type: integer }
+        outcome:
+          type: string
+          enum: [completed, skipped, failed, incomplete]
+        triage_verdict:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/TriageVerdict"
+        triage_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+        verifier_verdict:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/VerifierVerdict"
+        verifier_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+        note: { type: ["string", "null"] }
+        last_event_seq: { type: integer }
+
+    ReviewHistory:
+      type: object
+      required: [current_attempt, attempts]
+      properties:
+        current_attempt: { type: integer }
+        attempts:
+          type: array
+          items: { $ref: "#/components/schemas/ReviewAttempt" }
+
     RedactedEvidence:
       type: object
       required: [snippet, redactions, truncated]
@@ -915,6 +1046,32 @@ components:
           type: array
           items: { type: string }
 
+    MaintenanceMetrics:
+      type: object
+      required: [memory, tiering]
+      properties:
+        memory:
+          type: object
+          required: [runs, embeddings_evicted, failures, last_run_at]
+          properties:
+            runs: { type: integer }
+            embeddings_evicted: { type: integer }
+            failures: { type: integer }
+            last_run_at:
+              oneOf:
+                - { type: string, format: date-time }
+                - { type: "null" }
+        tiering:
+          type: object
+          required: [findings_tiered, failures, last_run_at]
+          properties:
+            findings_tiered: { type: integer }
+            failures: { type: integer }
+            last_run_at:
+              oneOf:
+                - { type: string, format: date-time }
+                - { type: "null" }
+
     StepUpInput:
       type: object
       required: [token, reason]
@@ -1060,6 +1217,28 @@ components:
           type: string
           enum: [open]
         transitioned: { type: boolean }
+
+    ReReviewFindingInput:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: |
+            Optional free-text reason ("why") for the operator-initiated replay.
+            Scanned by the same content policy as resolve/reopen reasons before
+            it lands in the immutable audit ledger.
+
+    ReReviewFindingResult:
+      type: object
+      required: [finding_id, agent_review_status, enqueued]
+      properties:
+        finding_id: { type: string }
+        agent_review_status:
+          type: string
+          enum: [pending]
+        enqueued: { type: boolean }
 
     IngestReplayResult:
       type: object

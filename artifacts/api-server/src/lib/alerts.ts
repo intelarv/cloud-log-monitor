@@ -55,6 +55,12 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // SQL access. Frequency anomalies are detected downstream by the log
   // shipper, not here.
   "break_glass.raw_phi_accessed": "warning",
+  // HITL: a human confirmed a remediation proposal (step-up gated). Warning,
+  // for the same reason as break-glass reads — it is a legitimate, authorized
+  // action, but it is the moment a proposed write becomes authorized to act,
+  // so it belongs in the alert stream as an audit signal ("who authorized what
+  // remediation in the last 24h") without needing SQL access.
+  "remediation.confirmed": "warning",
   // M0: ledger chain mismatch detected at boot. Critical — the integrity
   // claim is dead until resolved. (The boot path already logger.error's
   // and refuses to listen; this rule covers the case where a future
@@ -134,6 +140,29 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // Loop-safe because this event is emitted from the source loop, never
   // from the alert dispatcher itself.
   "ingest.source_error": "warning",
+  // M8 (reaper): a pull-based log source's checkpoint cursor has not advanced
+  // within the operator-configured stall threshold (INGEST_SOURCE_STALL_AFTER_MS).
+  // Warning, not high: an idle source with no new logs is indistinguishable
+  // from a wedged poller at the checkpoint level, so this is a "look at it"
+  // signal rather than a confirmed outage — sustained stalls across many
+  // sources are the pageable pattern, detected downstream from the alert
+  // stream. Edge-triggered (emitted once per stall episode, re-armed when the
+  // cursor advances again) so a perpetually-idle source does not storm the
+  // alert channel every cadence. Inert unless the reaper is opted in. Loop-safe:
+  // emitted from the reaper job, never the alert dispatcher. Payload carries the
+  // source name + idle duration + policy threshold only (no PHI).
+  "ingest.source_stalled": "warning",
+  // M8 (DLQ): a raw.logs record failed to process after the bounded per-record
+  // retry and was dead-lettered (metadata-only marker persisted + record ACKed
+  // so a real broker stops redelivering the poison message). High, not warning:
+  // a dropped log record in a compliance system is a potentially-missed PHI
+  // detection an operator must triage proactively — but not critical, since no
+  // disclosure or ledger-integrity loss occurs and the drop is itself
+  // ledgered/auditable. Inert unless the DLQ is opted in (INGEST_DEAD_LETTER_ENABLED);
+  // with it off the pipeline rethrows exactly as before. Loop-safe: emitted from
+  // the ingest pipeline, never the alert dispatcher. Payload carries source
+  // provenance + error name + attempt count + payload hash only (no raw PHI).
+  "ingest.dead_lettered": "high",
   // M10.2/M10.3: an external WORM raw-evidence write (`store.put`) failed at
   // ingest. The finding still commits (the leak IS recorded), but its raw
   // PHI did NOT land in durable storage and `raw_evidence_ref` stays NULL.
@@ -147,6 +176,17 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // external store is configured (the inline DB store can't fail this way).
   // Loop-safe: emitted from the ingest path, never the alert dispatcher.
   "ingest.raw_evidence_store_failed": "high",
+  // Paired recovery for `ingest.raw_evidence_store_failed`: an external WORM
+  // raw-evidence `store.put` succeeded again after a preceding failure for the
+  // same provider+tenant, so durable raw-PHI capture to the WORM tier is
+  // restored. Warning (the lowest severity — `info` is intentionally absent):
+  // good news rather than an incident, but on-call needs the paired signal to
+  // know the degraded condition cleared instead of guessing whether it is still
+  // ongoing. NO PHI: payload carries finding id + provider + source only.
+  // Emitted only when a failure was previously latched (steady-state success
+  // never alerts) and inert when no external store is configured. Loop-safe:
+  // emitted from the ingest path, never the alert dispatcher.
+  "ingest.raw_evidence_store_recovered": "warning",
   // M10.2/M10.3 (read path): a break-glass raw-PHI read could NOT resolve the
   // external WORM ref (store outage / misconfig / malformed ref) and fell back
   // to the legacy inline `raw_evidence` copy. The analyst still saw the raw
@@ -194,6 +234,21 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // eviction job, never the alert dispatcher. Payload carries counts + policy
   // params only (no finding ids, no PHI).
   "memory.evict_failed": "warning",
+  // Supervisor durable engine (WORKFLOW_ENGINE=temporal): a finding's
+  // Triage->Verifier review was dropped before it could run — either the
+  // pre-start buffer overflowed during the engine's async startup window
+  // (reason `prestart_buffer_overflow`) or a non-idempotency `startWorkflow`
+  // call failed and dispatch has no retry (reason `start_workflow_failed`).
+  // High, not warning: for a compliance system a dropped review means a
+  // finding silently never got its verdict — an operator must replay it
+  // proactively (same reasoning as `ingest.dead_lettered`). Not critical: no
+  // disclosure or ledger-integrity loss, the finding row itself is durable,
+  // and the drop is itself ledgered/auditable. Inert unless the temporal
+  // engine is selected (the default in-process engine never buffers or starts
+  // workflows). Loop-safe: emitted from the engine, never the alert
+  // dispatcher. Payload carries the finding id + a static reason (+ buffer cap
+  // / error name) only — no PHI.
+  "supervisor.review_dropped": "high",
 } as const;
 
 /** Event types that are legitimately emitted at high volume or as part of a
@@ -224,6 +279,14 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // action that *reduces* exposure; the raw-PHI read it gates is the
   // alertable event. Auditable in the ledger like grant/approve.
   "break_glass.revoked",
+  // HITL remediation lifecycle. An agent drafting a *proposal* is inert (it
+  // executes nothing — the human confirm endpoint is the gate), and a human
+  // rejecting a proposal *reduces* exposure. The security-relevant event is
+  // `remediation.confirmed` (warning-level above), where a proposal becomes
+  // authorized to act. Both are auditable in the ledger like the rest of the
+  // lifecycle.
+  "remediation.proposed",
+  "remediation.rejected",
   // Finding lifecycle — the notifier handles severity-based routing per
   // §291; not in scope of the alert hook.
   "finding.created",
@@ -238,6 +301,13 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // unlike resolve it does NOT touch break-glass access. Auditable in the
   // ledger like the rest of the finding lifecycle.
   "finding.reopened",
+  // An operator manually requested a re-run of a finding's Triage->Verifier
+  // review (reset to pending + re-enqueue). A routine triage action over the
+  // redacted projection — no disclosure and no authorized write; the LLM cost
+  // it incurs is already gated downstream by the per-tenant budget breaker
+  // (`agent.review_skipped_budget`, warning above). Auditable in the ledger
+  // like the rest of the finding/agent lifecycle.
+  "agent.re_review_requested",
   // Ledger bootstrap. Fires once.
   "ledger.genesis",
   // M2: each successful notarization checkpoint creation. Routine signal

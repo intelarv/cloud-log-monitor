@@ -1,7 +1,17 @@
 import { z } from "zod";
-import { eq, and } from "drizzle-orm";
-import { findingsTable, findingSafeColumns, type FindingSafe } from "@workspace/db";
+import { randomUUID } from "node:crypto";
+import { eq, and, inArray, desc } from "drizzle-orm";
+import {
+  findingsTable,
+  findingSafeColumns,
+  remediationProposalsTable,
+  FINDING_CLASSIFICATIONS,
+  FINDING_SEVERITIES,
+  FINDING_STATUSES,
+  type FindingSafe,
+} from "@workspace/db";
 import { withTenant } from "./db-context";
+import { appendLedger } from "./ledger";
 import {
   isToolAllowed,
   validateToolArgs,
@@ -280,8 +290,179 @@ export const searchFindingsTool: McpToolDef<
   },
 };
 
+// `structured_query` (threat model §EoP "No raw SQL from LLMs"): the agent
+// plane MUST NOT have a tool that executes LLM-generated SQL. This is the
+// sanctioned alternative — a Zod-validated *typed filter object*. The agent
+// supplies enum-constrained facets (classification / severity / status /
+// source) and a bounded limit; the handler turns them into parameterized
+// drizzle predicates. There is no string interpolation and no free-form SQL,
+// so an injected agent can at worst select a different (still tenant-scoped,
+// still redacted) slice of its own findings.
+//
+// `limit` is non-optional for the same McpToolDef invariance reason documented
+// on `search_findings`.
+const StructuredQueryArgs = z.object({
+  classification: z.array(z.enum(FINDING_CLASSIFICATIONS)).max(16).optional(),
+  severity: z.array(z.enum(FINDING_SEVERITIES)).max(4).optional(),
+  status: z.array(z.enum(FINDING_STATUSES)).max(3).optional(),
+  // Exact-match source filter (e.g. "cloudwatch:/aws/lambda/billing"). Bounded
+  // count + length; matched with `inArray`, never `LIKE`, so no wildcard
+  // injection. An array so the agent can scope to several sources at once.
+  source: z.array(z.string().min(1).max(200)).max(16).optional(),
+  limit: z.number().int().min(1).max(50),
+});
+
+export interface StructuredQueryResultItem {
+  id: string;
+  classification: string;
+  subclass: string | null;
+  severity: string;
+  status: string;
+  source: string;
+  redacted_snippet: string;
+  occurrence_count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+export const structuredQueryTool: McpToolDef<
+  z.infer<typeof StructuredQueryArgs>,
+  { results: StructuredQueryResultItem[] }
+> = {
+  name: "structured_query",
+  version: "1.0.0",
+  description:
+    "Filter findings by typed facets (classification, severity, status, source) over the redacted view, scoped to the caller's tenant. Accepts a structured filter object only — never SQL. Returns matching findings, most-recently-seen first.",
+  inputSchema: StructuredQueryArgs,
+  handler: async (args, ctx) => {
+    const rows = await withTenant(ctx.tenantId, async (tx) => {
+      const conds = [eq(findingsTable.tenantId, ctx.tenantId)];
+      if (args.classification && args.classification.length > 0) {
+        conds.push(inArray(findingsTable.classification, args.classification));
+      }
+      if (args.severity && args.severity.length > 0) {
+        conds.push(inArray(findingsTable.severity, args.severity));
+      }
+      if (args.status && args.status.length > 0) {
+        conds.push(inArray(findingsTable.status, args.status));
+      }
+      if (args.source && args.source.length > 0) {
+        conds.push(inArray(findingsTable.source, args.source));
+      }
+      // Safe projection ONLY — this result is fed back into the LLM prompt and
+      // streamed to the client, so `rawEvidence` must never be selected here.
+      return tx
+        .select(findingSafeColumns)
+        .from(findingsTable)
+        .where(and(...conds))
+        .orderBy(desc(findingsTable.lastSeenAt))
+        .limit(args.limit);
+    });
+    const results: StructuredQueryResultItem[] = rows.map((f) => {
+      const ev = f.redactedEvidence as { snippet?: string };
+      return {
+        id: f.id,
+        classification: f.classification,
+        subclass: f.subclass,
+        severity: f.severity,
+        status: f.status,
+        source: f.source,
+        redacted_snippet: ev.snippet ?? "",
+        occurrence_count: f.occurrenceCount,
+        first_seen_at: f.firstSeenAt.toISOString(),
+        last_seen_at: f.lastSeenAt.toISOString(),
+      };
+    });
+    return { results };
+  },
+};
+
+// `propose_remediation` (threat model §EoP "HITL gates on write actions"):
+// remediation tools MUST return *proposals*, not executions. This tool writes
+// a PENDING `remediation_proposals` row and ledgers `remediation.proposed`;
+// it executes nothing. A human then confirms (step-up gated) or rejects via
+// the admin endpoints. The proposal is inert until confirmed.
+const ProposeRemediationArgs = z.object({
+  finding_id: z.string().min(1).max(64),
+  action_type: z.enum([
+    "redact_at_source",
+    "open_pr",
+    "notify_owner",
+    "tighten_retention",
+    "enable_kms",
+    "other",
+  ]),
+  summary: z.string().min(1).max(500),
+  rationale: z.string().min(1).max(2000),
+});
+
+export const proposeRemediationTool: McpToolDef<
+  z.infer<typeof ProposeRemediationArgs>,
+  { proposal_id: string; status: "pending" }
+> = {
+  name: "propose_remediation",
+  version: "1.0.0",
+  description:
+    "Draft a remediation PROPOSAL for a finding (e.g. redact-at-source, open a PR, notify the owner). Creates a pending record for a human to confirm or reject — it does NOT execute anything. Provide finding_id, an action_type, a short summary, and the rationale.",
+  inputSchema: ProposeRemediationArgs,
+  handler: async (args, ctx) => {
+    // Guard against proposing against a finding that doesn't exist in this
+    // tenant (RLS already scopes the insert, but a dangling finding_id would
+    // create an un-actionable proposal). Safe projection — id only.
+    const proposalId = `rp_${randomUUID()}`;
+    await withTenant(ctx.tenantId, async (tx) => {
+      const [finding] = await tx
+        .select({ id: findingsTable.id })
+        .from(findingsTable)
+        .where(
+          and(
+            eq(findingsTable.id, args.finding_id),
+            eq(findingsTable.tenantId, ctx.tenantId),
+          ),
+        )
+        .limit(1);
+      if (!finding) {
+        throw new Error(`finding ${args.finding_id} not found`);
+      }
+      await tx.insert(remediationProposalsTable).values({
+        id: proposalId,
+        tenantId: ctx.tenantId,
+        findingId: args.finding_id,
+        actionType: args.action_type,
+        summary: args.summary,
+        rationale: args.rationale,
+        proposedByAgent: ctx.agent,
+        proposedByUserId: ctx.userId,
+        status: "pending",
+      });
+    });
+    // Agent action → ledger entry (threat model §Repudiation). Payload carries
+    // the structured pointers only; `summary`/`rationale` already passed the
+    // tool-arg PHI/canary scan, but we keep them OUT of the ledger anyway and
+    // record only the categorical action_type + ids, mirroring the rest of the
+    // codebase's "no free text in the ledger payload" posture.
+    await appendLedger({
+      tenantId: ctx.tenantId,
+      actor: { kind: "agent", id: ctx.agent },
+      eventType: "remediation.proposed",
+      subjectType: "finding",
+      subjectId: args.finding_id,
+      payload: {
+        proposal_id: proposalId,
+        finding_id: args.finding_id,
+        action_type: args.action_type,
+        proposed_by_agent: ctx.agent,
+        proposed_by_user_id: ctx.userId,
+      },
+    });
+    return { proposal_id: proposalId, status: "pending" };
+  },
+};
+
 export const toolRegistry: ToolRegistry = new ToolRegistry({
   handlerTimeoutMs: envInt("TOOL_CALL_TIMEOUT_MS", DEFAULT_TOOL_TIMEOUT_MS),
 });
 toolRegistry.register(getFindingTool);
 toolRegistry.register(searchFindingsTool);
+toolRegistry.register(structuredQueryTool);
+toolRegistry.register(proposeRemediationTool);

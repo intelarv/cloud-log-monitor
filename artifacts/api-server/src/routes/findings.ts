@@ -11,6 +11,10 @@ type Finding = FindingSafe;
 import { GetFindingResponse as FindingSchema } from "@workspace/api-zod";
 import { withTenant } from "../lib/db-context";
 import { requireSession } from "../lib/auth";
+import {
+  listFindingReviewEntries,
+  parseReviewAttempt,
+} from "../lib/ledger";
 
 const router: IRouter = Router();
 
@@ -168,6 +172,109 @@ router.get(
         hash: r.hash,
       })),
     );
+  },
+);
+
+// Agent review re-run history. Each agent review (the initial post-ingest run
+// plus every fix-and-replay) bumps the finding's `agent_review_attempt`; the
+// triage/verifier/skip/fail ledger entries it writes carry that attempt number
+// in their `{workflowId}:attempt:N:step` idempotency key. We reconstruct the
+// per-attempt timeline from those immutable entries so an analyst can see why a
+// verdict changed between re-runs ("reviewed 2 times, latest X, prior Y").
+//
+// Same tenant-isolation reasoning as /history above: `ledger_entries` has no RLS
+// policy, so we enforce isolation with an explicit `tenant_id` predicate (inside
+// listFindingReviewEntries) and scope to this finding's subject id. Rationale
+// text was PHI-scanned before it landed in the immutable ledger, so it carries
+// no raw PHI. Read-only.
+type ReviewAttemptAccumulator = {
+  attempt: number;
+  triage_verdict: unknown;
+  triage_at: string | null;
+  verifier_verdict: unknown;
+  verifier_at: string | null;
+  note: string | null;
+  failed: boolean;
+  skipped: boolean;
+  last_event_seq: number;
+};
+
+function deriveOutcome(
+  a: ReviewAttemptAccumulator,
+): "completed" | "skipped" | "failed" | "incomplete" {
+  if (a.failed) return "failed";
+  if (a.skipped) return "skipped";
+  if (a.verifier_verdict !== null) return "completed";
+  return "incomplete";
+}
+
+router.get(
+  "/findings/:id/review-history",
+  requireSession,
+  async (req, res): Promise<void> => {
+    const id = String(req.params.id);
+    const tenantId = req.session!.tenant_id;
+    const entries = await listFindingReviewEntries(tenantId, id);
+
+    const byAttempt = new Map<number, ReviewAttemptAccumulator>();
+    for (const e of entries) {
+      const attempt = parseReviewAttempt(e.idempotencyKey);
+      if (attempt === null) continue;
+      let acc = byAttempt.get(attempt);
+      if (!acc) {
+        acc = {
+          attempt,
+          triage_verdict: null,
+          triage_at: null,
+          verifier_verdict: null,
+          verifier_at: null,
+          note: null,
+          failed: false,
+          skipped: false,
+          last_event_seq: e.seq,
+        };
+        byAttempt.set(attempt, acc);
+      }
+      if (e.seq > acc.last_event_seq) acc.last_event_seq = e.seq;
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      const ts = e.ts.toISOString();
+      switch (e.eventType) {
+        case "agent.triage_complete":
+          acc.triage_verdict = payload.verdict ?? null;
+          acc.triage_at = ts;
+          break;
+        case "agent.verifier_complete":
+          acc.verifier_verdict = payload.verdict ?? null;
+          acc.verifier_at = ts;
+          break;
+        case "agent.review_skipped_budget":
+          acc.skipped = true;
+          if (typeof payload.reason === "string") acc.note = payload.reason;
+          break;
+        case "agent.review_failed":
+          acc.failed = true;
+          if (typeof payload.error === "string") acc.note = payload.error;
+          break;
+      }
+    }
+
+    const attempts = Array.from(byAttempt.values())
+      .sort((a, b) => b.attempt - a.attempt)
+      .map((a) => ({
+        attempt: a.attempt,
+        outcome: deriveOutcome(a),
+        triage_verdict: a.triage_verdict,
+        triage_at: a.triage_at,
+        verifier_verdict: a.verifier_verdict,
+        verifier_at: a.verifier_at,
+        note: a.note,
+        last_event_seq: a.last_event_seq,
+      }));
+    const current_attempt = attempts.length > 0 ? attempts[0]!.attempt : 0;
+
+    // Return plain JSON (no generated zod .parse): the nullable date-time fields
+    // would be coerced `null → epoch 0` by the generated `coerce.date()` union.
+    res.json({ current_attempt, attempts });
   },
 );
 

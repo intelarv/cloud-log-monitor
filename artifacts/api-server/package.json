@@ -9,6 +9,8 @@
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "test:temporal": "bash ./scripts/run-temporal-integration.sh",
+    "reindex:search": "pnpm run build && node --enable-source-maps ./dist/scripts/reindex-search.mjs",
     "eval": "rm -rf evals/results && vitest run --config vitest.eval.config.ts && node evals/gate.mjs",
     "eval:update": "rm -rf evals/results && vitest run --config vitest.eval.config.ts && node evals/gate.mjs --update"
   },
@@ -42,5 +44,10 @@
     "pino-pretty": "^13.1.3",
     "thread-stream": "3.1.0",
     "vitest": "^4.1.7"
+  },
+  "optionalDependencies": {
+    "@temporalio/client": "^1.18.0",
+    "@temporalio/worker": "^1.18.0",
+    "@temporalio/workflow": "^1.18.0"
   }
 }

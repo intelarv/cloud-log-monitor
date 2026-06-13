@@ -180,6 +180,8 @@ export function defaultPagerDutyDedupKey(): string;
 
 export function defaultHeartbeatDedupKey(): string;
 
+export function defaultTemporalDedupKey(): string;
+
 export function resolveHeartbeat(opts?: {
   env?: Record<string, string | undefined>;
   fetchImpl?: typeof fetch;
@@ -191,6 +193,8 @@ export function postToChannels(opts: {
   text: string;
   payload: unknown;
   fetchImpl?: typeof fetch;
+  pagerDutyDedupKey?: string;
+  pagerDutySource?: string;
 }): Promise<{ skipped: boolean; sent: SendResult[] }>;
 
 export function notifyEvalGate(opts?: {

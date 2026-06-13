@@ -31,6 +31,7 @@ import {
   verifyCheckpoints,
   type CheckpointVerifyResult,
 } from "./notarization";
+import type { WorkflowEngine } from "./agents/workflow-engine";
 
 export interface ChainVerifierSchedule {
   /** Rolling 24h-window walk cadence. Default 1h. */
@@ -39,19 +40,23 @@ export interface ChainVerifierSchedule {
   fullMs: number;
   /** Window size for the rolling walk. Default 24h. */
   lookbackMs: number;
-  /** Cadence for creating + verifying external notarization checkpoints
-   *  (M2). Default 5min in dev — production §23.2 spec is "every 1,000
-   *  entries OR daily, whichever first"; this is a time-only approximation
-   *  that's fine for the dev write rate. */
-  checkpointMs: number;
 }
 
 const DEFAULT_SCHEDULE: ChainVerifierSchedule = {
   windowMs: 60 * 60 * 1000,
   fullMs: 7 * 24 * 60 * 60 * 1000,
   lookbackMs: 24 * 60 * 60 * 1000,
-  checkpointMs: 5 * 60 * 1000,
 };
+
+/** Notarizer (checkpoint create+verify) cadence for the in-process engine.
+ *  Default 5min in dev — production §23.2 spec is "every 1,000 entries OR
+ *  daily, whichever first"; this is a time-only approximation that's fine for
+ *  the dev write rate. The Temporal backend uses NOTARIZER_CRON instead. */
+const DEFAULT_NOTARIZER_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Temporal cron for the notarizer — the production cadence knob (operators
+ *  tune it on the cluster). Kept aligned with the in-process default (5min). */
+const NOTARIZER_CRON = "*/5 * * * *";
 
 // Per-scope advisory-lock keys. Distinct from LEDGER_LOCK_KEY in ledger.ts
 // and from each other so the rolling + full walks can run concurrently if
@@ -234,7 +239,12 @@ async function isDuplicateCheckpointMismatch(
   return p.signature === signature;
 }
 
-async function runCheckpointOnce(): Promise<void> {
+/** One notarizer cycle: create a checkpoint at the live head (no-op if
+ *  unchanged) then verify all existing checkpoints. Leader-locked, dedupe-
+ *  guarded, and internally error-isolated so it is safe to re-run every cadence.
+ *  Exported as the in-process notarizer tick AND the Temporal notarizer
+ *  activity (`runCycle`) so both engines run identical work. */
+export async function runCheckpointOnce(): Promise<void> {
   await withLeaderLock("checkpoint", async () => {
     // (1) Sign current head into a new checkpoint (no-op if unchanged).
     // Architect-flagged: verify MUST run even if create errors (e.g. a
@@ -275,10 +285,26 @@ async function runCheckpointOnce(): Promise<void> {
       // (2) Verify all existing checkpoints against the live ledger.
       const r = await verifyCheckpoints();
       if (r.ok) {
-        logger.debug(
-          { walked: r.walked },
-          "notarization checkpoints verified ok",
-        );
+        if (r.unnotarized_count > 0) {
+          // Some checkpoints carry the all-zero placeholder head hash — never
+          // externally notarized (forged/placeholder rows, e.g. dev test
+          // pollution), NOT a tamper. Surfaced at debug so it does not spam
+          // ERROR each cycle, while a genuine live≠notarized mismatch still
+          // takes the critical path below.
+          logger.debug(
+            {
+              walked: r.walked,
+              unnotarized_count: r.unnotarized_count,
+              first_unnotarized: r.first_unnotarized,
+            },
+            "notarization checkpoints verified; some not yet notarized (placeholder head hash, not a tamper)",
+          );
+        } else {
+          logger.debug(
+            { walked: r.walked },
+            "notarization checkpoints verified ok",
+          );
+        }
         return;
       }
       const signature = checkpointSignature(r);
@@ -336,11 +362,7 @@ export function startChainVerifier(
     () => void runOnce("full", () => verifyChain()),
     s.fullMs,
   );
-  const checkpointTimer = setInterval(
-    () => void runCheckpointOnce(),
-    s.checkpointMs,
-  );
-  intervals.push(windowTimer, fullTimer, checkpointTimer);
+  intervals.push(windowTimer, fullTimer);
 
   // Never keep the process alive on shutdown.
   for (const t of intervals) t.unref?.();
@@ -350,7 +372,6 @@ export function startChainVerifier(
       windowMs: s.windowMs,
       fullMs: s.fullMs,
       lookbackMs: s.lookbackMs,
-      checkpointMs: s.checkpointMs,
     },
     "chain verifier scheduled",
   );
@@ -358,6 +379,31 @@ export function startChainVerifier(
   return () => {
     for (const t of intervals) clearInterval(t);
   };
+}
+
+/** Schedule the notarizer (checkpoint create+verify cycle) through the
+ *  WorkflowEngine seam. In-process: a leader-locked setInterval, byte-identical
+ *  to the pre-seam checkpoint timer this replaces. Temporal: a durable cron
+ *  workflow (`notarizationWorkflow`), so the notarizer gains the same
+ *  single-execution + crash-resume guarantees as the supervisor review path.
+ *  Returns a stop handle (a no-op for the durable cron, which lives on the
+ *  cluster by design). */
+export function startNotarizer(
+  engine: WorkflowEngine,
+  intervalMs: number = DEFAULT_NOTARIZER_INTERVAL_MS,
+): () => void {
+  const stop = engine.schedulePeriodic({
+    name: "notarizer",
+    intervalMs,
+    cronSchedule: NOTARIZER_CRON,
+    workflowType: "notarizationWorkflow",
+    run: () => runCheckpointOnce(),
+  });
+  logger.info(
+    { engine: engine.kind, intervalMs },
+    "notarizer scheduled via workflow engine",
+  );
+  return stop;
 }
 
 // Exported for direct testing without spinning up setInterval. Also exposes

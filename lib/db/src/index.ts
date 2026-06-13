@@ -7,4 +7,9 @@ export {
   computeLedgerHash,
 } from "./chain";
 export { bootstrap } from "./bootstrap";
-export { SETUP_SQL } from "./setup-sql";
+export { SETUP_SQL, buildSetupSql, type SetupSqlOptions } from "./setup-sql";
+export {
+  provisionTenantEmbeddingPartition,
+  isFindingEmbeddingsPartitionedInDb,
+  type ProvisionPartitionResult,
+} from "./tenant-partition";

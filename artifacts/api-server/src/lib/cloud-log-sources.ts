@@ -130,6 +130,11 @@ export interface CloudwatchLogSourceOpts {
   readonly initialBackoffMs?: number;
   /** Backoff cap. Default 60s. */
   readonly maxBackoffMs?: number;
+  /** Max log groups polled concurrently per tick. Default 1 (sequential —
+   *  byte-identical to the original behavior). Bounded so a wide log-group
+   *  fan-out can't open an unbounded number of in-flight FilterLogEvents
+   *  calls. */
+  readonly maxConcurrentGroups?: number;
   /** Test injection: bypass the real SDK loader. */
   readonly clientFactory?: () => Promise<CloudwatchClient>;
   /** Test injection: bypass DB-backed checkpoint store. */
@@ -149,6 +154,7 @@ export class CloudwatchLogSource implements LogSource {
   private readonly maxPagesPerTick: number;
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
+  private readonly maxConcurrentGroups: number;
 
   constructor(private readonly opts: CloudwatchLogSourceOpts) {
     if (opts.logGroups.length === 0) {
@@ -161,6 +167,7 @@ export class CloudwatchLogSource implements LogSource {
     this.maxPagesPerTick = opts.maxPagesPerTick ?? 5;
     this.initialBackoffMs = opts.initialBackoffMs ?? 1000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 60_000;
+    this.maxConcurrentGroups = Math.max(1, opts.maxConcurrentGroups ?? 1);
   }
 
   private async getClient(): Promise<CloudwatchClient> {
@@ -260,11 +267,25 @@ export class CloudwatchLogSource implements LogSource {
     const client = await this.getClient();
     let published = 0;
     let pages = 0;
-    for (const group of this.opts.logGroups) {
-      const r = await this.pollGroup(client, group);
-      published += r.published;
-      pages += r.pages;
-    }
+    // Bounded worker pool over the log groups. With maxConcurrentGroups=1
+    // (default) this is exactly the original sequential poll. Each group has
+    // its own independent cursor, so concurrent polls never contend on the
+    // same checkpoint row.
+    const queue = [...this.opts.logGroups];
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const group = queue.shift();
+        if (group === undefined) return;
+        const r = await this.pollGroup(client, group);
+        published += r.published;
+        pages += r.pages;
+      }
+    };
+    const workers = Math.min(
+      this.maxConcurrentGroups,
+      this.opts.logGroups.length,
+    );
+    await Promise.all(Array.from({ length: workers }, () => worker()));
     return { published, pages };
   }
 
@@ -458,6 +479,7 @@ function shortHash(s: string): string {
  *  by setting `LOG_SOURCE=cloudwatch` plus the required vars. */
 export function buildCloudwatchSourceFromEnv(
   publish: (record: LogRecord) => Promise<unknown>,
+  extra: { maxConcurrentGroups?: number } = {},
 ): CloudwatchLogSource | null {
   if (process.env["LOG_SOURCE"] !== "cloudwatch") return null;
   const tenantId = process.env["CLOUDWATCH_TENANT_ID"];
@@ -485,6 +507,9 @@ export function buildCloudwatchSourceFromEnv(
     publish,
     pollIntervalMs,
     lookbackMsOnFirstPoll,
+    ...(extra.maxConcurrentGroups !== undefined
+      ? { maxConcurrentGroups: extra.maxConcurrentGroups }
+      : {}),
   });
 }
 

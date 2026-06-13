@@ -1,0 +1,109 @@
+# CI quality gate for the PHI/PII log-audit monorepo.
+#
+# This wires the gates that are ALREADY proven in-repo (and run locally /
+# in the dev workflow) to GitHub Actions — nothing here invents a new check:
+#   - typecheck         -> `pnpm run typecheck`            (all libs + leaf packages)
+#   - eval gate         -> `pnpm run eval:gate`            (6 credential-free suites + regression gate)
+#   - api-server tests  -> `pnpm --filter @workspace/api-server run test`  (needs Postgres + pgvector)
+#   - dashboard tests   -> `pnpm --filter @workspace/dashboard run test`
+#   - infra lint        -> `pnpm run tf:fmt` + `pnpm run helm:matrix`
+#
+# The eval gate is deliberately the credential-free half (see
+# deploy/scripts/eval-gate.sh): it unsets EVAL_LLM and uses a placeholder
+# DATABASE_URL, so it needs no secrets and stays byte-identical to local runs.
+# The LLM/DB-backed suites (`eval:gate:llm`) stay opt-in and are NOT run here.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref so a fresh push wins.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin the toolchain to what the repo develops against (Node 24, pnpm 10).
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10"
+
+jobs:
+  # Secret-free static + deterministic checks: typecheck, the credential-free
+  # eval gate, and the dashboard's vitest suite. No database needed.
+  quality:
+    name: Typecheck + eval gate + dashboard tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck (libs + all leaf packages)
+        run: pnpm run typecheck
+      - name: Eval gate (credential-free regression gate)
+        run: pnpm run eval:gate
+      - name: Dashboard unit tests
+        run: pnpm --filter @workspace/dashboard run test
+
+  # The api-server vitest suite opens a real Postgres connection (RLS, pgvector,
+  # the ledger hash chain, route tests), so it runs against a pgvector-enabled
+  # Postgres service container. bootstrap() creates the extension + schema
+  # idempotently, so a blank database is all that's required.
+  api-server-tests:
+    name: API server tests (Postgres + pgvector)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phiaudit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/phiaudit
+      # CI-only throwaway value; the real key lives in the operator secret store
+      # (see deploy/README.md). Never a production secret.
+      SESSION_SECRET: ci-throwaway-session-secret-not-for-prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: API server vitest suite
+        run: pnpm --filter @workspace/api-server run test
+
+  # Infrastructure-as-code lint: Terraform/OpenTofu formatting + the Helm
+  # render matrix across all three cloud overlays. Both are plain bash scripts
+  # (deploy/scripts/*.sh) with no Node/workspace dependency, so this job invokes
+  # them directly — it only needs the `tofu` + `helm` binaries, not pnpm.
+  infra-lint:
+    name: IaC lint (tofu fmt + helm matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+      - uses: azure/setup-helm@v4
+      - name: Terraform/OpenTofu fmt check
+        run: bash deploy/scripts/tf-fmt-check.sh
+      - name: Helm render matrix (aws/gcp/azure overlays)
+        run: bash deploy/scripts/helm-matrix.sh

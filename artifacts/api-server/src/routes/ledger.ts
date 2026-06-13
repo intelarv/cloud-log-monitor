@@ -1,5 +1,5 @@
 import { Router, type IRouter } from "express";
-import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import {
   db,
   ledgerEntriesTable,
@@ -118,6 +118,81 @@ router.get(
         signing_key_id: r.signingKeyId,
       })),
       verify,
+    });
+  },
+);
+
+// M10.6: read-only activity counts for the two opt-in cache-pruning jobs
+// (M10.4 raw-evidence tiering, M10.5 memory eviction). Both are default-inert,
+// so on an untuned deployment every count is simply 0 — the panel still tells
+// an operator "the jobs have never run here", which is the honest answer. Like
+// the ledger list above, this is scoped to the caller's tenant by an explicit
+// `tenant_id` predicate (the ledger has no RLS — the verifier walks it
+// globally). The aggregated payloads carry only counts + provider names, never
+// finding ids or object URIs, so nothing PHI-adjacent crosses the boundary.
+const MAINTENANCE_EVENT_TYPES = [
+  "memory.evicted",
+  "memory.evict_failed",
+  "raw_evidence.tiered",
+  "raw_evidence.tier_failed",
+] as const;
+
+function laterIso(a: unknown, b: unknown): string | null {
+  const da = a == null ? null : new Date(a as string | Date);
+  const db_ = b == null ? null : new Date(b as string | Date);
+  if (!da) return db_ ? db_.toISOString() : null;
+  if (!db_) return da.toISOString();
+  return (da > db_ ? da : db_).toISOString();
+}
+
+router.get(
+  "/admin/metrics/maintenance",
+  requireSession,
+  async (req, res): Promise<void> => {
+    const tenantId = req.session!.tenant_id;
+    const rows = await db
+      .select({
+        eventType: ledgerEntriesTable.eventType,
+        count: sql<number>`count(*)::int`,
+        lastTs: sql<string | null>`max(${ledgerEntriesTable.ts})`,
+        // Only `memory.evicted` payloads carry an `evicted` integer; the cast
+        // is NULL→0 for the other event types, so the coalesced sum is safe to
+        // run across the whole grouped set.
+        evictedSum: sql<number>`coalesce(sum((${ledgerEntriesTable.payload}->>'evicted')::int), 0)::int`,
+      })
+      .from(ledgerEntriesTable)
+      .where(
+        and(
+          eq(ledgerEntriesTable.tenantId, tenantId),
+          inArray(ledgerEntriesTable.eventType, [...MAINTENANCE_EVENT_TYPES]),
+        ),
+      )
+      .groupBy(ledgerEntriesTable.eventType);
+
+    const byType = new Map(rows.map((r) => [r.eventType, r]));
+    const memEvicted = byType.get("memory.evicted");
+    const memFailed = byType.get("memory.evict_failed");
+    const tiered = byType.get("raw_evidence.tiered");
+    const tierFailed = byType.get("raw_evidence.tier_failed");
+
+    // Returned plain (not via the generated Zod response schema): that schema
+    // models `last_run_at` as `union([coerce.date(), null])`, and
+    // `coerce.date()` greedily coerces `null` → `new Date(null)` (epoch 0), so
+    // parsing would silently rewrite a genuine "never run" null into
+    // 1970-01-01. The notarization-checkpoints route above skips the parse for
+    // the same reason; the response shape is covered by the route test instead.
+    res.json({
+      memory: {
+        runs: memEvicted?.count ?? 0,
+        embeddings_evicted: memEvicted?.evictedSum ?? 0,
+        failures: memFailed?.count ?? 0,
+        last_run_at: laterIso(memEvicted?.lastTs, memFailed?.lastTs),
+      },
+      tiering: {
+        findings_tiered: tiered?.count ?? 0,
+        failures: tierFailed?.count ?? 0,
+        last_run_at: laterIso(tiered?.lastTs, tierFailed?.lastTs),
+      },
     });
   },
 );

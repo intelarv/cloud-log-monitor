@@ -15,7 +15,15 @@ async function buildAll() {
   await rm(distDir, { recursive: true, force: true });
 
   await esbuild({
-    entryPoints: [path.resolve(artifactDir, "src/index.ts")],
+    entryPoints: [
+      path.resolve(artifactDir, "src/index.ts"),
+      path.resolve(artifactDir, "src/scripts/reindex-search.ts"),
+      // Temporal workflow module: emitted as a standalone bundle next to
+      // index.mjs so the (optional) Temporal worker can load it via
+      // workflowsPath. @temporalio/* is externalized below, so this builds even
+      // when the optional SDK is not installed (default-inert posture).
+      path.resolve(artifactDir, "src/lib/agents/temporal-workflows.ts"),
+    ],
     platform: "node",
     bundle: true,
     format: "esm",
@@ -100,6 +108,10 @@ async function buildAll() {
       "puppeteer",
       "puppeteer-core",
       "electron",
+      // Optional Temporal SDK (WORKFLOW_ENGINE=temporal). Externalized so the
+      // bundle builds without it installed; resolved at runtime by operators
+      // who opt in. temporal-workflows.ts statically imports @temporalio/workflow.
+      "@temporalio/*",
     ],
     sourcemap: "linked",
     plugins: [

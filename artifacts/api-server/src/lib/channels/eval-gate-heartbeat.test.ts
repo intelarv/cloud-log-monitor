@@ -7,16 +7,22 @@ import { describe, expect, it } from "vitest";
 // the byte-for-byte adapter cross-check in eval-gate-notify.test.ts covers both.
 import {
   DEFAULT_MAX_AGE_MINUTES,
+  DEFAULT_MAX_RUN_MINUTES,
   DEFAULT_PING_TIMEOUT_MS,
   ageMinutes,
   buildHeartbeatPayload,
   buildHeartbeatText,
+  buildHungPayload,
+  buildHungText,
   buildPingUrl,
   evaluateHeartbeat,
+  evaluateHungRun,
   externalPingUrl,
   gateName,
+  isHung,
   isStale,
   parseMaxAgeMinutes,
+  parseMaxRunMinutes,
   parsePingTimeoutMs,
   pingExternalHeartbeat,
   pingStyle,
@@ -409,5 +415,145 @@ describe("eval-gate heartbeat", () => {
     const payload = JSON.parse(body);
     expect(payload.kind).toBe("eval_gate_heartbeat_missing");
     expect(payload.severity).toBe("high");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Hung-run detection (--start stamps last_start_at; --check pages when a run
+  // began but no completion arrived within the max-run window).
+  // ---------------------------------------------------------------------------
+
+  it("parses EVAL_HEARTBEAT_MAX_RUN_MINUTES and falls back on bad input", () => {
+    expect(parseMaxRunMinutes({})).toBe(DEFAULT_MAX_RUN_MINUTES);
+    expect(parseMaxRunMinutes({ EVAL_HEARTBEAT_MAX_RUN_MINUTES: "30" })).toBe(30);
+    expect(parseMaxRunMinutes({ EVAL_HEARTBEAT_MAX_RUN_MINUTES: "0" })).toBe(DEFAULT_MAX_RUN_MINUTES);
+    expect(parseMaxRunMinutes({ EVAL_HEARTBEAT_MAX_RUN_MINUTES: "nope" })).toBe(
+      DEFAULT_MAX_RUN_MINUTES,
+    );
+  });
+
+  it("flags a hung run: start present, no completion at/after it, older than max-run", () => {
+    const threeHoursAgo = new Date(NOW - 3 * 60 * 60 * 1000).toISOString();
+    const fourHoursAgo = new Date(NOW - 4 * 60 * 60 * 1000).toISOString();
+    const tenMinAgo = new Date(NOW - 10 * 60 * 1000).toISOString();
+
+    // No start stamp at all → never hung (pre-upgrade / never-started rows).
+    expect(isHung(null, fourHoursAgo, 120, NOW)).toBe(false);
+    // Started 3h ago, last completion 4h ago (before the start) → hung at 120min.
+    expect(isHung(threeHoursAgo, fourHoursAgo, 120, NOW)).toBe(true);
+    // Started 3h ago, never completed → hung.
+    expect(isHung(threeHoursAgo, null, 120, NOW)).toBe(true);
+    // A completion AT/AFTER the start means the run finished → not hung.
+    expect(isHung(threeHoursAgo, tenMinAgo, 120, NOW)).toBe(false);
+    // Start within the window → in-flight, not yet hung.
+    expect(isHung(tenMinAgo, fourHoursAgo, 120, NOW)).toBe(false);
+    // Unparseable start stamp → not hung (cannot prove a hang).
+    expect(isHung("not-a-date", null, 120, NOW)).toBe(false);
+  });
+
+  it("builds a hung-run alert body + payload with no scores/PHI fields", () => {
+    const startedAt = new Date(NOW - 3 * 60 * 60 * 1000).toISOString();
+    const text = buildHungText({
+      name: "nightly",
+      lastStartAt: startedAt,
+      lastSuccessAt: null,
+      maxRunMinutes: 120,
+      now: NOW,
+    });
+    expect(text).toContain("[ALERT high]");
+    expect(text).toContain("run_hung");
+    expect(text).toContain("nightly");
+
+    const payload = buildHungPayload({
+      name: "nightly",
+      lastStartAt: startedAt,
+      lastSuccessAt: null,
+      maxRunMinutes: 120,
+      now: NOW,
+    });
+    expect(payload.kind).toBe("eval_gate_run_hung");
+    expect(payload.severity).toBe("high");
+    expect(payload.lastStartAt).toBe(startedAt);
+    expect(payload.lastSuccessAt).toBeNull();
+    expect(Math.round(payload.runMinutes ?? NaN)).toBe(180);
+    expect(payload).not.toHaveProperty("suites");
+  });
+
+  it("pages Slack at high severity when a run is hung", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const res = await evaluateHungRun({
+      env: { CHANNEL_SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/T/B/X" },
+      lastStartAt: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(),
+      lastSuccessAt: null,
+      maxRunMinutes: 120,
+      now: NOW,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(res.hung).toBe(true);
+    expect(res.skipped).toBe(false);
+    expect(res.severity).toBe("high");
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(calls[0]!.init.body as string);
+    expect(body.text).toContain("run_hung");
+  });
+
+  it("does not alert (inert) when the run is not hung", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const res = await evaluateHungRun({
+      env: { CHANNEL_SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/T/B/X" },
+      // Completion is after the start → finished, not hung.
+      lastStartAt: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(),
+      lastSuccessAt: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      maxRunMinutes: 120,
+      now: NOW,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(res.hung).toBe(false);
+    expect(res.skipped).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("shares the PagerDuty liveness dedup_key so a later completion auto-resolves the hung page", async () => {
+    // Hung run opens the liveness incident.
+    const hungFetch = makeFetch(true, 202);
+    const hungRes = await evaluateHungRun({
+      env: { CHANNEL_PAGERDUTY_ROUTING_KEY: "R0UT1NGK3Y0000000000000000000000" },
+      lastStartAt: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(),
+      lastSuccessAt: null,
+      maxRunMinutes: 120,
+      now: NOW,
+      fetchImpl: hungFetch.fetchImpl as unknown as typeof fetch,
+    });
+    expect(hungRes.hung).toBe(true);
+    const triggerEvent = JSON.parse(hungFetch.calls[0]!.init.body as string);
+    expect(triggerEvent.event_action).toBe("trigger");
+
+    // A later healthy completion-staleness check resolves the SAME dedup_key.
+    const healthyFetch = makeFetch(true, 202);
+    const healthyRes = await evaluateHeartbeat({
+      env: { CHANNEL_PAGERDUTY_ROUTING_KEY: "R0UT1NGK3Y0000000000000000000000" },
+      lastSuccessAt: new Date(NOW - 60 * 60 * 1000).toISOString(),
+      maxAgeMinutes: 1560,
+      now: NOW,
+      fetchImpl: healthyFetch.fetchImpl as unknown as typeof fetch,
+    });
+    const resolveEvent = JSON.parse(healthyFetch.calls[0]!.init.body as string);
+    expect(resolveEvent.event_action).toBe("resolve");
+    expect(resolveEvent.dedup_key).toBe(triggerEvent.dedup_key);
+    expect(healthyRes.stale).toBe(false);
+  });
+
+  it("is inert (no page) when hung but no channel is configured", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const res = await evaluateHungRun({
+      env: {},
+      lastStartAt: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(),
+      lastSuccessAt: null,
+      maxRunMinutes: 120,
+      now: NOW,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(res.hung).toBe(true);
+    expect(res.skipped).toBe(true);
+    expect(calls).toHaveLength(0);
   });
 });

@@ -6,6 +6,7 @@ import {
   useReplayIngestFixture,
   useApproveBreakGlassGrant,
   useRevokeBreakGlassGrant,
+  useGetMaintenanceMetrics,
   getListBreakGlassGrantsQueryKey,
   getListPendingBreakGlassApprovalsQueryKey,
   getListFindingsQueryKey,
@@ -17,7 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { Play, Shield, Clock, CheckCircle2, AlertTriangle, Key, Activity, Ban } from "lucide-react";
+import { Play, Shield, Clock, CheckCircle2, AlertTriangle, Key, Activity, Ban, Database, Archive } from "lucide-react";
 import { isPast } from "date-fns";
 import { safeTimestamp, safeRelativeTime } from "../lib/format";
 import { useToast } from "@/hooks/use-toast";
@@ -28,6 +29,7 @@ import { Label } from "@/components/ui/label";
 export default function Admin() {
   const { data: activeGrants, isLoading: loadingGrants } = useListBreakGlassGrants();
   const { data: pendingApprovals, isLoading: loadingApprovals, refetch: refetchApprovals } = useListPendingBreakGlassApprovals();
+  const { data: maintenance } = useGetMaintenanceMetrics();
   const replayIngest = useReplayIngestFixture();
   const approveGrant = useApproveBreakGlassGrant();
   const revokeGrant = useRevokeBreakGlassGrant();
@@ -307,6 +309,67 @@ export default function Admin() {
                   <Play className="h-4 w-4 mr-2" />
                   {replayIngest.isPending ? "Replaying..." : "Replay Fixture Logs"}
                 </Button>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="col-span-1 md:col-span-2">
+            <CardHeader>
+              <CardTitle className="text-lg flex items-center gap-2">
+                <Database className="h-5 w-5 text-primary" />
+                Cache-pruning Maintenance
+              </CardTitle>
+              <CardDescription>
+                Activity from the two opt-in retention jobs, read from the audit ledger (counts only, this tenant). Both are off by default — zeros mean the jobs have never run here.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="p-4 border rounded-md space-y-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Database className="h-4 w-4 text-muted-foreground" />
+                    Memory eviction
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div>
+                      <div className="text-2xl font-bold tabular-nums">{maintenance?.memory.embeddings_evicted ?? 0}</div>
+                      <div className="text-[11px] text-muted-foreground uppercase tracking-wide">Embeddings evicted</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold tabular-nums">{maintenance?.memory.runs ?? 0}</div>
+                      <div className="text-[11px] text-muted-foreground uppercase tracking-wide">Runs</div>
+                    </div>
+                    <div>
+                      <div className={`text-2xl font-bold tabular-nums ${(maintenance?.memory.failures ?? 0) > 0 ? "text-destructive" : ""}`}>{maintenance?.memory.failures ?? 0}</div>
+                      <div className="text-[11px] text-muted-foreground uppercase tracking-wide">Failures</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Clock className="h-3 w-3" />
+                    {maintenance?.memory.last_run_at ? `Last run ${safeRelativeTime(String(maintenance.memory.last_run_at))}` : "Never run"}
+                  </div>
+                </div>
+
+                <div className="p-4 border rounded-md space-y-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Archive className="h-4 w-4 text-muted-foreground" />
+                    Raw-evidence tiering
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-center">
+                    <div>
+                      <div className="text-2xl font-bold tabular-nums">{maintenance?.tiering.findings_tiered ?? 0}</div>
+                      <div className="text-[11px] text-muted-foreground uppercase tracking-wide">Findings tiered</div>
+                    </div>
+                    <div>
+                      <div className={`text-2xl font-bold tabular-nums ${(maintenance?.tiering.failures ?? 0) > 0 ? "text-destructive" : ""}`}>{maintenance?.tiering.failures ?? 0}</div>
+                      <div className="text-[11px] text-muted-foreground uppercase tracking-wide">Failures</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Clock className="h-3 w-3" />
+                    {maintenance?.tiering.last_run_at ? `Last run ${safeRelativeTime(String(maintenance.tiering.last_run_at))}` : "Never run"}
+                  </div>
+                </div>
               </div>
             </CardContent>
           </Card>

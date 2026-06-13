@@ -102,3 +102,21 @@ id = "BAdaL-uUldCekhrVAtS5s"
 uri = "file://dist/project.tar.gz"
 type = "unspecified"
 title = "Project source archive (project.tar.gz)"
+
+[[outputs]]
+id = "x9uvtJSelMF7nGRU4V9e3"
+uri = "file://export/phi-audit-project.tar.gz"
+type = "unspecified"
+title = "PHI Audit Project (source archive)"
+
+[[outputs]]
+id = "8t7uQUVzlISlrJJpDLdy9"
+uri = "file://exports/source.tar.gz"
+type = "unspecified"
+title = "Project source (572 files)"
+
+[[outputs]]
+id = "e3wHlQ5qXRKc163KdrLMv"
+uri = "file://exports/phi-audit-source.tar.gz"
+type = "unspecified"
+title = "PHI Audit — Source Files"

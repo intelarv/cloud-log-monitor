@@ -74,6 +74,15 @@ export const findingsTable = pgTable(
     triageVerdict: jsonb("triage_verdict"),
     verifierVerdict: jsonb("verifier_verdict"),
     lastAgentReviewAt: timestamp("last_agent_review_at", { withTimezone: true }),
+    // Monotonic per-finding review-attempt counter. Incremented by the CAS in
+    // acquireFinding (pending -> in_progress) so EACH (re)start of the review
+    // gets a distinct attempt number. The supervisor mixes this into every
+    // per-step ledger idempotency key, so a manual operator replay (reset
+    // status back to 'pending' + re-enqueue after a permanent failure) re-runs
+    // the LLM fresh instead of recovering the stale prior verdict, while a
+    // transient Temporal activity auto-retry — which never re-acquires within
+    // one workflow execution — keeps the same attempt and stays exactly-once.
+    agentReviewAttempt: integer("agent_review_attempt").notNull().default(0),
   },
   (t) => [
     index("findings_tenant_idx").on(t.tenantId),
@@ -114,6 +123,9 @@ export const findingSafeColumns = {
   triageVerdict: findingsTable.triageVerdict,
   verifierVerdict: findingsTable.verifierVerdict,
   lastAgentReviewAt: findingsTable.lastAgentReviewAt,
+  // Non-PHI integer bookkeeping counter; safe to expose. The supervisor reads
+  // it from the acquired finding to derive per-attempt idempotency keys.
+  agentReviewAttempt: findingsTable.agentReviewAttempt,
 } as const;
 
 // Matches `Finding` minus the raw-evidence columns. Drizzle infers this from

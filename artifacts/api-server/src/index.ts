@@ -2,20 +2,28 @@ import app from "./app";
 import { logger } from "./lib/logger";
 import { bootstrap } from "@workspace/db";
 import { verifyChain } from "./lib/ledger";
-import { startChainVerifier } from "./lib/chain-verifier";
+import { startChainVerifier, startNotarizer } from "./lib/chain-verifier";
 import { backfillEmbeddings, reconcileSearchIndex } from "./lib/search";
 import { initEmbedderFromEnv } from "./lib/embedder-config";
 import { initSearchProviderFromEnv } from "./lib/search-config";
 import { initRawEvidenceStoreFromEnv } from "./lib/raw-evidence-store";
 import { initNerProviderFromEnv } from "./lib/ner-config";
+import {
+  initEmbeddingsPartitioningFromEnv,
+  reconcileEmbeddingsPartitioningFromDb,
+} from "./lib/embeddings-partition-config";
 import { initLlmRuntimeFromEnv } from "./lib/llm-runtime-config";
 import { hasDedicatedNotarizationSecret } from "./lib/notarization";
+import { loadTenantKmsCacheFromDb } from "./lib/tenant-kms";
 import { startIngestPipeline } from "./lib/ingest";
 import { startRawEvidenceTiering } from "./lib/raw-evidence-tiering";
 import { startMemoryEviction } from "./lib/memory-eviction";
+import { startLogSourceReaper } from "./lib/log-source-reaper";
 import { initLogBusFromEnv } from "./lib/log-bus-config";
-import { buildCloudwatchSourceFromEnv } from "./lib/cloud-log-sources";
+import { buildLogSourceFromEnv } from "./lib/log-source-config";
+import type { LogRecord } from "./lib/log-source";
 import { startAgentSupervisor } from "./lib/agents/supervisor";
+import { getWorkflowEngine } from "./lib/agents/workflow-engine";
 import { buildChannelsFromEnv, initChannels } from "./lib/channels";
 
 const rawPort = process.env["PORT"];
@@ -64,13 +72,42 @@ async function main(): Promise<void> {
   // No DB access here. See ner-config.ts.
   initNerProviderFromEnv();
 
+  // Step 0.95 (M12.2): resolve the per-tenant pgvector partitioning switch.
+  // Default off ⇒ single-table finding_embeddings, byte-identical to pre-M12.2.
+  // When EMBEDDINGS_TENANT_PARTITIONING is on, bootstrap recreates the table as
+  // LIST-partitioned by tenant_id (DEFAULT partition keeps un-provisioned
+  // tenants behaving identically), and the embedding upsert switches its ON
+  // CONFLICT arbiter to the composite PK. See embeddings-partition-config.ts.
+  const embeddingsPartitioned = initEmbeddingsPartitioningFromEnv();
+
   // Step 1: idempotent DB setup (RLS policies + findings_redacted view).
   // Safe to run every boot; CREATE OR REPLACE / DROP IF EXISTS make it so.
   // The embedding-column dim is passed through; if a pre-existing column has
   // a different dim, bootstrap throws with a clear migration message.
   logger.info("Running DB bootstrap (setup + seed-if-empty)");
-  const boot = await bootstrap({ embeddingDim: embedderConfig.dim });
+  const boot = await bootstrap({
+    embeddingDim: embedderConfig.dim,
+    tenantPartitioning: embeddingsPartitioned,
+  });
   logger.info(boot, "DB bootstrap complete");
+
+  // Step 1.05 (M12.2): reconcile the runtime partitioning switch with the
+  // ACTUAL table layout. bootstrap only converts single→partitioned (never
+  // back), so the env flag can drift from the schema; trusting the catalog
+  // keeps the embedding upsert's ON CONFLICT arbiter consistent with the table
+  // and avoids a runtime arbiter mismatch. No-op when they already agree.
+  const actuallyPartitioned = await reconcileEmbeddingsPartitioningFromDb();
+  logger.info(
+    { embeddingsPartitioned: actuallyPartitioned },
+    "finding_embeddings layout reconciled",
+  );
+
+  // Step 1.1 (M12.1): load the per-tenant KMS key registry into the in-memory
+  // resolver cache, now that bootstrap has ensured the table exists. Default-
+  // inert: an empty registry (the dev/eval default) leaves every tenant on the
+  // global secret, so cookie signatures stay byte-identical to pre-M12.1.
+  const kms = await loadTenantKmsCacheFromDb();
+  logger.info({ tenantKeys: kms }, "Per-tenant KMS registry loaded");
 
   // Step 1.5 (M1): backfill embeddings for any finding without one (or
   // re-embed when the embedder version has changed). Idempotent; cheap when
@@ -117,8 +154,9 @@ async function main(): Promise<void> {
   // Step 3 (M1.8): start the periodic chain verifier — hourly 24h-window
   // walk + weekly full walk. On mismatch it appends `ledger.chain_invalid`
   // whose post-commit alert hook routes via §25. See ARCHITECTURE.md §23.2.
-  // M2: the same scheduler also drives external notarization checkpoint
-  // creation + verification (5min cadence in dev).
+  // M2 notarization checkpoint create+verify is no longer driven here — it now
+  // runs through the WorkflowEngine seam (`startNotarizer`, step 5.5) so it can
+  // be made durable under WORKFLOW_ENGINE=temporal.
   if (!hasDedicatedNotarizationSecret()) {
     logger.warn(
       "NOTARIZATION_SECRET is not set; falling back to SESSION_SECRET-derived dev key. " +
@@ -168,19 +206,31 @@ async function main(): Promise<void> {
   // eviction removed. See memory-eviction.ts.
   startMemoryEviction();
 
-  // Step 4.5 (M8): real cloud log source(s), env-driven. Inert by default —
-  // an operator opts in with `LOG_SOURCE=cloudwatch` + the required vars
-  // (CLOUDWATCH_TENANT_ID, CLOUDWATCH_LOG_GROUPS, AWS_REGION). When unset,
-  // `buildCloudwatchSourceFromEnv` returns null and we keep dev behavior:
-  // only the fixture replay endpoint produces records. Same lazy-load
-  // pattern as cloud-embedders — `@aws-sdk/client-cloudwatch-logs` is an
-  // optional dep that's only required when this branch fires.
-  const cloudwatchSource = buildCloudwatchSourceFromEnv((record) =>
+  // Step 4.9 (M8 reaper): start the stuck-cursor reaper. Periodically scans
+  // `log_source_checkpoints` for poller cursors that have stopped advancing past
+  // the operator-configured stall threshold and emits a warning-level
+  // `ingest.source_stalled` ledger event so on-call learns a log source went
+  // quiet (a potential missed-PHI gap that is otherwise invisible at the finding
+  // level). Default-INERT: schedules nothing unless the operator opts in
+  // (INGEST_SOURCE_STALL_AFTER_MS). With it unset — and with no cloud source
+  // configured the checkpoint table is empty anyway — dev boot + the offline
+  // eval gate are byte-identical. Edge-triggered + leader-locked. See
+  // log-source-reaper.ts.
+  startLogSourceReaper();
+
+  // Step 4.5 (M8): real cloud log source, env-driven. Inert by default — an
+  // operator opts in with `LOG_SOURCE=cloudwatch|cloud_logging|azure_monitor`
+  // + that provider's required vars (see docs/CONFIGURATION.md). When unset,
+  // `buildLogSourceFromEnv` returns null and we keep dev behavior: only the
+  // fixture replay endpoint produces records. Same lazy-load pattern as
+  // cloud-embedders — each provider SDK is an optional dep that's only
+  // required when its branch fires.
+  const cloudLogSource = buildLogSourceFromEnv((record: LogRecord) =>
     bus.publish("raw.logs", record),
   );
-  if (cloudwatchSource) {
-    await cloudwatchSource.start();
-    logger.info({ source: cloudwatchSource.name }, "cloud log source started");
+  if (cloudLogSource) {
+    await cloudLogSource.start();
+    logger.info({ source: cloudLogSource.name }, "cloud log source started");
   } else {
     logger.info("no cloud log source configured (LOG_SOURCE unset)");
   }
@@ -193,6 +243,16 @@ async function main(): Promise<void> {
   // ARCH §7 / §24. Cost is bounded by AGENT_DAILY_TOKEN_BUDGET; concurrency
   // is bounded inside the supervisor module.
   startAgentSupervisor();
+
+  // Step 5.5 (M2 notarizer through the WorkflowEngine seam): schedule the
+  // checkpoint create+verify cycle on the active workflow engine. In-process
+  // this is a leader-locked 5min setInterval, byte-identical to the pre-seam
+  // chain-verifier checkpoint timer it replaces. Under WORKFLOW_ENGINE=temporal
+  // it becomes a durable cron workflow (`notarizationWorkflow`) with the same
+  // single-execution + crash-resume guarantees as the review path. Wired AFTER
+  // startAgentSupervisor so the engine is selected (and, for temporal, started
+  // — schedulePeriodic buffers until the worker is up).
+  startNotarizer(getWorkflowEngine());
 
   // Step 6 (M6): wire notification channels (Slack incoming-webhook +
   // generic HMAC-signed webhook). Adapter env is read here and validated

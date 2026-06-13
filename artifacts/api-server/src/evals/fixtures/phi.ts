@@ -241,6 +241,31 @@ export const PHI_FIXTURES: PhiFixture[] = [
     ],
   },
   {
+    // Member-identifying URL in a logfmt access line: the `member_id` query
+    // param is the signal; the URL is flagged even though the host is benign.
+    id: "url-2",
+    shape: "kv",
+    text: "audit access url=https://portal.examplehealth.org/eligibility?member_id=998877 actor=svc",
+    phi: [
+      {
+        sub: "https://portal.examplehealth.org/eligibility?member_id=998877",
+        identifier: "url",
+      },
+    ],
+  },
+  {
+    // MRN query param inside a JSON event — patient-identifying URL.
+    id: "url-3",
+    shape: "json",
+    text: '{"event":"chart_open","link":"https://portal.examplehealth.org/v1/records?mrn=A1234567"}',
+    phi: [
+      {
+        sub: "https://portal.examplehealth.org/v1/records?mrn=A1234567",
+        identifier: "url",
+      },
+    ],
+  },
+  {
     id: "ip-1",
     shape: "clean",
     text: "Session originated from 192.168.10.24 inside the VPN.",
@@ -599,4 +624,103 @@ export const BENIGN_FIXTURES: { id: string; shape: LogShape; text: string }[] = 
     shape: "prose",
     text: "Health Check passed: region=us-west-2 nodes=12 cpu=75% mem=60% account=service-mesh stable.",
   },
+
+  // ---------------------------------------------------------------------------
+  // Benign infrastructure URLs (M-URL precision controls). The URL detector now
+  // suppresses plain infra URLs and fires only on patient/member-identifying
+  // ones — these controls lock that in. None carries a PHI signal in its
+  // path/query, so the suite must report ZERO hits across all of them.
+  // ---------------------------------------------------------------------------
+
+  // Service-to-service health check — path is /healthz, no identifying signal.
+  {
+    id: "benign-url-1",
+    shape: "clean",
+    text: "Health check GET https://billing-svc.internal:8080/healthz returned 200.",
+  },
+  // Asset CDN fetch — hashed static asset path, no signal.
+  {
+    id: "benign-url-2",
+    shape: "clean",
+    text: "Fetched asset https://assets.cdn.examplehealth.org/static/app.4f3a2b9c.js from edge.",
+  },
+  // The key host-vs-path trap: the HOST contains "patient" (a service name) but
+  // the path (/livez) carries no identifying signal — must NOT be flagged.
+  {
+    id: "benign-url-3",
+    shape: "kv",
+    text: "upstream url=https://patient-records-svc.internal/livez status=ok latency=12ms",
+  },
+  // OAuth token endpoint — grant_type is not an identifying param.
+  {
+    id: "benign-url-4",
+    shape: "clean",
+    text: "Token endpoint https://auth.examplehealth.org/oauth2/token?grant_type=client_credentials reached.",
+  },
+  // Paginated list API in JSON — limit/cursor params carry no identity.
+  {
+    id: "benign-url-5",
+    shape: "json",
+    text: '{"msg":"page fetch","url":"https://api.examplehealth.org/v1/findings?limit=50&cursor=ab12cd"}',
+  },
+  // "remember_token" contains the substring "member" but is not preceded by a
+  // query/path separator, so the member-id signal must NOT fire.
+  {
+    id: "benign-url-6",
+    shape: "clean",
+    text: "Webhook https://hooks.examplehealth.org/notify?remember_token=true&channel=ops delivered.",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// NER (Stage-2) recall fixtures — DELIBERATELY SEPARATE from PHI_FIXTURES.
+//
+// These are the *un-anchored person names* the deterministic Stage-1 detectors
+// (scanForPhi) cannot match without destroying precision: a single surname with
+// no title/anchor ("Reyes finalized the discharge note"), or a name token that
+// is ALSO a common English word ("Hope", "Grace", "Will", "Mark", "May",
+// "Park") — the precision trap that blocks any regex-only fix, since flagging
+// capitalized words would fire on sentence-initial common words.
+//
+// They live in their OWN export, never in PHI_FIXTURES, on purpose: folding them
+// into the gated detector-phi corpus would create unexplained false negatives
+// (they are not `knownGap` spans against a *deterministic* detector — they are
+// the explicit reason the optional NER seam exists) and would regress the gated
+// recall score. The measurement that consumes them (detector-ner.eval.ts) is
+// OPT-IN (EVAL_NER=1) and never writes a baselined result, so the credential-
+// free offline gate stays byte-identical. Verified misses: every `name` below
+// returns no overlapping Stage-1 hit (see detector-ner.eval.ts, "stage-1 recall
+// gap" leg). The benign precision-hold leg reuses BENIGN_FIXTURES, whose
+// operational text contains none of these name tokens at a case-sensitive word
+// boundary — so a real NER (and the deterministic fake that stands in for it
+// offline) adds no false positives there.
+// ---------------------------------------------------------------------------
+
+/** A labeled un-anchored person name that Stage-1 misses and a Stage-2 NER
+ *  provider is expected to recover. */
+export interface NerNameFixture {
+  id: string;
+  text: string;
+  /** The person-name substring. Must be unique in `text` and match at a
+   *  case-sensitive word boundary (the fake provider matches whole words). */
+  name: string;
+  /** True when `name` is also a common English word — the precision trap that
+   *  makes a precision-safe regex fix impossible (only a model has the context
+   *  to disambiguate "Hope examined the chart" from "Hope this helps"). */
+  wordCollision?: boolean;
+}
+
+export const NER_PHI_FIXTURES: NerNameFixture[] = [
+  // Word-collision names: the token is also an ordinary English word.
+  { id: "ner-name-1", text: "Park reviewed the chart before rounds.", name: "Park", wordCollision: true },
+  { id: "ner-name-2", text: "Hope examined the results yesterday.", name: "Hope", wordCollision: true },
+  { id: "ner-name-3", text: "Grace signed the consent form.", name: "Grace", wordCollision: true },
+  { id: "ner-name-4", text: "Mark closed the incident at noon.", name: "Mark", wordCollision: true },
+  { id: "ner-name-5", text: "May returned the labs to the ward.", name: "May", wordCollision: true },
+  // Plain un-anchored surnames: no title, no "First Last" casing pair, so the
+  // Stage-1 dictionary/context passes stay silent.
+  { id: "ner-name-6", text: "The consult was completed by Reyes.", name: "Reyes" },
+  { id: "ner-name-7", text: "Approval came from Cho late Friday.", name: "Cho" },
+  { id: "ner-name-8", text: "Okafor approved the transfer overnight.", name: "Okafor" },
+  { id: "ner-name-9", text: "Nguyen finalized the discharge note.", name: "Nguyen" },
 ];

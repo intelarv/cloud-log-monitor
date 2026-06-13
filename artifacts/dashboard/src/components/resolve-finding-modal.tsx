@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   useResolveFinding,
   getGetFindingQueryKey,
+  getGetFindingHistoryQueryKey,
   getListFindingsQueryKey,
   type ResolveFindingResult,
 } from "@workspace/api-client-react";
@@ -47,6 +48,7 @@ export default function ResolveFindingModal({
       const result = await resolve.mutateAsync({ id: findingId, data: { status } });
 
       await queryClient.invalidateQueries({ queryKey: getGetFindingQueryKey(findingId) });
+      await queryClient.invalidateQueries({ queryKey: getGetFindingHistoryQueryKey(findingId) });
       await queryClient.invalidateQueries({ queryKey: getListFindingsQueryKey() });
 
       const label = status === "resolved" ? "Resolved" : "False positive";

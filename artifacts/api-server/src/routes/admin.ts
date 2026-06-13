@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { Router, type IRouter } from "express";
 import { z } from "zod";
-import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, ne, sql } from "drizzle-orm";
 import {
   breakGlassGrantsTable,
   findingsTable,
+  findingSafeColumns,
+  remediationProposalsTable,
   type BreakGlassGrant,
   type Finding,
+  type RemediationProposal,
 } from "@workspace/db";
 import { withTenant } from "../lib/db-context";
 import { requireSession, requireStepUp } from "../lib/auth";
@@ -17,6 +20,7 @@ import {
   resolveRawEvidence,
 } from "../lib/raw-evidence-store";
 import { resolveFinding, reopenFinding } from "../lib/finding-status";
+import { enqueueReview } from "../lib/agents/supervisor";
 
 // M1.6: break-glass raw-PHI access flow.
 // M1.7: two-person rule on critical-severity findings.
@@ -93,6 +97,13 @@ const ReopenFindingBody = z.object({
   // Optional free-text reason — lands in the immutable ledger payload, so it is
   // scanned by the same content policy as resolve/revoke justifications when
   // present.
+  reason: z.string().min(1).max(2000).optional(),
+});
+
+const ReReviewFindingBody = z.object({
+  // Optional free-text reason ("why") for the operator-initiated replay — lands
+  // in the immutable ledger payload, so it is scanned by the same content policy
+  // as resolve/reopen reasons when present.
   reason: z.string().min(1).max(2000).optional(),
 });
 
@@ -669,6 +680,143 @@ router.post(
   },
 );
 
+// Operator-initiated re-review (replay). A first-class, audited way to re-run
+// the Triage -> Verifier LLM review of a finding without out-of-band DB edits.
+// It resets `agent_review_status` back to "pending" and re-enqueues the review;
+// the supervisor's acquireFinding CAS then bumps `agent_review_attempt`, which
+// gives every replay step a FRESH per-attempt idempotency key so the agents
+// re-run from scratch instead of recovering the prior (stale) verdict.
+//
+// Requires session only — like resolve/reopen this is routine triage over the
+// REDACTED projection (no raw PHI, no authorized write). It does consume LLM
+// budget, but the per-tenant cost breaker (agent-budget.ts) already gates that
+// downstream (a replay over budget is ledgered `agent.review_skipped_budget`).
+//
+// A review currently `in_progress` is refused (409) so a replay cannot clobber
+// a run that is mid-flight (which would orphan its in-flight attempt). The
+// status reset is a compare-and-swap on `status != 'in_progress'` so a review
+// that a concurrent supervisor worker picked up between our read and write is
+// not stomped. Ledgered `agent.re_review_requested` (who + optional why).
+router.post(
+  "/admin/findings/:id/re-review",
+  requireSession,
+  async (req, res): Promise<void> => {
+    const parsed = ReReviewFindingBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.message });
+      return;
+    }
+    const tenantId = req.session!.tenant_id;
+    const userId = req.session!.sub;
+    const findingId = String(req.params.id);
+
+    // Boundary scan on the optional reason — same rationale as resolve/reopen:
+    // it lands in the immutable ledger payload, so refuse and ledger any text
+    // that scans as PHI/secrets or carries the canary token.
+    if (parsed.data.reason !== undefined) {
+      const rv = validateLedgerSafeText(parsed.data.reason);
+      if (!rv.ok) {
+        await appendLedger({
+          tenantId,
+          actor: { kind: "human", id: userId },
+          eventType: "policy.text_field_rejected",
+          subjectType: "finding",
+          subjectId: findingId,
+          payload: {
+            endpoint: "POST /admin/findings/:id/re-review",
+            field: "reason",
+            reason: rv.reason,
+            detectors: rv.detectors,
+          },
+        });
+        res.status(400).json({
+          error: "reason rejected by content policy",
+          reason: rv.reason,
+        });
+        return;
+      }
+    }
+
+    // Establish existence (and current review state) within the caller's tenant.
+    const [existing] = await withTenant(tenantId, async (tx) =>
+      tx
+        .select({ agentReviewStatus: findingsTable.agentReviewStatus })
+        .from(findingsTable)
+        .where(
+          and(
+            eq(findingsTable.id, findingId),
+            eq(findingsTable.tenantId, tenantId),
+          ),
+        )
+        .limit(1),
+    );
+    if (!existing) {
+      res.status(404).json({ error: "finding not found" });
+      return;
+    }
+    if (existing.agentReviewStatus === "in_progress") {
+      res.status(409).json({ error: "review already in progress" });
+      return;
+    }
+
+    // CAS reset to 'pending' guarding against a concurrent worker flipping the
+    // row to in_progress between the read above and this write.
+    const [updated] = await withTenant(tenantId, async (tx) =>
+      tx
+        .update(findingsTable)
+        .set({ agentReviewStatus: "pending" })
+        .where(
+          and(
+            eq(findingsTable.id, findingId),
+            eq(findingsTable.tenantId, tenantId),
+            ne(findingsTable.agentReviewStatus, "in_progress"),
+          ),
+        )
+        .returning(findingSafeColumns),
+    );
+    if (!updated) {
+      // A supervisor worker won the race and is now reviewing it.
+      res.status(409).json({ error: "review already in progress" });
+      return;
+    }
+
+    const led = await appendLedger({
+      tenantId,
+      actor: { kind: "human", id: userId },
+      eventType: "agent.re_review_requested",
+      subjectType: "finding",
+      subjectId: findingId,
+      payload: {
+        finding_id: findingId,
+        requested_by: userId,
+        previous_status: existing.agentReviewStatus,
+        ...(parsed.data.reason !== undefined
+          ? { reason: parsed.data.reason }
+          : {}),
+      },
+    });
+
+    // Fire-and-forget enqueue — the CAS in the review steps makes it safe to
+    // call even if a stray duplicate is already queued.
+    enqueueReview(findingId, tenantId);
+
+    req.log.warn(
+      {
+        finding_id: findingId,
+        requested_by: userId,
+        previous_status: existing.agentReviewStatus,
+        seq: led.seq,
+      },
+      "operator-initiated finding re-review enqueued",
+    );
+    res.json({
+      finding_id: findingId,
+      agent_review_status: "pending",
+      enqueued: true,
+    });
+  },
+);
+
 // List the caller's active grants (for the dashboard's "active break-glass
 // grants" badge). Returns at most 50, most-recently-granted first.
 router.get(
@@ -903,6 +1051,297 @@ router.get(
       two_person_approved: grant.requiresSecondApproval,
       approver_user_id: grant.approverUserId,
     });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// HITL remediation plane (threat model §EoP "HITL gates on write actions").
+//
+// An agent drafts a remediation *proposal* via the `propose_remediation` tool
+// (see lib/tools.ts), which writes a PENDING `remediation_proposals` row and
+// ledgers `remediation.proposed`. The proposal executes nothing. A human then:
+//
+//   - confirms it (POST .../:id/confirm) — requires session + step-up, the
+//     same auth scope the threat model demands for the proposed write action
+//     ("Confirmation MUST require the same auth scope as the proposed
+//     action"). Ledgered `remediation.confirmed`. Confirmation records the
+//     *authorization* to act; the actual code-touching execution is an
+//     operator/out-of-band step by design (no tool in this system executes
+//     remediations).
+//   - rejects it (POST .../:id/reject) — requires session only (rejecting
+//     reduces exposure). Ledgered `remediation.rejected`.
+//
+// Both transitions are compare-and-swap on `status = 'pending'` so two
+// concurrent decisions cannot double-ledger, mirroring the break-glass
+// approve/revoke routes. Tenant-scoped via `withTenant` (RLS) throughout.
+const RemediationDecisionBody = z.object({
+  note: z.string().min(1).max(2000).optional(),
+});
+
+const REMEDIATION_LIST_STATUSES = ["pending", "confirmed", "rejected"] as const;
+const RemediationListQuery = z.object({
+  status: z.enum(REMEDIATION_LIST_STATUSES).optional(),
+});
+
+function proposalToApi(p: RemediationProposal): unknown {
+  return {
+    id: p.id,
+    tenant_id: p.tenantId,
+    finding_id: p.findingId,
+    action_type: p.actionType,
+    summary: p.summary,
+    rationale: p.rationale,
+    proposed_by_agent: p.proposedByAgent,
+    proposed_by_user_id: p.proposedByUserId,
+    status: p.status,
+    created_at: p.createdAt.toISOString(),
+    decided_by_user_id: p.decidedByUserId,
+    decided_at: p.decidedAt?.toISOString() ?? null,
+    decision_note: p.decisionNote,
+  };
+}
+
+// List remediation proposals for the caller's tenant. Session only — this is
+// the redacted, safe-to-read inventory (the proposal text already passed the
+// tool-arg PHI/canary scan at creation time). Optional `?status` filter.
+router.get(
+  "/admin/remediation/proposals",
+  requireSession,
+  async (req, res): Promise<void> => {
+    const parsed = RemediationListQuery.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.message });
+      return;
+    }
+    const tenantId = req.session!.tenant_id;
+    const rows = await withTenant(tenantId, async (tx) => {
+      const conds = [eq(remediationProposalsTable.tenantId, tenantId)];
+      if (parsed.data.status) {
+        conds.push(eq(remediationProposalsTable.status, parsed.data.status));
+      }
+      return tx
+        .select()
+        .from(remediationProposalsTable)
+        .where(and(...conds))
+        .orderBy(desc(remediationProposalsTable.createdAt))
+        .limit(50);
+    });
+    res.json(rows.map(proposalToApi));
+  },
+);
+
+// Confirm a remediation proposal. Requires session + step-up — confirming a
+// proposal authorizes a (potentially code-touching) write action, so it keeps
+// the same elevated auth scope as the privileged break-glass routes. CAS on
+// `status = 'pending'`. Ledgered `remediation.confirmed`.
+router.post(
+  "/admin/remediation/proposals/:id/confirm",
+  requireSession,
+  requireStepUp,
+  async (req, res): Promise<void> => {
+    const parsed = RemediationDecisionBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.message });
+      return;
+    }
+    const tenantId = req.session!.tenant_id;
+    const userId = req.session!.sub;
+    const proposalId = String(req.params.id);
+
+    // Boundary scan on the (optional) decision note — same rationale as the
+    // break-glass justification/approval-note scan.
+    if (parsed.data.note !== undefined) {
+      const nv = validateLedgerSafeText(parsed.data.note);
+      if (!nv.ok) {
+        await appendLedger({
+          tenantId,
+          actor: { kind: "human", id: userId },
+          eventType: "policy.text_field_rejected",
+          payload: {
+            endpoint: "POST /admin/remediation/proposals/:id/confirm",
+            field: "note",
+            reason: nv.reason,
+            detectors: nv.detectors,
+            proposal_id: proposalId,
+          },
+        });
+        res.status(400).json({
+          error: "note rejected by content policy",
+          reason: nv.reason,
+        });
+        return;
+      }
+    }
+
+    const decidedAt = new Date();
+    const [updated] = await withTenant(tenantId, async (tx) =>
+      tx
+        .update(remediationProposalsTable)
+        .set({
+          status: "confirmed",
+          decidedByUserId: userId,
+          decidedAt,
+          decisionNote: parsed.data.note ?? null,
+          deciderStepUpReason: req.stepUp!.reason,
+        })
+        .where(
+          and(
+            eq(remediationProposalsTable.id, proposalId),
+            eq(remediationProposalsTable.tenantId, tenantId),
+            // CAS — only confirm if still pending.
+            eq(remediationProposalsTable.status, "pending"),
+          ),
+        )
+        .returning(),
+    );
+    if (!updated) {
+      // Either it doesn't exist (in this tenant) or it's already decided.
+      const [existing] = await withTenant(tenantId, async (tx) =>
+        tx
+          .select({ id: remediationProposalsTable.id })
+          .from(remediationProposalsTable)
+          .where(
+            and(
+              eq(remediationProposalsTable.id, proposalId),
+              eq(remediationProposalsTable.tenantId, tenantId),
+            ),
+          )
+          .limit(1),
+      );
+      res
+        .status(existing ? 409 : 404)
+        .json({ error: existing ? "proposal already decided" : "proposal not found" });
+      return;
+    }
+
+    const led = await appendLedger({
+      tenantId,
+      actor: { kind: "human", id: userId },
+      eventType: "remediation.confirmed",
+      subjectType: "finding",
+      subjectId: updated.findingId,
+      payload: {
+        proposal_id: updated.id,
+        finding_id: updated.findingId,
+        action_type: updated.actionType,
+        decided_by_user_id: userId,
+        decider_step_up_reason: req.stepUp!.reason,
+      },
+    });
+    req.log.warn(
+      {
+        proposal_id: updated.id,
+        finding_id: updated.findingId,
+        action_type: updated.actionType,
+        decided_by_user_id: userId,
+        seq: led.seq,
+      },
+      "remediation proposal confirmed (HITL gate)",
+    );
+    res.json(proposalToApi(updated));
+  },
+);
+
+// Reject a remediation proposal. Session only — rejecting a proposal reduces
+// exposure (the proposal stays inert). CAS on `status = 'pending'`. Ledgered
+// `remediation.rejected`.
+router.post(
+  "/admin/remediation/proposals/:id/reject",
+  requireSession,
+  async (req, res): Promise<void> => {
+    const parsed = RemediationDecisionBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.message });
+      return;
+    }
+    const tenantId = req.session!.tenant_id;
+    const userId = req.session!.sub;
+    const proposalId = String(req.params.id);
+
+    if (parsed.data.note !== undefined) {
+      const nv = validateLedgerSafeText(parsed.data.note);
+      if (!nv.ok) {
+        await appendLedger({
+          tenantId,
+          actor: { kind: "human", id: userId },
+          eventType: "policy.text_field_rejected",
+          payload: {
+            endpoint: "POST /admin/remediation/proposals/:id/reject",
+            field: "note",
+            reason: nv.reason,
+            detectors: nv.detectors,
+            proposal_id: proposalId,
+          },
+        });
+        res.status(400).json({
+          error: "note rejected by content policy",
+          reason: nv.reason,
+        });
+        return;
+      }
+    }
+
+    const decidedAt = new Date();
+    const [updated] = await withTenant(tenantId, async (tx) =>
+      tx
+        .update(remediationProposalsTable)
+        .set({
+          status: "rejected",
+          decidedByUserId: userId,
+          decidedAt,
+          decisionNote: parsed.data.note ?? null,
+        })
+        .where(
+          and(
+            eq(remediationProposalsTable.id, proposalId),
+            eq(remediationProposalsTable.tenantId, tenantId),
+            eq(remediationProposalsTable.status, "pending"),
+          ),
+        )
+        .returning(),
+    );
+    if (!updated) {
+      const [existing] = await withTenant(tenantId, async (tx) =>
+        tx
+          .select({ id: remediationProposalsTable.id })
+          .from(remediationProposalsTable)
+          .where(
+            and(
+              eq(remediationProposalsTable.id, proposalId),
+              eq(remediationProposalsTable.tenantId, tenantId),
+            ),
+          )
+          .limit(1),
+      );
+      res
+        .status(existing ? 409 : 404)
+        .json({ error: existing ? "proposal already decided" : "proposal not found" });
+      return;
+    }
+
+    const led = await appendLedger({
+      tenantId,
+      actor: { kind: "human", id: userId },
+      eventType: "remediation.rejected",
+      subjectType: "finding",
+      subjectId: updated.findingId,
+      payload: {
+        proposal_id: updated.id,
+        finding_id: updated.findingId,
+        action_type: updated.actionType,
+        decided_by_user_id: userId,
+      },
+    });
+    req.log.info(
+      {
+        proposal_id: updated.id,
+        finding_id: updated.findingId,
+        decided_by_user_id: userId,
+        seq: led.seq,
+      },
+      "remediation proposal rejected (HITL gate)",
+    );
+    res.json(proposalToApi(updated));
   },
 );
 

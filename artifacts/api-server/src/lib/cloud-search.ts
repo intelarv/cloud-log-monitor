@@ -12,6 +12,7 @@
 // filter; the RLS-checked hydrate in search.ts is the backstop so a missing
 // filter can never leak cross-tenant rows into a prompt.
 
+import { createHash } from "node:crypto";
 import { logger } from "./logger";
 import type { LexicalSearchDoc, LexicalSearchProvider } from "./search-config";
 import type { RetrievalHit } from "./search";
@@ -36,6 +37,13 @@ export interface OpenSearchClient {
     id: string,
     body: Record<string, unknown>,
   ): Promise<void>;
+  /** Bulk-index many docs into ONE index in a single round-trip (`_bulk`).
+   *  Optional: a custom/legacy client may omit it, in which case the provider
+   *  falls back to per-doc `indexDoc`. */
+  bulkIndex?(
+    index: string,
+    docs: ReadonlyArray<{ id: string; body: Record<string, unknown> }>,
+  ): Promise<void>;
   /** Returns the matched document ids in score order (best first). */
   searchIds(index: string, body: Record<string, unknown>): Promise<string[]>;
 }
@@ -45,11 +53,34 @@ export interface OpenSearchProviderOpts {
   readonly indexPrefix?: string;
   readonly username?: string;
   readonly password?: string;
+  /** When true, each tenant's findings live in their OWN index
+   *  (`${indexPrefix}-${safeTenantSegment(tenantId)}`) instead of one shared
+   *  index scoped only by a `tenant_id` term filter. Off by default ⇒
+   *  byte-identical to the pre-isolation single-index behavior. */
+  readonly perTenantIndex?: boolean;
   /** Test injection: bypass the real SDK loader. */
   readonly clientFactory?: () => Promise<OpenSearchClient>;
 }
 
 const DEFAULT_INDEX_PREFIX = "phi-audit-findings";
+
+/** Derive a per-tenant index suffix that is a valid OpenSearch index segment
+ *  AND collision-free across tenants. OpenSearch index names must be lowercase
+ *  and exclude `\\ / * ? " < > | , #` / spaces, so we (1) lowercase + replace
+ *  every unsafe char with `-` for a human-readable, bounded prefix, then (2)
+ *  append a short hash of the RAW tenant id. The hash guarantees two distinct
+ *  tenant ids can never sanitize to the same index — without it, e.g. `a/b` and
+ *  `a-b` would collide and physically co-mingle two tenants' documents, which
+ *  is exactly the cross-tenant leak this isolation is meant to prevent. */
+export function safeTenantSegment(tenantId: string): string {
+  const readable = tenantId
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-")
+    .replace(/^[-_]+/, "")
+    .slice(0, 40);
+  const hash = createHash("sha256").update(tenantId).digest("hex").slice(0, 12);
+  return readable ? `${readable}-${hash}` : hash;
+}
 
 export class OpenSearchLexicalProvider implements LexicalSearchProvider {
   readonly name = "opensearch";
@@ -57,15 +88,22 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
   private clientPromise: Promise<OpenSearchClient> | null = null;
   private readonly ensured = new Set<string>();
   private readonly indexPrefix: string;
+  private readonly perTenantIndex: boolean;
 
   constructor(private readonly opts: OpenSearchProviderOpts) {
     this.indexPrefix = opts.indexPrefix ?? DEFAULT_INDEX_PREFIX;
+    this.perTenantIndex = opts.perTenantIndex ?? false;
   }
 
-  /** Single shared index with a mandatory per-query tenant filter. (A
-   *  per-tenant index could be substituted here without touching callers.) */
-  private indexName(): string {
-    return this.indexPrefix;
+  /** The index a given tenant's documents live in. By default this is a single
+   *  shared index scoped only by the mandatory per-query `tenant_id` filter.
+   *  When `perTenantIndex` is on, each tenant gets a physically separate index
+   *  so a search-layer bug can never even address another tenant's documents —
+   *  the term filter remains as defense-in-depth on top. */
+  private indexName(tenantId: string): string {
+    return this.perTenantIndex
+      ? `${this.indexPrefix}-${safeTenantSegment(tenantId)}`
+      : this.indexPrefix;
   }
 
   private async getClient(): Promise<OpenSearchClient> {
@@ -135,6 +173,31 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
           ): Promise<void> {
             await native.index({ index, id, body, refresh: false });
           },
+          async bulkIndex(
+            index: string,
+            docs: ReadonlyArray<{ id: string; body: Record<string, unknown> }>,
+          ): Promise<void> {
+            if (docs.length === 0) return;
+            // `_bulk` takes an action/source NDJSON pair per doc.
+            const operations = docs.flatMap((d) => [
+              { index: { _index: index, _id: d.id } },
+              d.body,
+            ]);
+            const resp = await native.bulk({ body: operations, refresh: false });
+            const payload = resp?.body ?? resp;
+            if (payload?.errors) {
+              const firstErr = (payload.items as ReadonlyArray<
+                Record<string, { error?: { reason?: string } }>
+              >)
+                .map((it) => Object.values(it)[0]?.error?.reason)
+                .find((r): r is string => Boolean(r));
+              throw new Error(
+                `OpenSearch _bulk reported item errors${
+                  firstErr ? `: ${firstErr}` : ""
+                }`,
+              );
+            }
+          },
           async searchIds(
             index: string,
             body: Record<string, unknown>,
@@ -166,7 +229,7 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
   ): Promise<RetrievalHit[]> {
     if (!query.trim()) return [];
     const client = await this.getClient();
-    const index = this.indexName();
+    const index = this.indexName(tenantId);
     await this.ensureIndexOnce(client, index);
     const ids = await client.searchIds(index, {
       size: limit,
@@ -196,9 +259,36 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
     return ids.map((id, i) => ({ finding_id: id, rank: i + 1 }));
   }
 
+  async indexFindingBulk(docs: ReadonlyArray<LexicalSearchDoc>): Promise<void> {
+    if (docs.length === 0) return;
+    const client = await this.getClient();
+    // Caller contract: all docs share a tenant, so they all route to one index.
+    const index = this.indexName(docs[0]!.tenantId);
+    await this.ensureIndexOnce(client, index);
+    const payloads = docs.map((doc) => ({
+      id: doc.findingId,
+      body: {
+        tenant_id: doc.tenantId,
+        classification: doc.classification,
+        subclass: doc.subclass,
+        severity: doc.severity,
+        source: doc.source,
+        snippet: doc.snippet,
+      } as Record<string, unknown>,
+    }));
+    if (client.bulkIndex) {
+      await client.bulkIndex(index, payloads);
+      return;
+    }
+    // Fallback for a client without _bulk support: per-doc index.
+    for (const p of payloads) {
+      await client.indexDoc(index, p.id, p.body);
+    }
+  }
+
   async indexFinding(doc: LexicalSearchDoc): Promise<void> {
     const client = await this.getClient();
-    const index = this.indexName();
+    const index = this.indexName(doc.tenantId);
     await this.ensureIndexOnce(client, index);
     await client.indexDoc(index, doc.findingId, {
       tenant_id: doc.tenantId,
@@ -235,10 +325,20 @@ export function createOpenSearchProvider(
         "basic auth is disabled (both are required). Connecting unauthenticated.",
     );
   }
+  const perTenantIndex = isTruthyEnv(env["OPENSEARCH_PER_TENANT_INDEX"]);
   return new OpenSearchLexicalProvider({
     endpoint,
     indexPrefix,
+    perTenantIndex,
     ...(username ? { username } : {}),
     ...(password ? { password } : {}),
   });
+}
+
+/** A small, permissive truthy-env reader (`1`/`true`/`yes`/`on`,
+ *  case-insensitive). Unset / blank / anything else ⇒ false, so the per-tenant
+ *  index switch stays off by default and dev/eval are byte-identical. */
+function isTruthyEnv(raw: string | undefined): boolean {
+  const v = raw?.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }

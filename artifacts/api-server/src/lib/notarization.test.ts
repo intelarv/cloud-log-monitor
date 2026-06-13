@@ -24,6 +24,7 @@ const {
   computeSignature,
   constantTimeEq,
   resetRetiredKeysCache,
+  isUnnotarizedHash,
   ACTIVE_KEY_ID,
   MAX_MISMATCHES_IN_PAYLOAD,
 } = __test__;
@@ -75,6 +76,20 @@ describe("notarization signature primitive", () => {
     expect(constantTimeEq(valid, "a".repeat(63))).toBe(false);
     expect(constantTimeEq(valid, "")).toBe(false);
     expect(constantTimeEq(valid, valid)).toBe(true);
+  });
+
+  it("isUnnotarizedHash distinguishes the all-zero placeholder from a real head hash", () => {
+    // The all-zero (or empty) head hash marks a checkpoint that was never
+    // externally notarized — a placeholder/forged row, NOT a tamper. A real
+    // SHA-256 head hash (any non-zero hex) must NOT be treated as unnotarized,
+    // so genuine live≠notarized tampers still take the critical mismatch path.
+    expect(isUnnotarizedHash("0".repeat(64))).toBe(true);
+    expect(isUnnotarizedHash("")).toBe(true);
+    expect(isUnnotarizedHash("0")).toBe(true);
+    expect(isUnnotarizedHash("f".repeat(64))).toBe(false);
+    expect(isUnnotarizedHash("a".repeat(64))).toBe(false);
+    // A single non-zero nibble anywhere is enough to count as "notarized".
+    expect(isUnnotarizedHash("0".repeat(63) + "1")).toBe(false);
   });
 
   it("retired key id resolves via NOTARIZATION_RETIRED_KEYS — rotation safety", () => {
@@ -188,13 +203,12 @@ describe("notarization — DB integration", () => {
     }
   });
 
-  it("verifyCheckpoints detects a tampered checkpoint row", async () => {
-    // Insert a fresh checkpoint to tamper.
+  it("ledger_checkpoints refuses direct UPDATE (ENABLE ALWAYS append-only guarantee)", async () => {
     await appendLedger({
       tenantId: null,
       actor: { kind: "system", id: "integration_test" },
       eventType: "system.integration_test_marker",
-      payload: { marker: "notarization-tamper-target" },
+      payload: { marker: "notarization-update-refusal-target" },
     });
     const created = await createCheckpoint();
     expect(created.kind).toBe("created");
@@ -215,70 +229,108 @@ describe("notarization — DB integration", () => {
       sql`SELECT head_hash FROM ledger_checkpoints WHERE id = ${id}`,
     );
     expect(afterRes.rows[0]!.head_hash).toBe(created.checkpoint.headHash);
+  });
 
-    // Since we cannot mutate an existing row, simulate the production
-    // attack ("attacker rewrote a ledger row that an old checkpoint
-    // pinned") by manually inserting a checkpoint whose head_hash does
-    // NOT match the live ledger row at that seq. INSERTs are allowed;
-    // the mismatch is what verifyCheckpoints exists to catch.
-    const wrongHash = "0".repeat(64);
-    const notarizedAt = new Date();
-    const forgedSig = computeSignature({
-      seq: created.checkpoint.seq,
-      headHash: wrongHash,
-      notarizedAtIso: notarizedAt.toISOString(),
-      signingKeyId: ACTIVE_KEY_ID,
-    });
-    // Use a fresh seq slot (one past current head) so the unique index on
-    // seq doesn't conflict with the legitimate checkpoint we just created.
-    // We append another ledger row first to advance head.
+  it("classifies an all-zero checkpoint as never-notarized, NOT a tamper mismatch", async () => {
+    // Simulate the placeholder/forged-row condition (the historical dev-DB
+    // pollution): a checkpoint whose head_hash is the all-zero sentinel and
+    // does NOT match the live ledger row at that seq. Pre-fix this surfaced as
+    // a critical `checkpoint_mismatch` every verifier cycle; post-fix it must
+    // be classified as "not yet notarized" so `ok` stays true and the tamper
+    // ERROR is not raised. INSERTs are allowed (append-only blocks UPDATE/DELETE
+    // only); the all-zero row persists harmlessly because it is now quiet.
     await appendLedger({
       tenantId: null,
       actor: { kind: "system", id: "integration_test" },
       eventType: "system.integration_test_marker",
-      payload: { marker: "advance-head-for-forgery-slot" },
+      payload: { marker: "advance-head-for-unnotarized-slot" },
     });
-    const headRes = await db.execute<{ seq: number; hash: string }>(
-      sql`SELECT seq, hash FROM ledger_entries ORDER BY seq DESC LIMIT 1`,
+    const headRes = await db.execute<{ seq: number }>(
+      sql`SELECT seq FROM ledger_entries ORDER BY seq DESC LIMIT 1`,
     );
     const liveHeadSeq = Number(headRes.rows[0]!.seq);
-
-    // Insert the forged checkpoint claiming the live head's seq but with
-    // wrong head_hash. Signature is internally consistent (we computed
-    // it ourselves) so the failure mode under test is the *cross-check
-    // against the live ledger row*, not signature validation.
-    const sigForLiveSeq = computeSignature({
+    const zeroHash = "0".repeat(64);
+    const notarizedAt = new Date();
+    const sigForZero = computeSignature({
       seq: liveHeadSeq,
-      headHash: wrongHash,
+      headHash: zeroHash,
       notarizedAtIso: notarizedAt.toISOString(),
       signingKeyId: ACTIVE_KEY_ID,
     });
     await db.execute(
       sql`INSERT INTO ledger_checkpoints (seq, head_hash, notarized_at, signature, signing_key_id)
-          VALUES (${liveHeadSeq}, ${wrongHash}, ${notarizedAt}, ${sigForLiveSeq}, ${ACTIVE_KEY_ID})
+          VALUES (${liveHeadSeq}, ${zeroHash}, ${notarizedAt}, ${sigForZero}, ${ACTIVE_KEY_ID})
           ON CONFLICT (seq) DO NOTHING`,
     );
 
-    const verify = await verifyCheckpoints();
-    // Could be ok if the ON CONFLICT skipped (a legitimate checkpoint at
-    // this seq already existed). Either way the inserted-or-skipped row
-    // is the assertion target.
-    if (verify.ok) {
-      // ON CONFLICT skipped — re-run with a guaranteed-unused seq slot.
-      // verifyCheckpoints only looks at seqs that exist in checkpoints
-      // AND in ledger_entries, so we need a seq that's in BOTH. Skip this
-      // assertion path; the unused-key path is covered by the unit test.
-      return;
+    // Scope to JUST our inserted seq so the assertion is robust to other rows.
+    const verify = await verifyCheckpoints(liveHeadSeq - 1);
+    // The all-zero row is "not yet notarized", never a mismatch.
+    expect(verify.unnotarized_count).toBeGreaterThanOrEqual(1);
+    expect(verify.first_unnotarized[0]).toMatch(/not yet notarized/);
+    expect(
+      verify.first_mismatches.every((m) => !/notarized 0{64}/.test(m)),
+      `all-zero rows must NOT appear as mismatches: ${verify.first_mismatches.join("; ")}`,
+    ).toBe(true);
+    // No genuine mismatch in this scope ⇒ ok stays true (spam-fix invariant).
+    expect(verify.mismatch_count).toBe(0);
+    expect(verify.ok).toBe(true);
+  });
+
+  it("still flags a genuine (non-zero) head-hash mismatch as a critical tamper (rolled back so dev stays clean)", async () => {
+    // Genuine tamper = a checkpoint pinning a REAL (non-zero) head hash that
+    // disagrees with the live ledger row. This MUST still be a critical
+    // mismatch. We run it inside a transaction and roll back so we don't leave
+    // a persistent forged-mismatch row that would re-introduce perpetual
+    // checkpoint_mismatch ERRORs in the shared dev DB.
+    await appendLedger({
+      tenantId: null,
+      actor: { kind: "system", id: "integration_test" },
+      eventType: "system.integration_test_marker",
+      payload: { marker: "advance-head-for-genuine-tamper-slot" },
+    });
+    const wrongHash = "f".repeat(64);
+    const notarizedAt = new Date();
+    const ROLLBACK = "rollback-genuine-tamper-sentinel";
+    let asserted = false;
+    try {
+      await db.transaction(async (tx) => {
+        const head = await tx.execute<{ seq: number; hash: string }>(
+          sql`SELECT seq, hash FROM ledger_entries ORDER BY seq DESC LIMIT 1`,
+        );
+        const liveSeq = Number(head.rows[0]!.seq);
+        // The live row's real hash must differ from our forged non-zero hash.
+        expect(head.rows[0]!.hash).not.toBe(wrongHash);
+        const sig = computeSignature({
+          seq: liveSeq,
+          headHash: wrongHash,
+          notarizedAtIso: notarizedAt.toISOString(),
+          signingKeyId: ACTIVE_KEY_ID,
+        });
+        await tx.execute(
+          sql`INSERT INTO ledger_checkpoints (seq, head_hash, notarized_at, signature, signing_key_id)
+              VALUES (${liveSeq}, ${wrongHash}, ${notarizedAt}, ${sig}, ${ACTIVE_KEY_ID})
+              ON CONFLICT (seq) DO NOTHING`,
+        );
+        const verify = await verifyCheckpoints(liveSeq - 1, tx);
+        expect(verify.ok).toBe(false);
+        expect(verify.mismatch_count).toBeGreaterThanOrEqual(1);
+        expect(
+          verify.first_mismatches.some((m) => /!= notarized f{64}/.test(m)),
+          `expected a non-zero tamper mismatch: ${verify.first_mismatches.join("; ")}`,
+        ).toBe(true);
+        expect(verify.first_mismatches.length).toBeLessThanOrEqual(
+          MAX_MISMATCHES_IN_PAYLOAD,
+        );
+        // A genuine tamper is NOT counted as unnotarized.
+        expect(verify.unnotarized_count).toBe(0);
+        asserted = true;
+        // Force rollback: the forged row never commits.
+        throw new Error(ROLLBACK);
+      });
+    } catch (err) {
+      if ((err as Error).message !== ROLLBACK) throw err;
     }
-    expect(verify.mismatch_count).toBeGreaterThanOrEqual(1);
-    expect(verify.first_mismatches[0]).toMatch(
-      /live hash .* != notarized 0{64}/,
-    );
-    expect(verify.first_mismatches.length).toBeLessThanOrEqual(
-      MAX_MISMATCHES_IN_PAYLOAD,
-    );
-    // Avoid forgedSig "unused" warning — it's documentary for the parallel
-    // path (forgery at a seq slot that doesn't yet exist in ledger).
-    void forgedSig;
+    expect(asserted).toBe(true);
   });
 });

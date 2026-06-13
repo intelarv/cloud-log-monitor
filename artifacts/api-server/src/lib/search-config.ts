@@ -76,6 +76,12 @@ export interface LexicalSearchProvider {
     limit: number,
   ): Promise<RetrievalHit[]>;
   indexFinding(doc: LexicalSearchDoc): Promise<void>;
+  /** Mirror a batch of redacted docs in one round-trip. Optional: providers
+   *  that don't maintain an external index (Postgres) omit it; callers that
+   *  want batching fall back to per-doc `indexFinding` when it's absent. All
+   *  docs in a single call MUST belong to the same tenant (the reconcile loop
+   *  batches inside a per-tenant `withTenant` scope). */
+  indexFindingBulk?(docs: ReadonlyArray<LexicalSearchDoc>): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

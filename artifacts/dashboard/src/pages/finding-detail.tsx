@@ -4,29 +4,51 @@ import {
   useGetFinding,
   useGetFindingRaw,
   useGetFindingHistory,
+  useGetFindingReviewHistory,
   getGetFindingQueryKey,
   getGetFindingHistoryQueryKey,
+  getGetFindingReviewHistoryQueryKey,
 } from "@workspace/api-client-react";
+import type { ReviewAttempt } from "@workspace/api-client-react";
 import { useParams, Link } from "wouter";
 import { SeverityBadge, StatusBadge } from "../components/severity-badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle } from "lucide-react";
+import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, RefreshCw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle } from "lucide-react";
 import { safeTimestamp } from "../lib/format";
 import BreakGlassModal from "../components/break-glass-modal";
 import ResolveFindingModal from "../components/resolve-finding-modal";
 import ReopenFindingModal from "../components/reopen-finding-modal";
+import ReReviewFindingModal from "../components/re-review-finding-modal";
 import { ApiError } from "@workspace/api-client-react";
+
+// While an agent review is queued or running, poll the finding + review-history
+// queries so the Triage/Verifier verdicts land on their own once the supervisor
+// finishes the re-run. Polling stops the moment the status reaches a terminal
+// state (completed/failed/skipped) to avoid wasted requests.
+const REVIEW_POLL_INTERVAL_MS = 3000;
+
+function isReviewActive(status: string | null | undefined): boolean {
+  return status === "pending" || status === "in_progress";
+}
 
 export default function FindingDetail() {
   const { id } = useParams<{ id: string }>();
-  const { data: finding, isLoading } = useGetFinding(id!, { query: { enabled: !!id, queryKey: getGetFindingQueryKey(id!) } });
+  const { data: finding, isLoading } = useGetFinding(id!, {
+    query: {
+      enabled: !!id,
+      queryKey: getGetFindingQueryKey(id!),
+      refetchInterval: (query) =>
+        isReviewActive(query.state.data?.agent_review_status) ? REVIEW_POLL_INTERVAL_MS : false,
+    },
+  });
 
   const [showBreakGlass, setShowBreakGlass] = React.useState(false);
   const [showResolve, setShowResolve] = React.useState(false);
   const [showReopen, setShowReopen] = React.useState(false);
+  const [showReReview, setShowReReview] = React.useState(false);
   const [rawEvidence, setRawEvidence] = React.useState<any>(null);
   const [rawError, setRawError] = React.useState<ApiError | null>(null);
   const [isPendingApproval, setIsPendingApproval] = React.useState(false);
@@ -100,6 +122,9 @@ export default function FindingDetail() {
           </div>
           
           <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={() => setShowReReview(true)}>
+              <RefreshCw className="h-4 w-4 mr-2" /> Re-review
+            </Button>
             {finding.status === "open" ? (
               <Button variant="outline" onClick={() => setShowResolve(true)}>
                 <CheckCheck className="h-4 w-4 mr-2" /> Close Out
@@ -232,6 +257,8 @@ export default function FindingDetail() {
             
             <AgentReviewCard finding={finding} />
 
+            <ReviewHistoryCard findingId={finding.id} reviewStatus={finding.agent_review_status} />
+
             <Card>
               <CardHeader>
                 <CardTitle>Agent Triage</CardTitle>
@@ -272,6 +299,14 @@ export default function FindingDetail() {
         <ReopenFindingModal
           open={showReopen}
           onOpenChange={setShowReopen}
+          findingId={finding.id}
+        />
+      )}
+
+      {finding && (
+        <ReReviewFindingModal
+          open={showReReview}
+          onOpenChange={setShowReReview}
           findingId={finding.id}
         />
       )}
@@ -427,6 +462,8 @@ export function eventMeta(eventType: string): {
       return { label: "Closed out", icon: <CheckCheck className="h-4 w-4" />, tone: "text-emerald-600 bg-emerald-500/10 border-emerald-500/20" };
     case "finding.reopened":
       return { label: "Reopened", icon: <RotateCcw className="h-4 w-4" />, tone: "text-blue-600 bg-blue-500/10 border-blue-500/20" };
+    case "agent.re_review_requested":
+      return { label: "Re-review requested", icon: <RefreshCw className="h-4 w-4" />, tone: "text-violet-600 bg-violet-500/10 border-violet-500/20" };
     case "break_glass.granted":
       return { label: "Break-glass granted", icon: <KeyRound className="h-4 w-4" />, tone: "text-orange-600 bg-orange-500/10 border-orange-500/20" };
     case "break_glass.approved":
@@ -519,6 +556,151 @@ export function FindingHistoryCard({ findingId }: { findingId: string }) {
                   {note && (
                     <p className="mt-1.5 text-xs text-foreground bg-muted/50 border rounded-md px-2.5 py-1.5 whitespace-pre-wrap">
                       {note}
+                    </p>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent review re-run history. Each agent review (the initial post-ingest run
+// plus every fix-and-replay) is grouped into a numbered attempt carrying its
+// triage + verifier verdicts, reconstructed server-side from the tamper-evident
+// ledger. Lets an analyst see at a glance how many times a finding was reviewed
+// and why a verdict changed between re-runs. Rationale shown here was PHI-scanned
+// before it landed in the immutable ledger, so it carries no raw PHI.
+// ---------------------------------------------------------------------------
+
+function outcomeBadge(outcome: ReviewAttempt["outcome"]) {
+  switch (outcome) {
+    case "completed":
+      return <Badge className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20"><CheckCircle2 className="h-3 w-3 mr-1" /> Completed</Badge>;
+    case "skipped":
+      return <Badge variant="outline"><HelpCircle className="h-3 w-3 mr-1" /> Skipped (budget)</Badge>;
+    case "failed":
+      return <Badge variant="destructive"><XCircle className="h-3 w-3 mr-1" /> Failed</Badge>;
+    default:
+      return <Badge variant="secondary"><Clock className="h-3 w-3 mr-1" /> Incomplete</Badge>;
+  }
+}
+
+export function ReviewHistoryCard({ findingId, reviewStatus }: { findingId: string; reviewStatus?: string | null }) {
+  const { data, isLoading } = useGetFindingReviewHistory(findingId, {
+    query: {
+      queryKey: getGetFindingReviewHistoryQueryKey(findingId),
+      refetchInterval: isReviewActive(reviewStatus) ? REVIEW_POLL_INTERVAL_MS : false,
+    },
+  });
+  const attempts = data?.attempts ?? [];
+  const total = data?.current_attempt ?? 0;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><RefreshCw className="h-4 w-4" /> Review History</CardTitle>
+        <CardDescription>
+          {isLoading
+            ? "Loading agent review attempts…"
+            : total === 0
+              ? "No agent reviews have run for this finding yet."
+              : `Reviewed ${total} ${total === 1 ? "time" : "times"} — most recent first.`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <div className="space-y-3">
+            {Array.from({ length: 2 }).map((_, i) => (
+              <Skeleton key={i} className="h-16 w-full" />
+            ))}
+          </div>
+        ) : attempts.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No recorded review attempts yet.</p>
+        ) : (
+          <ol className="space-y-4">
+            {attempts.map((a, i) => {
+              const triage = a.triage_verdict as null | {
+                recommended_severity: string;
+                recommended_action: string;
+                rationale: string;
+                confidence: number;
+                prompt_injection_suspected: boolean;
+              };
+              const verifier = a.verifier_verdict as null | {
+                verdict: string;
+                rationale: string;
+                confidence: number;
+                prompt_injection_suspected: boolean;
+                agrees_with_triage: boolean;
+              };
+              const isLatest = i === 0;
+              const ts = a.verifier_at ?? a.triage_at ?? null;
+              return (
+                <li
+                  key={a.attempt}
+                  className={`rounded-md border p-3 ${isLatest ? "border-primary/30 bg-primary/5" : "border-border"}`}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold">Attempt #{a.attempt}</span>
+                    {isLatest && (
+                      <Badge variant="secondary" className="text-[10px]">latest</Badge>
+                    )}
+                    {outcomeBadge(a.outcome)}
+                    {a.last_event_seq != null && (
+                      <Link
+                        href={`/ledger?seq=${a.last_event_seq}`}
+                        className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                        title="View this attempt's record in the Audit Ledger"
+                      >
+                        <span className="font-mono">#{a.last_event_seq}</span>
+                        <ExternalLink className="h-3 w-3" />
+                      </Link>
+                    )}
+                  </div>
+                  {ts && (
+                    <div className="text-xs text-muted-foreground mt-0.5">{safeTimestamp(ts)}</div>
+                  )}
+
+                  {triage && (
+                    <div className="mt-2 space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs uppercase tracking-wide text-muted-foreground">Triage</span>
+                        <Badge variant="outline" className="font-mono text-xs">{triage.recommended_severity}</Badge>
+                        <Badge variant="secondary" className="font-mono text-xs">{triage.recommended_action}</Badge>
+                        <span className="text-xs text-muted-foreground ml-auto">conf {triage.confidence.toFixed(2)}</span>
+                      </div>
+                      <p className="text-xs text-muted-foreground leading-relaxed">{triage.rationale}</p>
+                      {triage.prompt_injection_suspected && (
+                        <Badge variant="destructive" className="text-xs"><ShieldAlert className="h-3 w-3 mr-1" /> Prompt injection suspected</Badge>
+                      )}
+                    </div>
+                  )}
+
+                  {verifier && (
+                    <div className="mt-2 space-y-1 pt-2 border-t">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs uppercase tracking-wide text-muted-foreground">Verifier</span>
+                        <Badge variant="outline" className="font-mono text-xs">{verifier.verdict}</Badge>
+                        <Badge variant={verifier.agrees_with_triage ? "secondary" : "destructive"} className="text-xs">
+                          {verifier.agrees_with_triage ? "agrees" : "disagrees"}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground ml-auto">conf {verifier.confidence.toFixed(2)}</span>
+                      </div>
+                      <p className="text-xs text-muted-foreground leading-relaxed">{verifier.rationale}</p>
+                      {verifier.prompt_injection_suspected && (
+                        <Badge variant="destructive" className="text-xs"><ShieldAlert className="h-3 w-3 mr-1" /> Prompt injection suspected</Badge>
+                      )}
+                    </div>
+                  )}
+
+                  {a.note && (
+                    <p className="mt-2 text-xs text-foreground bg-muted/50 border rounded-md px-2.5 py-1.5 whitespace-pre-wrap">
+                      {a.note}
                     </p>
                   )}
                 </li>

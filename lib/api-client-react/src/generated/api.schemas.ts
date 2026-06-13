@@ -159,6 +159,33 @@ export interface Finding {
   last_agent_review_at?: null | string;
 }
 
+export type ReviewAttemptOutcome = typeof ReviewAttemptOutcome[keyof typeof ReviewAttemptOutcome];
+
+
+export const ReviewAttemptOutcome = {
+  completed: 'completed',
+  skipped: 'skipped',
+  failed: 'failed',
+  incomplete: 'incomplete',
+} as const;
+
+export interface ReviewAttempt {
+  attempt: number;
+  outcome: ReviewAttemptOutcome;
+  triage_verdict?: null | TriageVerdict;
+  triage_at?: null | string;
+  verifier_verdict?: null | VerifierVerdict;
+  verifier_at?: null | string;
+  /** @nullable */
+  note?: string | null;
+  last_event_seq?: number;
+}
+
+export interface ReviewHistory {
+  current_attempt: number;
+  attempts: ReviewAttempt[];
+}
+
 export interface ChatSession {
   id: string;
   tenant_id: string;
@@ -260,6 +287,24 @@ export interface LedgerCheckpointsVerifyResult {
 export interface LedgerCheckpointsPage {
   checkpoints: LedgerCheckpoint[];
   verify?: LedgerCheckpointsVerifyResult | null;
+}
+
+export type MaintenanceMetricsMemory = {
+  runs: number;
+  embeddings_evicted: number;
+  failures: number;
+  last_run_at: string | null;
+};
+
+export type MaintenanceMetricsTiering = {
+  findings_tiered: number;
+  failures: number;
+  last_run_at: string | null;
+};
+
+export interface MaintenanceMetrics {
+  memory: MaintenanceMetricsMemory;
+  tiering: MaintenanceMetricsTiering;
 }
 
 export interface StepUpInput {
@@ -398,6 +443,31 @@ export interface ReopenFindingResult {
   finding_id: string;
   status: ReopenFindingResultStatus;
   transitioned: boolean;
+}
+
+export interface ReReviewFindingInput {
+  /**
+     * Optional free-text reason ("why") for the operator-initiated replay.
+  Scanned by the same content policy as resolve/reopen reasons before
+  it lands in the immutable audit ledger.
+
+     * @minLength 1
+     * @maxLength 2000
+     */
+  reason?: string;
+}
+
+export type ReReviewFindingResultAgentReviewStatus = typeof ReReviewFindingResultAgentReviewStatus[keyof typeof ReReviewFindingResultAgentReviewStatus];
+
+
+export const ReReviewFindingResultAgentReviewStatus = {
+  pending: 'pending',
+} as const;
+
+export interface ReReviewFindingResult {
+  finding_id: string;
+  agent_review_status: ReReviewFindingResultAgentReviewStatus;
+  enqueued: boolean;
 }
 
 export interface IngestReplayResult {

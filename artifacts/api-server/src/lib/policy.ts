@@ -24,17 +24,35 @@ export type AgentName =
   | "notifier"
   | "remediation";
 
-export type ToolName = "get_finding" | "search_findings";
+export type ToolName =
+  | "get_finding"
+  | "search_findings"
+  | "structured_query"
+  | "propose_remediation";
 
 const ALLOW_LIST: Record<AgentName, ReadonlySet<ToolName>> = {
-  // Chat agent: read-only retrieval. `search_findings` (M1) lets the agent
-  // pull additional candidates by query when the pre-loaded context doesn't
-  // cover what the user asked about; `get_finding` reads one row by id.
-  chat: new Set<ToolName>(["get_finding", "search_findings"]),
+  // Chat agent: read-only retrieval + the *propose-only* HITL tool.
+  //   - `get_finding` / `search_findings` / `structured_query` are all reads
+  //     over the redacted projection.
+  //   - `propose_remediation` writes a PENDING proposal row that does nothing
+  //     until a human confirms it. It is NOT a write/execute tool — it cannot
+  //     open a PR, redact at source, or send a notification, so allowing the
+  //     chat agent to call it does not violate the threat-model rule "Chat
+  //     cannot call open_pr". The execution gate is the human confirm endpoint
+  //     (step-up + ledgered), exactly as §EoP "HITL gates on write actions"
+  //     requires (proposals, not executions).
+  chat: new Set<ToolName>([
+    "get_finding",
+    "search_findings",
+    "structured_query",
+    "propose_remediation",
+  ]),
   triage: new Set<ToolName>([]),
   verifier: new Set<ToolName>([]),
   notifier: new Set<ToolName>([]),
-  remediation: new Set<ToolName>([]),
+  // A future Remediation agent (ARCH §17.6) drafts proposals too; same
+  // propose-only posture. No executing tool is granted to any agent.
+  remediation: new Set<ToolName>(["propose_remediation"]),
 };
 
 export function isToolAllowed(agent: AgentName, tool: ToolName): boolean {
@@ -142,10 +160,10 @@ export function validateToolArgs(
   // requires that raw arg values never enter the ledger. The `kind` enum is
   // the categorical signal a verifier acts on; the offending value is already
   // captured (and gated) inside the incident-finding fingerprint, not here.
-  if (
-    tool === "get_finding" &&
-    typeof (args as { finding_id?: unknown })?.finding_id === "string"
-  ) {
+  // Applies to ANY tool that accepts a `finding_id` string arg (get_finding,
+  // propose_remediation, and any future id-taking tool) — the whitelist is a
+  // property of the identifier, not of one specific tool.
+  if (typeof (args as { finding_id?: unknown })?.finding_id === "string") {
     const id = (args as { finding_id: string }).finding_id;
     if (!FINDING_ID_RE.test(id)) {
       violations.push({

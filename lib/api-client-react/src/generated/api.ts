@@ -43,10 +43,14 @@ import type {
   ListLedgerCheckpointsParams,
   ListLedgerParams,
   LoginInput,
+  MaintenanceMetrics,
+  ReReviewFindingInput,
+  ReReviewFindingResult,
   ReopenFindingInput,
   ReopenFindingResult,
   ResolveFindingInput,
   ResolveFindingResult,
+  ReviewHistory,
   Session,
   StepUpInput,
   StepUpResult,
@@ -612,6 +616,93 @@ export function useGetFindingHistory<TData = Awaited<ReturnType<typeof getFindin
 
 
 
+export const getGetFindingReviewHistoryUrl = (id: string,) => {
+
+
+
+
+  return `/api/findings/${id}/review-history`
+}
+
+/**
+ * @summary Agent review re-run history for a single finding, reconstructed from the
+tamper-evident ledger. Each agent review (initial + every fix-and-replay)
+is grouped into a numbered attempt carrying its triage and verifier
+verdicts so an analyst can see why a verdict changed across re-runs.
+Tenant-scoped; redacted rationale only (PHI was scanned out at write time).
+
+ */
+export const getFindingReviewHistory = async (id: string, options?: RequestInit): Promise<ReviewHistory> => {
+
+  return customFetch<ReviewHistory>(getGetFindingReviewHistoryUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetFindingReviewHistoryQueryKey = (id: string,) => {
+    return [
+    `/api/findings/${id}/review-history`
+    ] as const;
+    }
+
+
+export const getGetFindingReviewHistoryQueryOptions = <TData = Awaited<ReturnType<typeof getFindingReviewHistory>>, TError = ErrorType<ErrorResponse>>(id: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getFindingReviewHistory>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetFindingReviewHistoryQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getFindingReviewHistory>>> = ({ signal }) => getFindingReviewHistory(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: !!(id), ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getFindingReviewHistory>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetFindingReviewHistoryQueryResult = NonNullable<Awaited<ReturnType<typeof getFindingReviewHistory>>>
+export type GetFindingReviewHistoryQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Agent review re-run history for a single finding, reconstructed from the
+tamper-evident ledger. Each agent review (initial + every fix-and-replay)
+is grouped into a numbered attempt carrying its triage and verifier
+verdicts so an analyst can see why a verdict changed across re-runs.
+Tenant-scoped; redacted rationale only (PHI was scanned out at write time).
+
+ */
+
+export function useGetFindingReviewHistory<TData = Awaited<ReturnType<typeof getFindingReviewHistory>>, TError = ErrorType<ErrorResponse>>(
+ id: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getFindingReviewHistory>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetFindingReviewHistoryQueryOptions(id,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
 export const getListChatSessionsUrl = () => {
 
 
@@ -1156,6 +1247,91 @@ export function useListLedgerCheckpoints<TData = Awaited<ReturnType<typeof listL
  ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
 
   const queryOptions = getListLedgerCheckpointsQueryOptions(params,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getGetMaintenanceMetricsUrl = () => {
+
+
+
+
+  return `/api/admin/metrics/maintenance`
+}
+
+/**
+ * @summary Aggregate counts for the two opt-in cache-pruning maintenance jobs
+(M10.4 raw-evidence tiering, M10.5 memory eviction) from the audit
+ledger, scoped to the caller's tenant. Counts only — no PHI, no finding
+ids, no object URIs.
+
+ */
+export const getMaintenanceMetrics = async ( options?: RequestInit): Promise<MaintenanceMetrics> => {
+
+  return customFetch<MaintenanceMetrics>(getGetMaintenanceMetricsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetMaintenanceMetricsQueryKey = () => {
+    return [
+    `/api/admin/metrics/maintenance`
+    ] as const;
+    }
+
+
+export const getGetMaintenanceMetricsQueryOptions = <TData = Awaited<ReturnType<typeof getMaintenanceMetrics>>, TError = ErrorType<unknown>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getMaintenanceMetrics>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetMaintenanceMetricsQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getMaintenanceMetrics>>> = ({ signal }) => getMaintenanceMetrics({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getMaintenanceMetrics>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetMaintenanceMetricsQueryResult = NonNullable<Awaited<ReturnType<typeof getMaintenanceMetrics>>>
+export type GetMaintenanceMetricsQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary Aggregate counts for the two opt-in cache-pruning maintenance jobs
+(M10.4 raw-evidence tiering, M10.5 memory eviction) from the audit
+ledger, scoped to the caller's tenant. Counts only — no PHI, no finding
+ids, no object URIs.
+
+ */
+
+export function useGetMaintenanceMetrics<TData = Awaited<ReturnType<typeof getMaintenanceMetrics>>, TError = ErrorType<unknown>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getMaintenanceMetrics>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetMaintenanceMetricsQueryOptions(options)
 
   const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
 
@@ -1877,6 +2053,94 @@ export const useReopenFinding = <TError = ErrorType<ErrorResponse>,
         TContext
       > => {
       return useMutation(getReopenFindingMutationOptions(options));
+    }
+
+export const getReReviewFindingUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/findings/${id}/re-review`
+}
+
+/**
+ * @summary Operator-initiated re-review (replay) of a finding's Triage -> Verifier
+LLM analysis. Resets the finding's agent review status back to "pending"
+and re-enqueues the review; the supervisor's compare-and-swap bumps the
+review attempt so the agents re-run from scratch (fresh per-attempt
+idempotency keys) rather than recovering the prior verdict. Refuses with
+409 when a review is already in progress so a replay cannot clobber a
+run mid-flight. Accepts an optional free-text reason (scanned by the
+content policy) recorded in the audit ledger. Requires session only.
+
+ */
+export const reReviewFinding = async (id: string,
+    reReviewFindingInput?: ReReviewFindingInput, options?: RequestInit): Promise<ReReviewFindingResult> => {
+
+  return customFetch<ReReviewFindingResult>(getReReviewFindingUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      reReviewFindingInput,)
+  }
+);}
+
+
+
+
+export const getReReviewFindingMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof reReviewFinding>>, TError,{id: string;data?: BodyType<ReReviewFindingInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof reReviewFinding>>, TError,{id: string;data?: BodyType<ReReviewFindingInput>}, TContext> => {
+
+const mutationKey = ['reReviewFinding'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof reReviewFinding>>, {id: string;data?: BodyType<ReReviewFindingInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  reReviewFinding(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ReReviewFindingMutationResult = NonNullable<Awaited<ReturnType<typeof reReviewFinding>>>
+    export type ReReviewFindingMutationBody = BodyType<ReReviewFindingInput> | undefined
+    export type ReReviewFindingMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Operator-initiated re-review (replay) of a finding's Triage -> Verifier
+LLM analysis. Resets the finding's agent review status back to "pending"
+and re-enqueues the review; the supervisor's compare-and-swap bumps the
+review attempt so the agents re-run from scratch (fresh per-attempt
+idempotency keys) rather than recovering the prior verdict. Refuses with
+409 when a review is already in progress so a replay cannot clobber a
+run mid-flight. Accepts an optional free-text reason (scanned by the
+content policy) recorded in the audit ledger. Requires session only.
+
+ */
+export const useReReviewFinding = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof reReviewFinding>>, TError,{id: string;data?: BodyType<ReReviewFindingInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof reReviewFinding>>,
+        TError,
+        {id: string;data?: BodyType<ReReviewFindingInput>},
+        TContext
+      > => {
+      return useMutation(getReReviewFindingMutationOptions(options));
     }
 
 export const getReplayIngestFixtureUrl = () => {

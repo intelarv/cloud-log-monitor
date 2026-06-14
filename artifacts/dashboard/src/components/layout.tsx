@@ -1,7 +1,7 @@
 import React from "react";
 import { useLocation, Link } from "wouter";
 import { useGetMe, useLogout } from "@workspace/api-client-react";
-import { Activity, ShieldAlert, MessageSquare, Database, Settings, LogOut, Sun, Moon, Monitor } from "lucide-react";
+import { Activity, ShieldAlert, MessageSquare, Database, Settings, LogOut, Sun, Moon, Monitor, Wrench } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Button } from "./ui/button";
 import { 
@@ -34,6 +34,7 @@ export default function Layout({ children }: LayoutProps) {
     { href: "/findings", label: "Findings", icon: ShieldAlert },
     { href: "/chat", label: "Chat Agent", icon: MessageSquare },
     { href: "/ledger", label: "Audit Ledger", icon: Database },
+    { href: "/remediation", label: "Remediation", icon: Wrench },
     { href: "/admin", label: "Admin & Break-glass", icon: Settings },
   ];
 

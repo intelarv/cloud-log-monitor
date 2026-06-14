@@ -18,6 +18,7 @@ import { loadTenantKmsCacheFromDb } from "./lib/tenant-kms";
 import { startIngestPipeline } from "./lib/ingest";
 import { startRawEvidenceTiering } from "./lib/raw-evidence-tiering";
 import { startMemoryEviction } from "./lib/memory-eviction";
+import { getSummaryPolicyFromEnv } from "./lib/memory-summarizer";
 import { startLogSourceReaper } from "./lib/log-source-reaper";
 import { initLogBusFromEnv } from "./lib/log-bus-config";
 import { buildLogSourceFromEnv } from "./lib/log-source-config";
@@ -204,7 +205,7 @@ async function main(): Promise<void> {
   // eval gate are byte-identical, and the boot backfill above is unchanged. The
   // backfill shares the same eligibility oracle so it never recreates what
   // eviction removed. See memory-eviction.ts.
-  startMemoryEviction();
+  startMemoryEviction(undefined, getSummaryPolicyFromEnv());
 
   // Step 4.9 (M8 reaper): start the stuck-cursor reaper. Periodically scans
   // `log_source_checkpoints` for poller cursors that have stopped advancing past

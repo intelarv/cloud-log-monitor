@@ -13,7 +13,25 @@ import Findings from "./pages/findings";
 import FindingDetail from "./pages/finding-detail";
 import Chat from "./pages/chat";
 import Ledger from "./pages/ledger";
+import Remediation from "./pages/remediation";
 import Admin from "./pages/admin";
+
+// A 401 normally means the session expired, so bounce to /login. The one
+// exception is a *step-up*-required 401 (`step_up_required: true`): that is an
+// expected, in-session challenge that individual flows (break-glass request,
+// approve, revoke) catch locally to open their MFA step-up dialog. Redirecting
+// to /login on those would unmount the dialog mid-flow and silently abort the
+// action, so they must be left for the originating component to handle.
+export function redirectOnAuthFailure(
+  error: unknown,
+  location: string,
+  setLocation: (to: string) => void,
+): void {
+  if (!(error instanceof ApiError) || error.status !== 401) return;
+  const data = error.data as { step_up_required?: boolean } | null;
+  if (data?.step_up_required) return;
+  if (location !== "/login") setLocation("/login");
+}
 
 function App() {
   const [location, setLocation] = useLocation();
@@ -23,21 +41,13 @@ function App() {
       new QueryClient({
         queryCache: new QueryCache({
           onError: (error) => {
-            if (error instanceof ApiError && error.status === 401) {
-              if (location !== "/login") {
-                setLocation("/login");
-              }
-            }
+            redirectOnAuthFailure(error, location, setLocation);
           },
         }),
         defaultOptions: {
           mutations: {
             onError: (error) => {
-              if (error instanceof ApiError && error.status === 401) {
-                if (location !== "/login") {
-                  setLocation("/login");
-                }
-              }
+              redirectOnAuthFailure(error, location, setLocation);
             },
           },
           queries: {
@@ -59,6 +69,7 @@ function App() {
               <Route path="/findings/:id" component={FindingDetail} />
               <Route path="/chat" component={Chat} />
               <Route path="/ledger" component={Ledger} />
+              <Route path="/remediation" component={Remediation} />
               <Route path="/admin" component={Admin} />
               <Route component={NotFound} />
             </Switch>

@@ -16,11 +16,11 @@ import {
 import type { PolicyViolation } from "./policy";
 import type { ToolName } from "./policy";
 import {
-  getLlmRuntime,
   streamFromRuntime,
   type LlmAgentRuntime,
   type LlmHistoryTurn,
 } from "./llm-runtime";
+import { resolveLlmForDecisionPoint } from "./llm-decision-points";
 import { withTimeout } from "./with-timeout";
 
 // ---------------------------------------------------------------------------
@@ -334,18 +334,19 @@ async function callLlm(
   history: LlmHistoryTurn[],
   userPrompt: string,
   timeoutMs: number,
+  modelIdHint: string,
 ): Promise<{ text: string; modelId: string; approxOutputTokens: number }> {
   const iterator = streamFromRuntime(runtime, {
     systemPrompt: CHAT_AGENT_SYSTEM_PROMPT,
     history,
     userPrompt,
-    modelId: CHAT_AGENT_MODEL,
+    modelId: modelIdHint,
     temperature: 0.2,
     maxOutputTokens: 1024,
   })[Symbol.asyncIterator]();
 
   let full = "";
-  let modelId = CHAT_AGENT_MODEL;
+  let modelId = modelIdHint;
   let approxOutputTokens = 0;
   const deadline = Date.now() + timeoutMs;
   try {
@@ -379,11 +380,18 @@ async function callLlmWithRetry(
   history: LlmHistoryTurn[],
   userPrompt: string,
   limits: HarnessLimits,
+  modelIdHint: string,
 ): Promise<{ text: string; modelId: string; approxOutputTokens: number }> {
   let attempt = 0;
   for (;;) {
     try {
-      return await callLlm(runtime, history, userPrompt, limits.llmCallTimeoutMs);
+      return await callLlm(
+        runtime,
+        history,
+        userPrompt,
+        limits.llmCallTimeoutMs,
+        modelIdHint,
+      );
     } catch (err) {
       attempt += 1;
       if (attempt > limits.maxLlmRetries) throw err;
@@ -416,7 +424,11 @@ export async function runAgentLoop(
   findings: Finding[],
   deps: AgentLoopDeps = {},
 ): Promise<ChatTurnResult> {
-  const runtime = deps.runtime ?? getLlmRuntime();
+  // Injected runtime (tests) wins and keeps the prompt-pinned model. With no
+  // injection, resolve the chat point's own provider/model (M17).
+  const { runtime, modelId: chatModelId } = deps.runtime
+    ? { runtime: deps.runtime, modelId: CHAT_AGENT_MODEL }
+    : resolveLlmForDecisionPoint("chat", CHAT_AGENT_MODEL);
   const limits = { ...defaultHarnessLimits(), ...deps.limits };
   const callTool: CallTool =
     deps.callTool ??
@@ -466,12 +478,18 @@ Respond per the system instructions.`;
   let degradeReason: DegradeReason | undefined;
   // Track the effective model id across turns so the ledger records what
   // actually serviced the FINAL response.
-  let effectiveModelId = CHAT_AGENT_MODEL;
+  let effectiveModelId = chatModelId;
 
   for (;;) {
     let buffered: { text: string; modelId: string; approxOutputTokens: number };
     try {
-      buffered = await callLlmWithRetry(runtime, history, nextUserPrompt, limits);
+      buffered = await callLlmWithRetry(
+        runtime,
+        history,
+        nextUserPrompt,
+        limits,
+        chatModelId,
+      );
     } catch (err) {
       logger.warn(
         { err: errMsg(err), tenantId: opts.tenantId },

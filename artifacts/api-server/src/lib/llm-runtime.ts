@@ -157,6 +157,15 @@ class GeminiLlmRuntime implements LlmAgentRuntime {
   }
 }
 
+/** Build a fresh, stateless Gemini (Replit AI Integration) runtime. Used by
+ *  the per-decision-point resolver (`llm-decision-points.ts`) when a point
+ *  resolves to `gemini-replit` even though the *global* runtime may have been
+ *  swapped to a cloud provider at boot — the global singleton can't be reused
+ *  in that case. Cheap: GeminiLlmRuntime holds no per-instance state. */
+export function makeGeminiRuntime(): LlmAgentRuntime {
+  return new GeminiLlmRuntime();
+}
+
 let runtime: LlmAgentRuntime = new GeminiLlmRuntime();
 
 export function getLlmRuntime(): LlmAgentRuntime {

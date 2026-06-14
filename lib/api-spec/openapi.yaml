@@ -723,6 +723,130 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /admin/remediation/proposals:
+    get:
+      operationId: listRemediationProposals
+      tags: [admin]
+      summary: |
+        List remediation proposals for the caller's tenant (most recent first).
+        These are agent-drafted, inert HITL proposals — they execute nothing
+        until a human confirms. Session only; optional `?status` filter.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, confirmed, rejected]
+      responses:
+        "200":
+          description: Proposals
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RemediationProposal" }
+        "400":
+          description: Invalid query
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/remediation/proposals/{id}/confirm:
+    post:
+      operationId: confirmRemediationProposal
+      tags: [admin]
+      summary: |
+        Confirm a pending remediation proposal (HITL gate). Requires a fresh
+        step-up cookie — confirming authorizes a potentially code-touching
+        action, so it keeps the same elevated scope as break-glass. The actual
+        execution stays operator/out-of-band by design. CAS on pending status.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RemediationDecisionInput" }
+      responses:
+        "200":
+          description: Proposal confirmed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemediationProposal" }
+        "400":
+          description: Invalid input or rejected note text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated or step-up missing
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Proposal not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "409":
+          description: Proposal already decided
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /admin/remediation/proposals/{id}/reject:
+    post:
+      operationId: rejectRemediationProposal
+      tags: [admin]
+      summary: |
+        Reject a pending remediation proposal. Session only — rejecting reduces
+        exposure (the proposal stays inert). CAS on pending status.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RemediationDecisionInput" }
+      responses:
+        "200":
+          description: Proposal rejected
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemediationProposal" }
+        "400":
+          description: Invalid input or rejected note text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Proposal not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "409":
+          description: Proposal already decided
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /tools/get_finding:
     post:
       operationId: invokeGetFindingTool
@@ -1256,3 +1380,48 @@ components:
           type: string
           minLength: 1
           maxLength: 64
+
+    RemediationDecisionInput:
+      type: object
+      properties:
+        note:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: |
+            Optional free-text note ("why") recorded with the confirm/reject
+            decision. Scanned by the same content policy as break-glass
+            justifications before it lands in the immutable audit ledger.
+
+    RemediationProposal:
+      type: object
+      required:
+        - id
+        - tenant_id
+        - finding_id
+        - action_type
+        - summary
+        - rationale
+        - proposed_by_agent
+        - proposed_by_user_id
+        - status
+        - created_at
+        - decided_by_user_id
+        - decided_at
+        - decision_note
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        finding_id: { type: string }
+        action_type: { type: string }
+        summary: { type: string }
+        rationale: { type: string }
+        proposed_by_agent: { type: string }
+        proposed_by_user_id: { type: string }
+        status:
+          type: string
+          enum: [pending, confirmed, rejected]
+        created_at: { type: string, format: date-time }
+        decided_by_user_id: { type: ["string", "null"] }
+        decided_at: { type: ["string", "null"], format: date-time }
+        decision_note: { type: ["string", "null"] }

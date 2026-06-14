@@ -53,6 +53,9 @@ import { db, pool } from "@workspace/db";
 import { withTenant } from "./db-context";
 import { appendLedger } from "./ledger";
 import { logger } from "./logger";
+// Type-only import (erased at build) — the runtime use is a lazy dynamic import
+// in runEvictOnce so the summarizer↔eviction dependency stays acyclic.
+import type { SummaryPolicy } from "./memory-summarizer";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -201,9 +204,66 @@ function isConsolidatable(
   return ageDays >= policy.halfLifeDays;
 }
 
-function groupKey(f: MemoryFinding): string {
+export function groupKey(f: MemoryFinding): string {
   // NUL separators so values can't run together ambiguously.
   return `${f.classification}\u0000${f.subclass ?? ""}\u0000${f.source}`;
+}
+
+/** A consolidation group: ≥2 consolidatable, non-floor findings sharing the
+ *  same (classification, subclass, source) key. `members` is ranked by
+ *  importance descending (ties by id ascending) so `members[0]` is the
+ *  representative whose embedding survives and the rest are the ones whose
+ *  embeddings Pass 1 evicts. Used both by `selectEvictions` (single source of
+ *  the grouping rule) and by the opt-in consolidation summarizer. */
+export interface ConsolidationGroup {
+  key: string;
+  classification: string;
+  subclass: string | null;
+  source: string;
+  /** Ranked importance-desc; index 0 is the kept representative. */
+  members: MemoryFinding[];
+}
+
+/** Pure, deterministic. Return the consolidation groups (group-dedup buckets
+ *  with ≥2 members) for a tenant's finding population, ranked. This is the
+ *  SINGLE source of the Pass-1 grouping rule; `selectEvictions` consumes it to
+ *  build its evict set and the summarizer consumes it to know what collapsed.
+ *  Eligibility mirrors Pass 1: floor findings (critical+open) are excluded and
+ *  only consolidatable findings (closed OR aged past one half-life) participate. */
+export function consolidationGroups(
+  findings: readonly MemoryFinding[],
+  policy: MemoryPolicy,
+  now: number,
+): ConsolidationGroup[] {
+  const imp = new Map<string, number>();
+  for (const f of findings) imp.set(f.id, computeImportance(f, now, policy));
+  const byImportanceDesc = (a: MemoryFinding, b: MemoryFinding): number =>
+    (imp.get(b.id) ?? 0) - (imp.get(a.id) ?? 0) || a.id.localeCompare(b.id);
+
+  const buckets = new Map<string, MemoryFinding[]>();
+  for (const f of findings) {
+    if (isFloor(f)) continue;
+    if (!isConsolidatable(f, now, policy)) continue;
+    const key = groupKey(f);
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(f);
+    else buckets.set(key, [f]);
+  }
+
+  const groups: ConsolidationGroup[] = [];
+  for (const [key, bucket] of buckets) {
+    if (bucket.length <= 1) continue;
+    const members = [...bucket].sort(byImportanceDesc);
+    const rep = members[0];
+    groups.push({
+      key,
+      classification: rep.classification,
+      subclass: rep.subclass,
+      source: rep.source,
+      members,
+    });
+  }
+  return groups;
 }
 
 /** Pure, deterministic. Given a tenant's full finding population, return the
@@ -234,20 +294,13 @@ export function selectEvictions(
   const byImportanceDesc = (a: MemoryFinding, b: MemoryFinding): number =>
     (imp.get(b.id) ?? 0) - (imp.get(a.id) ?? 0) || a.id.localeCompare(b.id);
 
-  // Pass 1 — consolidation (group-dedup).
-  const groups = new Map<string, MemoryFinding[]>();
-  for (const f of findings) {
-    if (isFloor(f)) continue;
-    if (!isConsolidatable(f, now, policy)) continue;
-    const key = groupKey(f);
-    const bucket = groups.get(key);
-    if (bucket) bucket.push(f);
-    else groups.set(key, [f]);
-  }
-  for (const bucket of groups.values()) {
-    if (bucket.length <= 1) continue;
-    const ranked = [...bucket].sort(byImportanceDesc);
-    for (let i = 1; i < ranked.length; i++) evict.add(ranked[i].id);
+  // Pass 1 — consolidation (group-dedup). `consolidationGroups` is the single
+  // source of the grouping rule; here we evict every non-representative member
+  // (members are already ranked importance-desc, so index 0 is kept).
+  for (const group of consolidationGroups(findings, policy, now)) {
+    for (let i = 1; i < group.members.length; i++) {
+      evict.add(group.members[i].id);
+    }
   }
 
   // Pass 2 — count cap on the post-consolidation survivors. Floor findings are
@@ -465,7 +518,10 @@ async function withLeaderLock<T>(fn: () => Promise<T>): Promise<T | "skipped"> {
   }
 }
 
-async function runEvictOnce(policy: MemoryPolicy): Promise<void> {
+async function runEvictOnce(
+  policy: MemoryPolicy,
+  summaryPolicy?: SummaryPolicy | null,
+): Promise<void> {
   await withLeaderLock(async () => {
     try {
       const r = await evictMemoryOnce({ policy });
@@ -477,6 +533,31 @@ async function runEvictOnce(policy: MemoryPolicy): Promise<void> {
     } catch (err) {
       logger.error({ err }, "memory eviction run failed");
     }
+
+    // Opt-in LLM consolidation summaries run in the SAME sweep, under the SAME
+    // leader lock, right after eviction. Lazy import keeps the module graph
+    // acyclic and loads nothing when the feature is off.
+    if (summaryPolicy) {
+      try {
+        const { summarizeConsolidationsOnce } = await import(
+          "./memory-summarizer"
+        );
+        const s = await summarizeConsolidationsOnce({
+          memoryPolicy: policy,
+          summaryPolicy,
+        });
+        if (s.summarized > 0 || s.failed > 0) {
+          logger.info(s, "memory consolidation summarization complete");
+        } else {
+          logger.debug(
+            s,
+            "memory consolidation summarization complete (nothing new)",
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, "memory consolidation summarization run failed");
+      }
+    }
   });
 }
 
@@ -487,6 +568,7 @@ async function runEvictOnce(policy: MemoryPolicy): Promise<void> {
  *  `undefined` reads env, explicit `null` forces disabled. */
 export function startMemoryEviction(
   cfgOverride?: MemoryPolicy | null,
+  summaryPolicy?: SummaryPolicy | null,
 ): () => void {
   const policy =
     cfgOverride === undefined ? getMemoryPolicyFromEnv() : cfgOverride;
@@ -497,13 +579,17 @@ export function startMemoryEviction(
     return () => {};
   }
 
-  const timer = setInterval(() => void runEvictOnce(policy), policy.intervalMs);
+  const timer = setInterval(
+    () => void runEvictOnce(policy, summaryPolicy),
+    policy.intervalMs,
+  );
   timer.unref?.();
   logger.info(
     {
       maxPerTenant: policy.maxPerTenant,
       halfLifeDays: policy.halfLifeDays,
       intervalMs: policy.intervalMs,
+      consolidationSummaries: summaryPolicy ? "on" : "off",
     },
     "memory eviction scheduled",
   );

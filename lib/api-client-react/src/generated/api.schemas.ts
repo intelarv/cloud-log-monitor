@@ -484,6 +484,46 @@ export interface ToolGetFindingInput {
   finding_id: string;
 }
 
+export interface RemediationDecisionInput {
+  /**
+     * Optional free-text note ("why") recorded with the confirm/reject
+  decision. Scanned by the same content policy as break-glass
+  justifications before it lands in the immutable audit ledger.
+
+     * @minLength 1
+     * @maxLength 2000
+     */
+  note?: string;
+}
+
+export type RemediationProposalStatus = typeof RemediationProposalStatus[keyof typeof RemediationProposalStatus];
+
+
+export const RemediationProposalStatus = {
+  pending: 'pending',
+  confirmed: 'confirmed',
+  rejected: 'rejected',
+} as const;
+
+export interface RemediationProposal {
+  id: string;
+  tenant_id: string;
+  finding_id: string;
+  action_type: string;
+  summary: string;
+  rationale: string;
+  proposed_by_agent: string;
+  proposed_by_user_id: string;
+  status: RemediationProposalStatus;
+  created_at: string;
+  /** @nullable */
+  decided_by_user_id: string | null;
+  /** @nullable */
+  decided_at: string | null;
+  /** @nullable */
+  decision_note: string | null;
+}
+
 export type ListFindingsParams = {
 status?: ListFindingsStatus;
 severity?: ListFindingsSeverity;
@@ -541,5 +581,18 @@ export type ListLedgerCheckpointsVerify = typeof ListLedgerCheckpointsVerify[key
 export const ListLedgerCheckpointsVerify = {
   NUMBER_0: '0',
   NUMBER_1: '1',
+} as const;
+
+export type ListRemediationProposalsParams = {
+status?: ListRemediationProposalsStatus;
+};
+
+export type ListRemediationProposalsStatus = typeof ListRemediationProposalsStatus[keyof typeof ListRemediationProposalsStatus];
+
+
+export const ListRemediationProposalsStatus = {
+  pending: 'pending',
+  confirmed: 'confirmed',
+  rejected: 'rejected',
 } as const;
 

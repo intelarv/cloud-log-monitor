@@ -11,6 +11,8 @@ import {
   getListPendingBreakGlassApprovalsQueryKey,
   getListFindingsQueryKey,
   getListLedgerQueryKey,
+  getGetFindingQueryKey,
+  getGetFindingHistoryQueryKey,
   ApiError,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -88,13 +90,21 @@ export default function Admin() {
     }
   };
 
+  const invalidateFindingQueries = (findingId: string | undefined) => {
+    if (!findingId) return;
+    queryClient.invalidateQueries({ queryKey: getGetFindingQueryKey(findingId) });
+    queryClient.invalidateQueries({ queryKey: getGetFindingHistoryQueryKey(findingId) });
+  };
+
   const submitRevoke = async (id: string, reason?: string) => {
+    const findingId = activeGrants?.find(g => g.id === id)?.finding_id;
     try {
       await revokeGrant.mutateAsync({ id, data: reason ? { reason } : {} });
       toast({ title: "Grant revoked", description: "Raw-PHI access has been cut off." });
       queryClient.invalidateQueries({ queryKey: getListBreakGlassGrantsQueryKey() });
       queryClient.invalidateQueries({ queryKey: getListPendingBreakGlassApprovalsQueryKey() });
       queryClient.invalidateQueries({ queryKey: getListLedgerQueryKey() });
+      invalidateFindingQueries(findingId);
     } catch (e: any) {
       if (e instanceof ApiError && e.status === 401) {
         toast({
@@ -135,11 +145,13 @@ export default function Admin() {
   };
 
   const submitApproval = async (id: string, note: string) => {
+    const findingId = pendingApprovals?.find(g => g.id === id)?.finding_id;
     try {
       await approveGrant.mutateAsync({ id, data: { approval_note: note } });
       toast({ title: "Grant approved", description: "The analyst can now view the raw finding." });
       queryClient.invalidateQueries({ queryKey: getListPendingBreakGlassApprovalsQueryKey() });
       queryClient.invalidateQueries({ queryKey: getListBreakGlassGrantsQueryKey() });
+      invalidateFindingQueries(findingId);
     } catch (e: any) {
       if (e instanceof ApiError && e.status === 401) {
         toast({

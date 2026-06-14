@@ -301,11 +301,33 @@ CREATE INDEX IF NOT EXISTS remediation_tenant_status_idx
 CREATE INDEX IF NOT EXISTS remediation_tenant_finding_idx
   ON remediation_proposals (tenant_id, finding_id);
 
+-- Opt-in (MEMORY_CONSOLIDATION_SUMMARY): one LLM-generated natural-language
+-- summary per collapsed consolidation group. Unset ⇒ never written. PHI-safe by
+-- construction (redacted-only input, scanForPhi on output). See
+-- lib/db/src/schema/memory-summary.ts + memory-summarizer.ts.
+CREATE TABLE IF NOT EXISTS memory_consolidation_summaries (
+  id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  group_key text NOT NULL,
+  classification text NOT NULL,
+  subclass text,
+  source text NOT NULL,
+  representative_finding_id text NOT NULL,
+  consolidated_count integer NOT NULL,
+  member_signature text NOT NULL,
+  summary text NOT NULL,
+  model_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_summary_tenant_group_idx
+  ON memory_consolidation_summaries (tenant_id, group_key);
+
 DO $$
 DECLARE
   t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['findings', 'chat_sessions', 'chat_messages', 'break_glass_grants', 'remediation_proposals'] LOOP
+  FOREACH t IN ARRAY ARRAY['findings', 'chat_sessions', 'chat_messages', 'break_glass_grants', 'remediation_proposals', 'memory_consolidation_summaries'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);

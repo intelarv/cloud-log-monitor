@@ -234,6 +234,10 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // eviction job, never the alert dispatcher. Payload carries counts + policy
   // params only (no finding ids, no PHI).
   "memory.evict_failed": "warning",
+  // Opt-in consolidation summarizer (MEMORY_CONSOLIDATION_SUMMARY) failed for a
+  // group/tenant — empty LLM output, PHI detected in output (hard-failed write),
+  // or a per-tenant error. The successful path (memory.summarized) is routine.
+  "memory.summary_failed": "warning",
   // Supervisor durable engine (WORKFLOW_ENGINE=temporal): a finding's
   // Triage->Verifier review was dropped before it could run — either the
   // pre-start buffer overflowed during the engine's async startup window
@@ -344,6 +348,11 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // lexical/BM25 leg are untouched); auditable in the ledger. The failure
   // event (memory.evict_failed, warning above) is the alertable one.
   "memory.evicted",
+  // Opt-in consolidation summarizer wrote/refreshed one or more group summaries
+  // (MEMORY_CONSOLIDATION_SUMMARY). Routine maintenance; payload carries counts +
+  // model_id only (no finding ids, no summary text, no PHI). The failure event
+  // (memory.summary_failed, warning above) is the alertable one.
+  "memory.summarized",
 ]);
 
 /** In-memory rolling counters for threshold-based alerts.

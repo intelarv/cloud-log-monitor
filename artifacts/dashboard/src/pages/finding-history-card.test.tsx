@@ -110,6 +110,85 @@ describe("FindingHistoryCard", () => {
     expect(screen.getByText("resolved")).toBeInTheDocument();
   });
 
+  it("renders an auto-revoked break-glass close-out distinctly from a manual revoke", () => {
+    // After a finding is closed out, its active break-glass grant is
+    // automatically revoked and ledgered as `break_glass.revoked` with
+    // `auto_revoked: true`. The History card must render that as
+    // "Break-glass revoked" *with* the "auto-revoked" qualifier, so an auditor
+    // can tell at a glance that access ended because of the close-out, not
+    // because a human manually pulled it. The manual revoke (newest event) must
+    // NOT carry the qualifier.
+    const events: HistoryEvent[] = [
+      {
+        seq: 50,
+        ts: "2026-05-31T16:00:00.000Z",
+        event_type: "break_glass.revoked",
+        actor: { kind: "human", id: "analyst-manual" },
+        payload: { reason: "Pulled access manually; investigation paused." },
+      },
+      {
+        seq: 40,
+        ts: "2026-05-31T15:00:00.000Z",
+        event_type: "break_glass.revoked",
+        actor: { kind: "system", id: "auto-revoke" },
+        payload: { auto_revoked: true, reason: "Finding closed out." },
+      },
+      {
+        seq: 30,
+        ts: "2026-05-31T14:30:00.000Z",
+        event_type: "finding.resolved",
+        actor: { kind: "human", id: "analyst-close" },
+        payload: { status: "resolved" },
+      },
+      {
+        seq: 20,
+        ts: "2026-05-31T14:00:00.000Z",
+        event_type: "break_glass.granted",
+        actor: { kind: "human", id: "analyst-bg" },
+        payload: { justification: "Need raw evidence to confirm SSN exposure." },
+      },
+      {
+        seq: 10,
+        ts: "2026-05-31T12:00:00.000Z",
+        event_type: "finding.created",
+        actor: { kind: "system", id: "ingest" },
+        payload: {},
+      },
+    ];
+    setHistory(events);
+
+    render(<FindingHistoryCard findingId="f_autorevoke" />);
+
+    // Both revokes render under the same human label.
+    expect(screen.getAllByText("Break-glass revoked")).toHaveLength(2);
+
+    const items = screen.getAllByRole("listitem");
+    expect(items).toHaveLength(5);
+
+    // The auto-revoke entry (seq 40) carries the "auto-revoked" qualifier badge.
+    const autoItem = items.find(
+      (li) => li.textContent?.includes("Break-glass revoked") && li.textContent?.includes("Finding closed out."),
+    )!;
+    expect(autoItem).toBeTruthy();
+    expect(within(autoItem).getByText("auto-revoked")).toBeInTheDocument();
+
+    // The manual revoke (seq 50) renders without the qualifier.
+    const manualItem = items.find((li) =>
+      li.textContent?.includes("Pulled access manually"),
+    )!;
+    expect(manualItem).toBeTruthy();
+    expect(within(manualItem).queryByText("auto-revoked")).not.toBeInTheDocument();
+
+    // The qualifier appears exactly once across the whole timeline.
+    expect(screen.getAllByText("auto-revoked")).toHaveLength(1);
+
+    // Ordering is preserved most-recent-first: manual revoke before auto-revoke.
+    const order = items.map((li) => li.textContent ?? "");
+    const manualIdx = order.findIndex((t) => t.includes("Pulled access manually"));
+    const autoIdx = order.findIndex((t) => t.includes("Finding closed out."));
+    expect(manualIdx).toBeLessThan(autoIdx);
+  });
+
   it("shows the empty state when there are no events", () => {
     setHistory([]);
     render(<FindingHistoryCard findingId="f_empty" />);

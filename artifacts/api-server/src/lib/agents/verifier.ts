@@ -11,7 +11,8 @@ import {
   VERIFIER_AGENT_VERSION,
   verifierPromptHash,
 } from "../prompts";
-import { getLlmRuntime, type LlmAgentRuntime } from "../llm-runtime";
+import { type LlmAgentRuntime } from "../llm-runtime";
+import { resolveLlmForDecisionPoint } from "../llm-decision-points";
 import { parseStrictJson } from "./triage";
 import type { TriageVerdict } from "./triage";
 
@@ -65,13 +66,18 @@ Produce your JSON verdict per the system instructions.`;
 export async function runVerifierAgent(
   finding: FindingSafe,
   triage: TriageVerdict,
-  runtime: LlmAgentRuntime = getLlmRuntime(),
+  runtime?: LlmAgentRuntime,
 ): Promise<{ verdict: VerifierVerdict; approxOutputTokens: number; modelId: string }> {
+  // Injected runtime (tests) wins and keeps the prompt-pinned model. With no
+  // injection, resolve this point's own provider/model (M17 per-decision-point).
+  const resolved = runtime
+    ? { runtime, modelId: VERIFIER_AGENT_MODEL }
+    : resolveLlmForDecisionPoint("verifier", VERIFIER_AGENT_MODEL);
   const userPrompt = buildUserPrompt(finding, triage);
-  const out = await runtime.generate({
+  const out = await resolved.runtime.generate({
     systemPrompt: VERIFIER_AGENT_SYSTEM_PROMPT,
     userPrompt,
-    modelId: VERIFIER_AGENT_MODEL,
+    modelId: resolved.modelId,
     temperature: 0.1,
     maxOutputTokens: 512,
   });

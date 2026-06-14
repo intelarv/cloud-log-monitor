@@ -168,6 +168,72 @@ async function createActiveGrant(
 }
 
 
+/** Inject an immediately-active grant DIRECTLY via the DB (no route), mirroring
+ *  the task's "[DB] inject an active break-glass grant" setup. break_glass_grants
+ *  is FORCE RLS, so the write goes through `withTenant` (sets the app.tenant_id
+ *  GUC) — a plain `db` write would be filtered out by the row-level policy. */
+async function injectActiveGrant(
+  findingId: string,
+  userId: string,
+): Promise<string> {
+  const id = `bg_${uniq()}`;
+  await withTenant(TENANT, async (tx) => {
+    await tx.insert(breakGlassGrantsTable).values({
+      id,
+      tenantId: TENANT,
+      userId,
+      findingId,
+      justification: "task104 db-injected active grant",
+      expiresAt: new Date(Date.now() + 10 * 60_000),
+      revokedAt: null,
+      requiresSecondApproval: false,
+    });
+  });
+  return id;
+}
+
+/** Read a grant's `revoked_at` straight from the DB (under tenant context, as
+ *  RLS requires) so the close-out's revoke persistence is verified at the
+ *  storage layer, not just through an API projection. */
+async function readGrantRevokedAt(grantId: string): Promise<Date | null> {
+  const rows = await withTenant(TENANT, async (tx) =>
+    tx
+      .select({ revokedAt: breakGlassGrantsTable.revokedAt })
+      .from(breakGlassGrantsTable)
+      .where(
+        and(
+          eq(breakGlassGrantsTable.id, grantId),
+          eq(breakGlassGrantsTable.tenantId, TENANT),
+        ),
+      )
+      .limit(1),
+  );
+  return rows[0]?.revokedAt ?? null;
+}
+
+/** Delete the injected finding + grant rows (tenant GUC via `withTenant`).
+ *  Never touches the append-only `ledger_entries` table. */
+async function cleanupInjected(findingId: string, grantId: string): Promise<void> {
+  await withTenant(TENANT, async (tx) => {
+    await tx
+      .delete(breakGlassGrantsTable)
+      .where(
+        and(
+          eq(breakGlassGrantsTable.id, grantId),
+          eq(breakGlassGrantsTable.tenantId, TENANT),
+        ),
+      );
+    await tx
+      .delete(findingsTable)
+      .where(
+        and(
+          eq(findingsTable.id, findingId),
+          eq(findingsTable.tenantId, TENANT),
+        ),
+      );
+  });
+}
+
 /** The most-recent ledger entry of `eventType` for `findingId` after `sinceSeq`. */
 async function latestLedgerEvent(
   eventType: string,
@@ -287,6 +353,52 @@ describe("auto-revoke break-glass on finding resolution (HTTP)", () => {
       readBefore,
     );
     expect(accessed).toBeUndefined();
+  });
+
+  // Task #104: the security-relevant variant — closing out a finding that has a
+  // SINGLE active break-glass grant must END that emergency access. This drives
+  // the real login -> close-out HTTP flow against a finding + grant injected
+  // directly via the DB ([DB] setup), verifies revoke persistence by reading
+  // break_glass_grants straight from the DB (active -> revoked), and cleans up
+  // the injected rows afterwards (tenant GUC via withTenant; never deletes from
+  // the append-only ledger). The toast wording the analyst sees for this exact
+  // single-grant case is covered by the dashboard component test
+  // (resolve-finding-modal.test.tsx), and a live browser run by the Playwright
+  // testing subagent.
+  it("closing out a finding ends its single active emergency-access grant (DB-verified lifecycle + cleanup)", async () => {
+    const findingId = await createHighFinding();
+    const { c: requester, sub } = await authedClient(`req-${uniq()}`);
+    const grantId = await injectActiveGrant(findingId, sub);
+
+    try {
+      // Active before close-out: the grant has no revoked_at in the DB.
+      expect(await readGrantRevokedAt(grantId)).toBeNull();
+
+      // Close out (resolve) the finding over the real HTTP route.
+      const resolve = await requester.post(
+        `/api/admin/findings/${findingId}/resolve`,
+        { status: "resolved" },
+      );
+      expect(resolve.status).toBe(200);
+      const body = (await resolve.json()) as {
+        transitioned: boolean;
+        revoked_grants: number;
+      };
+      expect(body.transitioned).toBe(true);
+      // Exactly the one injected grant was auto-revoked (drives the singular
+      // "1 active emergency-access grant was automatically revoked." toast).
+      expect(body.revoked_grants).toBe(1);
+
+      // Revoked after close-out: the DB row now carries a revoked_at, proving
+      // the emergency access actually ended at the storage layer.
+      const revokedAt = await readGrantRevokedAt(grantId);
+      expect(revokedAt).not.toBeNull();
+    } finally {
+      await cleanupInjected(findingId, grantId);
+    }
+
+    // Cleanup actually removed the injected grant + finding rows.
+    expect(await readGrantRevokedAt(grantId)).toBeNull();
   });
 
   it("re-resolving an already-resolved finding is an idempotent no-op", async () => {

@@ -42,10 +42,13 @@ import type {
   ListFindingsParams,
   ListLedgerCheckpointsParams,
   ListLedgerParams,
+  ListRemediationProposalsParams,
   LoginInput,
   MaintenanceMetrics,
   ReReviewFindingInput,
   ReReviewFindingResult,
+  RemediationDecisionInput,
+  RemediationProposal,
   ReopenFindingInput,
   ReopenFindingResult,
   ResolveFindingInput,
@@ -2217,6 +2220,252 @@ export const useReplayIngestFixture = <TError = ErrorType<ErrorResponse>,
         TContext
       > => {
       return useMutation(getReplayIngestFixtureMutationOptions(options));
+    }
+
+export const getListRemediationProposalsUrl = (params?: ListRemediationProposalsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/api/admin/remediation/proposals?${stringifiedParams}` : `/api/admin/remediation/proposals`
+}
+
+/**
+ * @summary List remediation proposals for the caller's tenant (most recent first).
+These are agent-drafted, inert HITL proposals — they execute nothing
+until a human confirms. Session only; optional `?status` filter.
+
+ */
+export const listRemediationProposals = async (params?: ListRemediationProposalsParams, options?: RequestInit): Promise<RemediationProposal[]> => {
+
+  return customFetch<RemediationProposal[]>(getListRemediationProposalsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListRemediationProposalsQueryKey = (params?: ListRemediationProposalsParams,) => {
+    return [
+    `/api/admin/remediation/proposals`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListRemediationProposalsQueryOptions = <TData = Awaited<ReturnType<typeof listRemediationProposals>>, TError = ErrorType<ErrorResponse>>(params?: ListRemediationProposalsParams, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listRemediationProposals>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListRemediationProposalsQueryKey(params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listRemediationProposals>>> = ({ signal }) => listRemediationProposals(params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listRemediationProposals>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type ListRemediationProposalsQueryResult = NonNullable<Awaited<ReturnType<typeof listRemediationProposals>>>
+export type ListRemediationProposalsQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary List remediation proposals for the caller's tenant (most recent first).
+These are agent-drafted, inert HITL proposals — they execute nothing
+until a human confirms. Session only; optional `?status` filter.
+
+ */
+
+export function useListRemediationProposals<TData = Awaited<ReturnType<typeof listRemediationProposals>>, TError = ErrorType<ErrorResponse>>(
+ params?: ListRemediationProposalsParams, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof listRemediationProposals>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getListRemediationProposalsQueryOptions(params,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getConfirmRemediationProposalUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/remediation/proposals/${id}/confirm`
+}
+
+/**
+ * @summary Confirm a pending remediation proposal (HITL gate). Requires a fresh
+step-up cookie — confirming authorizes a potentially code-touching
+action, so it keeps the same elevated scope as break-glass. The actual
+execution stays operator/out-of-band by design. CAS on pending status.
+
+ */
+export const confirmRemediationProposal = async (id: string,
+    remediationDecisionInput?: RemediationDecisionInput, options?: RequestInit): Promise<RemediationProposal> => {
+
+  return customFetch<RemediationProposal>(getConfirmRemediationProposalUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      remediationDecisionInput,)
+  }
+);}
+
+
+
+
+export const getConfirmRemediationProposalMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof confirmRemediationProposal>>, TError,{id: string;data?: BodyType<RemediationDecisionInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof confirmRemediationProposal>>, TError,{id: string;data?: BodyType<RemediationDecisionInput>}, TContext> => {
+
+const mutationKey = ['confirmRemediationProposal'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof confirmRemediationProposal>>, {id: string;data?: BodyType<RemediationDecisionInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  confirmRemediationProposal(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ConfirmRemediationProposalMutationResult = NonNullable<Awaited<ReturnType<typeof confirmRemediationProposal>>>
+    export type ConfirmRemediationProposalMutationBody = BodyType<RemediationDecisionInput> | undefined
+    export type ConfirmRemediationProposalMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Confirm a pending remediation proposal (HITL gate). Requires a fresh
+step-up cookie — confirming authorizes a potentially code-touching
+action, so it keeps the same elevated scope as break-glass. The actual
+execution stays operator/out-of-band by design. CAS on pending status.
+
+ */
+export const useConfirmRemediationProposal = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof confirmRemediationProposal>>, TError,{id: string;data?: BodyType<RemediationDecisionInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof confirmRemediationProposal>>,
+        TError,
+        {id: string;data?: BodyType<RemediationDecisionInput>},
+        TContext
+      > => {
+      return useMutation(getConfirmRemediationProposalMutationOptions(options));
+    }
+
+export const getRejectRemediationProposalUrl = (id: string,) => {
+
+
+
+
+  return `/api/admin/remediation/proposals/${id}/reject`
+}
+
+/**
+ * @summary Reject a pending remediation proposal. Session only — rejecting reduces
+exposure (the proposal stays inert). CAS on pending status.
+
+ */
+export const rejectRemediationProposal = async (id: string,
+    remediationDecisionInput?: RemediationDecisionInput, options?: RequestInit): Promise<RemediationProposal> => {
+
+  return customFetch<RemediationProposal>(getRejectRemediationProposalUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      remediationDecisionInput,)
+  }
+);}
+
+
+
+
+export const getRejectRemediationProposalMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rejectRemediationProposal>>, TError,{id: string;data?: BodyType<RemediationDecisionInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof rejectRemediationProposal>>, TError,{id: string;data?: BodyType<RemediationDecisionInput>}, TContext> => {
+
+const mutationKey = ['rejectRemediationProposal'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof rejectRemediationProposal>>, {id: string;data?: BodyType<RemediationDecisionInput>}> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  rejectRemediationProposal(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RejectRemediationProposalMutationResult = NonNullable<Awaited<ReturnType<typeof rejectRemediationProposal>>>
+    export type RejectRemediationProposalMutationBody = BodyType<RemediationDecisionInput> | undefined
+    export type RejectRemediationProposalMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Reject a pending remediation proposal. Session only — rejecting reduces
+exposure (the proposal stays inert). CAS on pending status.
+
+ */
+export const useRejectRemediationProposal = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rejectRemediationProposal>>, TError,{id: string;data?: BodyType<RemediationDecisionInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof rejectRemediationProposal>>,
+        TError,
+        {id: string;data?: BodyType<RemediationDecisionInput>},
+        TContext
+      > => {
+      return useMutation(getRejectRemediationProposalMutationOptions(options));
     }
 
 export const getInvokeGetFindingToolUrl = () => {

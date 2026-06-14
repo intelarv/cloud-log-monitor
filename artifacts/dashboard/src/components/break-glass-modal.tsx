@@ -2,7 +2,13 @@ import React from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useCreateBreakGlassGrant } from "@workspace/api-client-react";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  useCreateBreakGlassGrant,
+  getGetFindingQueryKey,
+  getGetFindingHistoryQueryKey,
+  getListBreakGlassGrantsQueryKey,
+} from "@workspace/api-client-react";
 import {
   Dialog,
   DialogContent,
@@ -37,10 +43,22 @@ interface BreakGlassModalProps {
   onOpenChange: (open: boolean) => void;
   findingId: string;
   onSuccess: (grant: any) => void;
+  // When the analyst re-requests access from the expiry warning (Task #113),
+  // the justification from the prior grant is carried over as a prefill so
+  // they don't have to retype it. It is still re-scanned server-side at write
+  // time — prefilling is a UX convenience, not a trust shortcut.
+  defaultJustification?: string;
 }
 
-export default function BreakGlassModal({ open, onOpenChange, findingId, onSuccess }: BreakGlassModalProps) {
+export default function BreakGlassModal({
+  open,
+  onOpenChange,
+  findingId,
+  onSuccess,
+  defaultJustification,
+}: BreakGlassModalProps) {
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   const createGrant = useCreateBreakGlassGrant();
   
   const [showStepUp, setShowStepUp] = React.useState(false);
@@ -55,9 +73,9 @@ export default function BreakGlassModal({ open, onOpenChange, findingId, onSucce
 
   React.useEffect(() => {
     if (open) {
-      form.reset({ justification: "", ttl_seconds: 300 });
+      form.reset({ justification: defaultJustification ?? "", ttl_seconds: 300 });
     }
-  }, [open, form]);
+  }, [open, form, defaultJustification]);
 
   const onSubmit = async (data: BreakGlassForm) => {
     try {
@@ -68,6 +86,14 @@ export default function BreakGlassModal({ open, onOpenChange, findingId, onSucce
           ttl_seconds: data.ttl_seconds,
         }
       });
+      await queryClient.invalidateQueries({ queryKey: getGetFindingQueryKey(findingId) });
+      await queryClient.invalidateQueries({ queryKey: getGetFindingHistoryQueryKey(findingId) });
+      // Refresh the analyst's own grants list so finding-detail immediately sees
+      // the new pending grant. This is what arms the live-notice poll: without
+      // it, finding-detail's grant stays null, its refetchInterval predicate
+      // stays false, and an analyst who keeps the tab focused would never get
+      // the approve/revoke toast (no focus change to trigger a refetch).
+      await queryClient.invalidateQueries({ queryKey: getListBreakGlassGrantsQueryKey() });
       onSuccess(grant);
     } catch (e: any) {
       if (e instanceof ApiError && e.status === 401) {

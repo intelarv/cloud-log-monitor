@@ -3,6 +3,7 @@ export * from "./ledger";
 export * from "./chat";
 export * from "./break-glass";
 export * from "./remediation";
+export * from "./memory-summary";
 export * from "./checkpoints";
 export * from "./log-source-checkpoints";
 export * from "./ingest-dead-letter";

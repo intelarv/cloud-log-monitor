@@ -669,6 +669,104 @@ export const ReplayIngestFixtureResponse = zod.object({
 
 
 /**
+ * @summary List remediation proposals for the caller's tenant (most recent first).
+These are agent-drafted, inert HITL proposals — they execute nothing
+until a human confirms. Session only; optional `?status` filter.
+
+ */
+export const ListRemediationProposalsQueryParams = zod.object({
+  "status": zod.enum(['pending', 'confirmed', 'rejected']).optional()
+})
+
+export const ListRemediationProposalsResponseItem = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "finding_id": zod.string(),
+  "action_type": zod.string(),
+  "summary": zod.string(),
+  "rationale": zod.string(),
+  "proposed_by_agent": zod.string(),
+  "proposed_by_user_id": zod.string(),
+  "status": zod.enum(['pending', 'confirmed', 'rejected']),
+  "created_at": zod.coerce.date(),
+  "decided_by_user_id": zod.string().nullable(),
+  "decided_at": zod.coerce.date().nullable(),
+  "decision_note": zod.string().nullable()
+})
+export const ListRemediationProposalsResponse = zod.array(ListRemediationProposalsResponseItem)
+
+
+/**
+ * @summary Confirm a pending remediation proposal (HITL gate). Requires a fresh
+step-up cookie — confirming authorizes a potentially code-touching
+action, so it keeps the same elevated scope as break-glass. The actual
+execution stays operator/out-of-band by design. CAS on pending status.
+
+ */
+export const ConfirmRemediationProposalParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const confirmRemediationProposalBodyNoteMax = 2000;
+
+
+
+export const ConfirmRemediationProposalBody = zod.object({
+  "note": zod.string().min(1).max(confirmRemediationProposalBodyNoteMax).optional().describe('Optional free-text note (\"why\") recorded with the confirm\/reject\ndecision. Scanned by the same content policy as break-glass\njustifications before it lands in the immutable audit ledger.\n')
+})
+
+export const ConfirmRemediationProposalResponse = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "finding_id": zod.string(),
+  "action_type": zod.string(),
+  "summary": zod.string(),
+  "rationale": zod.string(),
+  "proposed_by_agent": zod.string(),
+  "proposed_by_user_id": zod.string(),
+  "status": zod.enum(['pending', 'confirmed', 'rejected']),
+  "created_at": zod.coerce.date(),
+  "decided_by_user_id": zod.string().nullable(),
+  "decided_at": zod.coerce.date().nullable(),
+  "decision_note": zod.string().nullable()
+})
+
+
+/**
+ * @summary Reject a pending remediation proposal. Session only — rejecting reduces
+exposure (the proposal stays inert). CAS on pending status.
+
+ */
+export const RejectRemediationProposalParams = zod.object({
+  "id": zod.coerce.string()
+})
+
+export const rejectRemediationProposalBodyNoteMax = 2000;
+
+
+
+export const RejectRemediationProposalBody = zod.object({
+  "note": zod.string().min(1).max(rejectRemediationProposalBodyNoteMax).optional().describe('Optional free-text note (\"why\") recorded with the confirm\/reject\ndecision. Scanned by the same content policy as break-glass\njustifications before it lands in the immutable audit ledger.\n')
+})
+
+export const RejectRemediationProposalResponse = zod.object({
+  "id": zod.string(),
+  "tenant_id": zod.string(),
+  "finding_id": zod.string(),
+  "action_type": zod.string(),
+  "summary": zod.string(),
+  "rationale": zod.string(),
+  "proposed_by_agent": zod.string(),
+  "proposed_by_user_id": zod.string(),
+  "status": zod.enum(['pending', 'confirmed', 'rejected']),
+  "created_at": zod.coerce.date(),
+  "decided_by_user_id": zod.string().nullable(),
+  "decided_at": zod.coerce.date().nullable(),
+  "decision_note": zod.string().nullable()
+})
+
+
+/**
  * @summary MCP-shaped tool invocation surface for `get_finding`. Mirrors what the
 agent calls internally; useful for dashboard re-validation of
 citations and for manual exercises.

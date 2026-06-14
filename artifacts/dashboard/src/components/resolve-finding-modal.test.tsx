@@ -45,12 +45,18 @@ function renderModal(findingId = "f1") {
     .spyOn(queryClient, "invalidateQueries")
     .mockResolvedValue(undefined as never);
   const onOpenChange = vi.fn();
+  const onSuccess = vi.fn();
   render(
     <QueryClientProvider client={queryClient}>
-      <ResolveFindingModal open onOpenChange={onOpenChange} findingId={findingId} />
+      <ResolveFindingModal
+        open
+        onOpenChange={onOpenChange}
+        findingId={findingId}
+        onSuccess={onSuccess}
+      />
     </QueryClientProvider>,
   );
-  return { invalidateSpy, onOpenChange };
+  return { invalidateSpy, onOpenChange, onSuccess };
 }
 
 function invalidatedKeys(invalidateSpy: ReturnType<typeof vi.spyOn>) {
@@ -120,6 +126,31 @@ describe("ResolveFindingModal (Close Out)", () => {
     expect(mockToast.mock.calls[0][0].description).toContain(
       "2 active emergency-access grants were",
     );
+  });
+
+  // Security-relevant variant (Task #104): closing out a finding that has a
+  // SINGLE active break-glass grant must report it was automatically revoked,
+  // with singular wording, and propagate the revoked count to onSuccess so the
+  // detail page can react (e.g. drop a now-stale "Raw Unlocked" affordance).
+  // The live UI -> real backend -> DB-revoke flow is additionally covered by the
+  // Playwright testing subagent; the real HTTP/DB/ledger path by
+  // artifacts/api-server/src/routes/admin.auto-revoke.route.test.ts.
+  it("reports a single auto-revoked grant with singular wording and forwards the count to onSuccess", async () => {
+    const result = { transitioned: true, revoked_grants: 1 };
+    mockMutateAsync.mockResolvedValue(result);
+    const { onSuccess, onOpenChange } = renderModal("f6");
+
+    fireEvent.click(screen.getByText("Resolved"));
+
+    await waitFor(() => expect(mockToast).toHaveBeenCalled());
+    expect(mockToast.mock.calls[0][0].title).toBe("Finding marked resolved");
+    expect(mockToast.mock.calls[0][0].description).toBe(
+      "1 active emergency-access grant was automatically revoked.",
+    );
+    // The auto-revoke outcome is handed back to the caller (count > 0) and the
+    // modal closes itself on success.
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledWith(result));
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
   it("surfaces the already-in-state message when no transition occurs", async () => {

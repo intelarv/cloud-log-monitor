@@ -11,7 +11,8 @@ import {
   TRIAGE_AGENT_VERSION,
   triagePromptHash,
 } from "../prompts";
-import { getLlmRuntime, type LlmAgentRuntime } from "../llm-runtime";
+import { type LlmAgentRuntime } from "../llm-runtime";
+import { resolveLlmForDecisionPoint } from "../llm-decision-points";
 
 export const triageVerdictSchema = z.object({
   recommended_severity: z.enum(["low", "medium", "high", "critical"]),
@@ -70,13 +71,18 @@ Produce your JSON verdict per the system instructions.`;
 // decides retry policy.
 export async function runTriageAgent(
   finding: FindingSafe,
-  runtime: LlmAgentRuntime = getLlmRuntime(),
+  runtime?: LlmAgentRuntime,
 ): Promise<{ verdict: TriageVerdict; approxOutputTokens: number; modelId: string }> {
+  // Injected runtime (tests) wins and keeps the prompt-pinned model. With no
+  // injection, resolve this point's own provider/model (M17 per-decision-point).
+  const resolved = runtime
+    ? { runtime, modelId: TRIAGE_AGENT_MODEL }
+    : resolveLlmForDecisionPoint("triage", TRIAGE_AGENT_MODEL);
   const userPrompt = buildUserPrompt(finding);
-  const out = await runtime.generate({
+  const out = await resolved.runtime.generate({
     systemPrompt: TRIAGE_AGENT_SYSTEM_PROMPT,
     userPrompt,
-    modelId: TRIAGE_AGENT_MODEL,
+    modelId: resolved.modelId,
     temperature: 0.1,
     maxOutputTokens: 512,
   });

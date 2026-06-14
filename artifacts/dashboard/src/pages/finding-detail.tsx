@@ -5,18 +5,21 @@ import {
   useGetFindingRaw,
   useGetFindingHistory,
   useGetFindingReviewHistory,
+  useListBreakGlassGrants,
   getGetFindingQueryKey,
   getGetFindingHistoryQueryKey,
   getGetFindingReviewHistoryQueryKey,
+  getListBreakGlassGrantsQueryKey,
 } from "@workspace/api-client-react";
-import type { ReviewAttempt } from "@workspace/api-client-react";
+import type { ReviewAttempt, BreakGlassGrant } from "@workspace/api-client-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
 import { SeverityBadge, StatusBadge } from "../components/severity-badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, RefreshCw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle } from "lucide-react";
+import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, RefreshCw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle, X } from "lucide-react";
 import { safeTimestamp } from "../lib/format";
 import BreakGlassModal from "../components/break-glass-modal";
 import ResolveFindingModal from "../components/resolve-finding-modal";
@@ -30,8 +33,210 @@ import { ApiError } from "@workspace/api-client-react";
 // state (completed/failed/skipped) to avoid wasted requests.
 const REVIEW_POLL_INTERVAL_MS = 3000;
 
+// While the analyst has a break-glass grant on this finding that is still in
+// flight (awaiting a second-person approval) or currently active, poll their
+// grants so an approve/revoke performed *by someone else* (on the admin page)
+// surfaces here without a manual reload. Polling stops once the grant reaches a
+// terminal state (revoked / expired / none) — the live notice has already fired.
+const BREAK_GLASS_POLL_INTERVAL_MS = 5000;
+
 function isReviewActive(status: string | null | undefined): boolean {
   return status === "pending" || status === "in_progress";
+}
+
+export type GrantStatus = "pending" | "active" | "revoked" | "expired" | "none";
+
+// Reduce a grant row to the lifecycle state the analyst cares about. Revoked
+// takes precedence over expiry (an explicit cut-off), and a pending second
+// approval takes precedence over the active window it has not yet entered.
+export function grantStatus(grant: BreakGlassGrant | null | undefined): GrantStatus {
+  if (!grant) return "none";
+  if (grant.revoked_at) return "revoked";
+  if (grant.pending_approval) return "pending";
+  if (Date.parse(grant.expires_at) <= Date.now()) return "expired";
+  return "active";
+}
+
+// The only transitions worth a live notice: a pending grant becoming active
+// (someone approved it), or a pending/active grant being cut off (revoked or
+// expired). Everything else — initial observation, no change, re-grant — is
+// silent. Keeping this pure makes the notice logic unit-testable.
+export type GrantTransition = "approved" | "revoked" | "expired" | null;
+
+// One entry in the persistent, stacked access-change history. `id` is a stable
+// per-entry key/dismiss target (the same transition kind can recur, so the kind
+// alone is not unique); `notice` is the transition it represents.
+export type AccessChangeEntry = { id: number; notice: Exclude<GrantTransition, null> };
+
+export function grantTransition(prev: GrantStatus | null, next: GrantStatus): GrantTransition {
+  if (prev === null || prev === next) return null;
+  if (prev === "pending" && next === "active") return "approved";
+  if ((prev === "pending" || prev === "active") && next === "revoked") return "revoked";
+  if ((prev === "pending" || prev === "active") && next === "expired") return "expired";
+  return null;
+}
+
+// How close to auto-expiry the unlocked-evidence card switches from a calm
+// countdown to a "heads up, wrap up" warning. Exported so the threshold is a
+// single source of truth shared by the component and its tests.
+export const EXPIRY_WARNING_THRESHOLD_MS = 30_000;
+
+// Format a remaining-duration in milliseconds as `M:SS`, clamped at zero so a
+// just-lapsed grant never renders a negative timer. Pure, so the countdown math
+// is unit-testable without fake timers.
+export function formatRemaining(ms: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+// Unlocked raw-evidence panel. While a break-glass grant is active the analyst
+// otherwise only saw a static "Expires HH:mm:ss" timestamp; this drives a live,
+// once-per-second countdown of the time remaining on the grant and, in the final
+// EXPIRY_WARNING_THRESHOLD_MS before auto-expiry, surfaces a non-intrusive inline
+// notice so they can wrap up (or re-request) instead of being cut off mid-read.
+// A malformed expiry falls back to the absolute timestamp rather than a broken
+// timer. The grant itself still auto-expires server-side; this is display only.
+function UnlockedEvidence({ rawEvidence, onReRequest }: { rawEvidence: any; onReRequest?: () => void }) {
+  const expiryMs = React.useMemo(() => Date.parse(rawEvidence?.grant_expires_at), [rawEvidence?.grant_expires_at]);
+  const hasExpiry = !Number.isNaN(expiryMs);
+
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!hasExpiry) return;
+    setNow(Date.now());
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [hasExpiry, expiryMs]);
+
+  const remaining = hasExpiry ? expiryMs - now : null;
+  const expired = remaining !== null && remaining <= 0;
+  const expiring = remaining !== null && remaining > 0 && remaining <= EXPIRY_WARNING_THRESHOLD_MS;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20">
+          RAW PHI/PII UNLOCKED
+        </Badge>
+        {remaining === null ? (
+          <span className="text-xs text-muted-foreground">
+            Expires {safeTimestamp(rawEvidence.grant_expires_at, "HH:mm:ss")}
+          </span>
+        ) : (
+          <span
+            className={`text-xs font-mono tabular-nums ${
+              expiring || expired ? "text-destructive font-semibold" : "text-muted-foreground"
+            }`}
+            role="timer"
+            aria-live="off"
+          >
+            {expired ? "Access expired" : `Access expires in ${formatRemaining(remaining)}`}
+          </span>
+        )}
+      </div>
+      {expiring && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span className="flex-1">
+            Emergency access expires in {formatRemaining(remaining!)} — wrap up or re-request before raw evidence
+            re-locks.
+          </span>
+          {onReRequest && (
+            <Button
+              type="button"
+              size="sm"
+              variant="destructive"
+              className="h-7 shrink-0 px-2 text-xs"
+              onClick={onReRequest}
+            >
+              <KeyRound className="h-3.5 w-3.5 mr-1" /> Re-request access
+            </Button>
+          )}
+        </div>
+      )}
+      <pre className="p-4 bg-muted/50 rounded-md overflow-x-auto text-xs font-mono border border-destructive/20 text-foreground whitespace-pre-wrap">
+        {JSON.stringify(rawEvidence.raw_evidence, null, 2)}
+      </pre>
+    </div>
+  );
+}
+
+// Visual + copy config for the persistent access-change banner. Approved is a
+// positive (access-granted) state; revoked/expired are destructive (access cut
+// off) states and must be visually distinct from approval.
+const ACCESS_NOTICE_CONFIG: Record<
+  Exclude<GrantTransition, null>,
+  { title: string; description: string; Icon: typeof CheckCircle2; destructive: boolean }
+> = {
+  approved: {
+    title: "Break-glass access approved",
+    description:
+      "Your emergency access for this finding was just approved — raw evidence is now available.",
+    Icon: CheckCircle2,
+    destructive: false,
+  },
+  revoked: {
+    title: "Break-glass access revoked",
+    description:
+      "Your emergency access for this finding was cut off — raw evidence is no longer available.",
+    Icon: Ban,
+    destructive: true,
+  },
+  expired: {
+    title: "Break-glass access expired",
+    description:
+      "Your emergency access for this finding has expired — raw evidence is no longer available.",
+    Icon: Clock,
+    destructive: true,
+  },
+};
+
+// Persistent inline banner for an access change made by another analyst. It
+// stays on the page until explicitly dismissed (unlike the ~5s toast), so a
+// mid-investigation revocation/expiry can't be missed. Destructive states use
+// `role="alert"` (assertive) and the calm approval uses `role="status"`.
+export function AccessChangeBanner({
+  notice,
+  onDismiss,
+}: {
+  notice: Exclude<GrantTransition, null>;
+  onDismiss: () => void;
+}) {
+  const cfg = ACCESS_NOTICE_CONFIG[notice];
+  const { Icon } = cfg;
+  return (
+    <div
+      role={cfg.destructive ? "alert" : "status"}
+      data-testid="break-glass-access-banner"
+      data-variant={cfg.destructive ? "destructive" : "approved"}
+      className={`flex items-start gap-3 rounded-lg border px-4 py-3 ${
+        cfg.destructive
+          ? "border-destructive/40 bg-destructive/10 text-destructive"
+          : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+      }`}
+    >
+      <Icon className="h-5 w-5 shrink-0 mt-0.5" />
+      <div className="flex-1">
+        <h3 className="font-semibold leading-tight">{cfg.title}</h3>
+        <p className="text-sm mt-0.5 opacity-90">{cfg.description}</p>
+      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="h-7 w-7 shrink-0 hover:bg-transparent"
+        onClick={onDismiss}
+        aria-label="Dismiss break-glass access notice"
+      >
+        <X className="h-4 w-4" />
+      </Button>
+    </div>
+  );
 }
 
 export default function FindingDetail() {
@@ -53,6 +258,80 @@ export default function FindingDetail() {
   const [rawError, setRawError] = React.useState<ApiError | null>(null);
   const [isPendingApproval, setIsPendingApproval] = React.useState(false);
   const [grantId, setGrantId] = React.useState<string | null>(null);
+  // A persistent, stacked history of access changes made by another analyst.
+  // Unlike the transient toast (~5s), these banners stay on the finding-detail
+  // page until the analyst explicitly dismisses them, so a mid-investigation
+  // revocation can never scroll past or auto-dismiss before it is seen. During a
+  // busy two-analyst incident several transitions (e.g. approved → revoked →
+  // re-granted) can land in quick succession; each gets its own entry so a later
+  // transition never silently overwrites an earlier one the analyst hasn't read.
+  const [accessNotices, setAccessNotices] = React.useState<AccessChangeEntry[]>([]);
+  // Monotonic id source so each stacked entry has a stable React key + dismiss
+  // target, independent of its transition kind (the same kind can recur).
+  const accessNoticeIdRef = React.useRef(0);
+
+  const queryClient = useQueryClient();
+
+  // Keep the freshest grant in a ref so the polling predicate below (evaluated
+  // lazily by react-query) sees the current status without re-subscribing.
+  // Declared *before* useListBreakGlassGrants so the refetchInterval closure can
+  // safely read it on react-query's first synchronous evaluation — declaring it
+  // after the hook hit a temporal-dead-zone crash ("Cannot access
+  // 'latestGrantRef' before initialization") the moment the page mounted.
+  const latestGrantRef = React.useRef<BreakGlassGrant | null>(null);
+
+  // Poll the analyst's own break-glass grants while one for this finding is in
+  // flight (pending approval) or active, so a decision made elsewhere lands as a
+  // live notice. Stops polling once the grant is terminal to avoid wasted calls.
+  const { data: myGrants } = useListBreakGlassGrants({
+    query: {
+      queryKey: getListBreakGlassGrantsQueryKey(),
+      refetchInterval: () => {
+        const status = grantStatus(latestGrantRef.current);
+        return status === "pending" || status === "active" ? BREAK_GLASS_POLL_INTERVAL_MS : false;
+      },
+    },
+  });
+
+  const myGrant = React.useMemo<BreakGlassGrant | null>(
+    () => (myGrants ?? []).find((g) => g.finding_id === id) ?? null,
+    [myGrants, id],
+  );
+
+  latestGrantRef.current = myGrant;
+
+  // Detect approve/revoke transitions performed by another analyst and surface a
+  // persistent inline banner (see AccessChangeBanner). `prevStatusRef` starts
+  // unset so the first observed state never fires a notice — only genuine
+  // transitions do. A transient ~5s toast was easy to miss for a
+  // mid-investigation revocation, so the banner stays until acknowledged.
+  const prevStatusRef = React.useRef<GrantStatus | null>(null);
+  React.useEffect(() => {
+    if (!myGrant) return;
+    const status = grantStatus(myGrant);
+    const transition = grantTransition(prevStatusRef.current, status);
+    prevStatusRef.current = status;
+    if (!transition) return;
+
+    // Append the access change as its own persistent banner that stays until the
+    // analyst dismisses it, rather than a toast that auto-dismisses (~5s). Each
+    // transition stacks (newest first) so a rapid approve→revoke→re-grant burst
+    // never silently overwrites a notice the analyst hasn't acknowledged yet.
+    setAccessNotices((prev) => [{ id: accessNoticeIdRef.current++, notice: transition }, ...prev]);
+    if (transition === "approved") {
+      setIsPendingApproval(false);
+      void fetchRaw();
+    } else {
+      setRawEvidence(null);
+      setIsPendingApproval(false);
+      setGrantId(null);
+    }
+    // The decision propagated from another analyst: refresh the header + History
+    // timeline so they reflect the new state without a manual reload.
+    queryClient.invalidateQueries({ queryKey: getGetFindingQueryKey(id!) });
+    queryClient.invalidateQueries({ queryKey: getGetFindingHistoryQueryKey(id!) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myGrant]);
 
   const fetchRaw = async () => {
     try {
@@ -106,6 +385,32 @@ export default function FindingDetail() {
   return (
     <Layout>
       <div className="space-y-6">
+        {accessNotices.length > 0 && (
+          <div className="space-y-2">
+            {accessNotices.length > 1 && (
+              <div className="flex justify-end">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs text-muted-foreground"
+                  onClick={() => setAccessNotices([])}
+                >
+                  Dismiss all ({accessNotices.length})
+                </Button>
+              </div>
+            )}
+            {accessNotices.map((entry) => (
+              <AccessChangeBanner
+                key={entry.id}
+                notice={entry.notice}
+                onDismiss={() =>
+                  setAccessNotices((prev) => prev.filter((n) => n.id !== entry.id))
+                }
+              />
+            ))}
+          </div>
+        )}
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="icon" asChild>
             <Link href="/findings">
@@ -179,17 +484,7 @@ export default function FindingDetail() {
               </CardHeader>
               <CardContent className="space-y-4">
                 {rawEvidence ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20">
-                        RAW PHI/PII UNLOCKED
-                      </Badge>
-                      <span className="text-xs text-muted-foreground">Expires {safeTimestamp(rawEvidence.grant_expires_at, "HH:mm:ss")}</span>
-                    </div>
-                    <pre className="p-4 bg-muted/50 rounded-md overflow-x-auto text-xs font-mono border border-destructive/20 text-foreground whitespace-pre-wrap">
-                      {JSON.stringify(rawEvidence.raw_evidence, null, 2)}
-                    </pre>
-                  </div>
+                  <UnlockedEvidence rawEvidence={rawEvidence} onReRequest={() => setShowBreakGlass(true)} />
                 ) : (
                   <div className="space-y-2">
                     <Badge variant="outline" className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20">
@@ -284,6 +579,7 @@ export default function FindingDetail() {
           onOpenChange={setShowBreakGlass}
           findingId={finding.id}
           onSuccess={handleBreakGlassSuccess}
+          defaultJustification={myGrant?.justification}
         />
       )}
 

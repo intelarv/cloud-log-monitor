@@ -20,7 +20,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, RefreshCw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle, X } from "lucide-react";
-import { safeTimestamp } from "../lib/format";
+import { safeTimestamp, compactRelativeTime } from "../lib/format";
 import BreakGlassModal from "../components/break-glass-modal";
 import ResolveFindingModal from "../components/resolve-finding-modal";
 import ReopenFindingModal from "../components/reopen-finding-modal";
@@ -65,8 +65,11 @@ export type GrantTransition = "approved" | "revoked" | "expired" | null;
 
 // One entry in the persistent, stacked access-change history. `id` is a stable
 // per-entry key/dismiss target (the same transition kind can recur, so the kind
-// alone is not unique); `notice` is the transition it represents.
-export type AccessChangeEntry = { id: number; notice: Exclude<GrantTransition, null> };
+// alone is not unique); `notice` is the transition it represents; `at` is the
+// epoch-ms wall-clock time the transition was observed (captured on the
+// grant-poll transition) so each stacked entry can render a relative timestamp,
+// making the order of a rapid approve→revoke→re-grant burst unambiguous.
+export type AccessChangeEntry = { id: number; notice: Exclude<GrantTransition, null>; at: number };
 
 export function grantTransition(prev: GrantStatus | null, next: GrantStatus): GrantTransition {
   if (prev === null || prev === next) return null;
@@ -202,13 +205,26 @@ const ACCESS_NOTICE_CONFIG: Record<
 // `role="alert"` (assertive) and the calm approval uses `role="status"`.
 export function AccessChangeBanner({
   notice,
+  at,
   onDismiss,
 }: {
   notice: Exclude<GrantTransition, null>;
+  at: number;
   onDismiss: () => void;
 }) {
   const cfg = ACCESS_NOTICE_CONFIG[notice];
   const { Icon } = cfg;
+
+  // Re-render on a slow cadence so the captured-at time keeps reading correctly
+  // ("just now" → "1 min ago") while the persistent banner stays on screen,
+  // even after grant polling has stopped (terminal state) and nothing else
+  // would otherwise re-render the page.
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <div
       role={cfg.destructive ? "alert" : "status"}
@@ -224,6 +240,13 @@ export function AccessChangeBanner({
       <div className="flex-1">
         <h3 className="font-semibold leading-tight">{cfg.title}</h3>
         <p className="text-sm mt-0.5 opacity-90">{cfg.description}</p>
+        <p
+          className="text-xs mt-1 opacity-70"
+          data-testid="break-glass-access-time"
+          title={safeTimestamp(new Date(at).toISOString())}
+        >
+          {compactRelativeTime(at, now)}
+        </p>
       </div>
       <Button
         type="button"
@@ -317,7 +340,10 @@ export default function FindingDetail() {
     // analyst dismisses it, rather than a toast that auto-dismisses (~5s). Each
     // transition stacks (newest first) so a rapid approve→revoke→re-grant burst
     // never silently overwrites a notice the analyst hasn't acknowledged yet.
-    setAccessNotices((prev) => [{ id: accessNoticeIdRef.current++, notice: transition }, ...prev]);
+    setAccessNotices((prev) => [
+      { id: accessNoticeIdRef.current++, notice: transition, at: Date.now() },
+      ...prev,
+    ]);
     if (transition === "approved") {
       setIsPendingApproval(false);
       void fetchRaw();
@@ -404,6 +430,7 @@ export default function FindingDetail() {
               <AccessChangeBanner
                 key={entry.id}
                 notice={entry.notice}
+                at={entry.at}
                 onDismiss={() =>
                   setAccessNotices((prev) => prev.filter((n) => n.id !== entry.id))
                 }

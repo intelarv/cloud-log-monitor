@@ -2,9 +2,9 @@
 
 Cloud-agnostic agentic system that ingests cloud-provider logs, detects PHI/PII/secrets, maintains a tamper-evident audit ledger, and exposes a chat-over-audit dashboard for healthcare compliance analysts. See `docs/ARCHITECTURE.md`.
 
-Current milestone: **M15** (remediation proposal-inbox dashboard UI) on top of **M14** (HITL remediation/proposal plane + `structured_query` typed-filter tool) and **M12** (multi-tenant hardening), the M13 deterministic detector slices, the eval suite, pluggable lexical search + WORM raw-PHI store. M14 adds the agent-plane `structured_query` tool (Zod-validated typed filter through `findingSafeColumns` — never LLM SQL) and the human-in-the-loop remediation plane: the `propose_remediation` tool writes a PENDING `remediation_proposals` row + ledgers `remediation.proposed` and **never executes**; humans confirm (session + step-up, ledgers `remediation.confirmed`) or reject via `/api/admin/remediation/proposals`. A standing **"Implemented vs not" survey** now lives in `docs/MILESTONES.md`. The proposal-inbox dashboard UI is **built (M15)** — OpenAPI paths + generated hooks + a status-tabbed React page (`artifacts/dashboard/src/pages/remediation.tsx`) with step-up-gated confirm + reject. Deferred by design: an executing remediation worker (the plane stops at "confirmed"; code-touching steps stay operator/out-of-band). M12 status (verified against code): all four slices **done** — **M12.4** cross-tenant escalation guard (`cross-tenant-isolation.route.test.ts`); **M12.1** per-tenant KMS keys (`tenant_kms_keys` table + `lib/tenant-kms.ts` resolver seam, derived/external providers, per-tenant cookie signing); **M12.2** per-tenant pgvector partitioning (opt-in `EMBEDDINGS_TENANT_PARTITIONING` LIST-by-tenant with a catch-all DEFAULT partition); and **M12.3** per-tenant LLM budget isolation (supervisor budget keyed by `tenantId`). The cloud-KMS *provisioning + rotation* lifecycle (M12.1) remains operator/Terraform; the app-side seam is complete. All optional cloud/security seams (NER, A2A mTLS, cloud embedders, brokers, per-tenant KMS, per-tenant pgvector partitioning, etc.) are **default-inert** — they load no SDK and change no behavior unless their env/data is set, so the credential-free offline eval gate stays byte-identical.
+Current milestone: **M19** — chat agent semantic memory recall (opt-in `CHAT_MEMORY_SEMANTIC_RECALL`: replays the most-RELEVANT prior turns via pgvector cosine over per-message `chat_message_embeddings`, composed with the M18 recency window; offline embedder by default ⇒ credential-free; no new ledger events / no LLM call; off ⇒ byte-identical to M18). Built on the chat-memory line (M18 working memory + context-window management, M16 LLM consolidation summaries), per-decision-point LLM selection (M17), the HITL remediation plane + `structured_query` tool (M14) with its proposal-inbox dashboard UI (M15), multi-tenant hardening (M12), deterministic detector slices (M13), the eval suite, pluggable lexical search + WORM raw-PHI store. **Default-safe invariant:** every optional / cloud / security seam is default-inert (loads no SDK, changes no behavior unless its env/data is set), so the credential-free offline eval gate stays byte-identical.
 
-**Docs:** full per-milestone history (M0 → M15) + a standing "Implemented vs not" survey in `docs/MILESTONES.md`; architecture + implementation decisions in `docs/ARCHITECTURE.md`; optional env reference in `docs/CONFIGURATION.md`.
+**Docs:** full per-milestone history (M0 → M19) + a standing "Implemented vs not" survey in `docs/MILESTONES.md`; architecture + implementation decisions in `docs/ARCHITECTURE.md`; optional env reference in `docs/CONFIGURATION.md`.
 
 ## Run & Operate
 
@@ -16,29 +16,31 @@ Current milestone: **M15** (remediation proposal-inbox dashboard UI) on top of *
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL`, `SESSION_SECRET`. **Every optional subsystem — full env vars, defaults, credentials, and the cloud-aware embedder-selection table — is documented in `docs/CONFIGURATION.md` ("Optional env (by subsystem)").** All seams are **default-inert**: unset ⇒ no SDK loaded, no behavior change, eval gate byte-identical. Quick index of the switches (see CONFIGURATION.md for each):
+- Required env: `DATABASE_URL`, `SESSION_SECRET`. **Every optional subsystem — full env vars, defaults, credentials, and the cloud-aware embedder-selection table — is documented in `docs/CONFIGURATION.md` ("Optional env (by subsystem)").** All seams are **default-inert**: unset ⇒ no SDK loaded, no behavior change, eval gate byte-identical. Quick index of the switch *names* below (full prose, defaults, and credentials per switch in `docs/CONFIGURATION.md`):
   - Embedder — `EMBEDDING_PROVIDER` / `DEPLOYMENT_TARGET` / `EMBEDDING_DIM`.
-  - Per-tenant pgvector partitioning (M12.2) — `EMBEDDINGS_TENANT_PARTITIONING` (switch; off ⇒ single `finding_embeddings` table identical to pre-M12.2, on ⇒ LIST-by-tenant with a catch-all DEFAULT partition + opt-in per-tenant partitions).
-  - Per-tenant KMS keys (M12.1) — data-driven via the `tenant_kms_keys` table (no env switch); empty table ⇒ global `SESSION_SECRET` fallback, byte-identical to pre-M12.1.
-  - Lexical search (M10.1) — `SEARCH_PROVIDER=postgres|opensearch`; opt-in per-tenant index isolation `OPENSEARCH_PER_TENANT_INDEX` (off ⇒ single shared index + `tenant_id` filter, byte-identical; on ⇒ each tenant gets a physically separate index `${prefix}-${safeTenantSegment(tenantId)}`, term filter kept as defense-in-depth). Full external-index rebuild is batched + resumable: `SEARCH_REINDEX_BATCH_SIZE` (page size, default 500, clamped 1..10000) drives both the boot reconcile and the on-demand operator command (`pnpm --filter @workspace/api-server run reindex:search` — supports `--batch-size=N` and a composite `--since-tenant=<tenantId> --since-id=<findingId>` resume token (both required together — tenants are scanned in tenant_id order, so a bare id is ambiguous); no-op for Postgres).
-  - Raw-evidence store (M10.2/M10.3) — `RAW_EVIDENCE_PROVIDER=database|s3|gcs|azure-blob`.
-  - Raw-evidence tiering (M10.4) — `RAW_EVIDENCE_TIER_AGE_DAYS` (switch) / `_INTERVAL_MS` / `_BATCH_SIZE`.
-  - Raw-evidence write retry — `RAW_EVIDENCE_WRITE_MAX_ATTEMPTS` / `RAW_EVIDENCE_WRITE_BACKOFF_MS` (bounded retry+backoff before the WORM write is declared degraded; default-inert without an external store).
-  - Memory eviction (M10.5) — `MEMORY_MAX_EMBEDDINGS_PER_TENANT` (switch) / `MEMORY_DECAY_HALF_LIFE_DAYS` / `MEMORY_EVICT_INTERVAL_MS`.
-  - LLM consolidation summaries (M16) — `MEMORY_CONSOLIDATION_SUMMARY` (switch; the **one memory feature that calls an LLM**, off ⇒ byte-identical) / `MEMORY_SUMMARY_MAX_GROUPS_PER_RUN` / `MEMORY_SUMMARY_MAX_MEMBERS_SAMPLED` / `MEMORY_SUMMARY_MODEL`: writes a natural-language summary per consolidated group into `memory_consolidation_summaries` (redacted-only input + `scanForPhi` output guard), riding the same leader-locked memory job.
+  - Per-tenant pgvector partitioning (M12.2) — `EMBEDDINGS_TENANT_PARTITIONING`.
+  - Per-tenant KMS keys (M12.1) — data-driven via the `tenant_kms_keys` table (no env switch; empty ⇒ global `SESSION_SECRET`).
+  - Lexical search (M10.1) — `SEARCH_PROVIDER` / `OPENSEARCH_PER_TENANT_INDEX` / `SEARCH_REINDEX_BATCH_SIZE` (+ `reindex:search` operator command).
+  - Raw-evidence store (M10.2/M10.3) — `RAW_EVIDENCE_PROVIDER`.
+  - Raw-evidence tiering (M10.4) — `RAW_EVIDENCE_TIER_AGE_DAYS` / `_INTERVAL_MS` / `_BATCH_SIZE`.
+  - Raw-evidence write retry — `RAW_EVIDENCE_WRITE_MAX_ATTEMPTS` / `RAW_EVIDENCE_WRITE_BACKOFF_MS`.
+  - Memory eviction (M10.5) — `MEMORY_MAX_EMBEDDINGS_PER_TENANT` / `MEMORY_DECAY_HALF_LIFE_DAYS` / `MEMORY_EVICT_INTERVAL_MS`.
+  - LLM consolidation summaries (M16) — `MEMORY_CONSOLIDATION_SUMMARY` / `_MAX_GROUPS_PER_RUN` / `_MAX_MEMBERS_SAMPLED` / `MEMORY_SUMMARY_MODEL` (the one memory feature that calls an LLM).
   - Agent/LLM harness limits — `LLM_CALL_TIMEOUT_MS` / `TOOL_CALL_TIMEOUT_MS` / `AGENT_MAX_TOOL_CALLS` / `AGENT_MAX_OUTPUT_TOKENS_PER_TURN` / `AGENT_MAX_LLM_RETRIES` / `AGENT_LLM_RETRY_DELAY_MS` / `AGENT_MAX_TOOL_RESULT_BYTES`.
-  - Per-decision-point LLM selection (M17) — `LLM_<CHAT|TRIAGE|VERIFIER|SUMMARY>_<PROVIDER|MODEL|AWS_REGION|GCP_PROJECT_ID|GCP_LOCATION|AZURE_OPENAI_*>` overlay the matching global LLM keys for one decision point only (chat agent / Triage / Verifier / memory summarizer), so each point can run a **fully different provider+model** (e.g. verifier→Bedrock Claude, chat→Gemini). Unset for a point ⇒ it uses the global `getLlmRuntime()` + prompt-pinned model, byte-identical. `summary` keeps the M16 `MEMORY_SUMMARY_MODEL` alias. Static per-point selection only — the input-based LLM **router** is a deferred future milestone. Resolver: `lib/llm-decision-points.ts`.
+  - Chat working memory (M18) — `CHAT_MEMORY_TOKEN_BUDGET` / `CHAT_MEMORY_MAX_TURNS` / `CHAT_MEMORY_SUMMARY` / `_SUMMARY_MAX_MESSAGES` / `_SUMMARY_MODEL`.
+  - Chat semantic recall (M19) — `CHAT_MEMORY_SEMANTIC_RECALL` / `_K` / `_RECENCY_TAIL`.
+  - Per-decision-point LLM selection (M17) — `LLM_<CHAT|TRIAGE|VERIFIER|SUMMARY>_<PROVIDER|MODEL|AWS_REGION|GCP_PROJECT_ID|GCP_LOCATION|AZURE_OPENAI_*>` (resolver: `lib/llm-decision-points.ts`).
   - Step-up auth — `STEP_UP_DEV_TOKEN` (dev only).
   - Notarization — `NOTARIZATION_SECRET` / `NOTARIZATION_RETIRED_KEYS` (separate trust zone).
   - Channel adapters (M6) — `CHANNEL_*` (Slack / HMAC webhook / PagerDuty).
   - NER detector (M13.3) — `NER_PROVIDER=none|aws-comprehend|gcp-dlp|azure-language`.
   - Cloud LLM runtime — `LLM_PROVIDER=bedrock|vertex|azure-openai`.
   - A2A cross-cloud mTLS + peer ABAC — `A2A_REQUIRE_MTLS` / `A2A_MTLS_*`.
-  - Cloud log source (M8 / M8.1) — `LOG_SOURCE=cloudwatch|cloud_logging|azure_monitor` (unified dispatcher; all three share the `PollingLogSource` loop, lazy SDKs). CloudWatch gained opt-in `CLOUDWATCH_MAX_CONCURRENT_GROUPS` (default 1 = byte-identical).
-  - Stuck-cursor reaper (M8.1) — `INGEST_SOURCE_STALL_AFTER_MS` (switch) / `INGEST_SOURCE_STALL_CHECK_INTERVAL_MS`: leader-locked edge-triggered scan of `log_source_checkpoints` ⇒ warning-level `ingest.source_stalled`.
-  - Ingest dead-letter queue (M8.1) — `INGEST_DEAD_LETTER_ENABLED` (switch) / `INGEST_DLQ_MAX_ATTEMPTS` / `INGEST_DLQ_BACKOFF_MS`: bounded retry+backoff, on terminal failure persists a metadata-only `ingest_dead_letter` marker + ledgers `ingest.dead_lettered` + ACKs (off ⇒ rethrow, byte-identical).
+  - Cloud log source (M8/M8.1) — `LOG_SOURCE=cloudwatch|cloud_logging|azure_monitor` / `CLOUDWATCH_MAX_CONCURRENT_GROUPS`.
+  - Stuck-cursor reaper (M8.1) — `INGEST_SOURCE_STALL_AFTER_MS` / `INGEST_SOURCE_STALL_CHECK_INTERVAL_MS`.
+  - Ingest dead-letter queue (M8.1) — `INGEST_DEAD_LETTER_ENABLED` / `INGEST_DLQ_MAX_ATTEMPTS` / `INGEST_DLQ_BACKOFF_MS`.
   - Event-bus transport — `LOG_BUS_PROVIDER=memory|kafka|nats`.
-  - Supervisor orchestration engine — `WORKFLOW_ENGINE=inprocess|temporal` (default `inprocess` = in-memory queue + CAS, byte-identical; `temporal` opt-in needs `TEMPORAL_ADDRESS` [+ `TEMPORAL_NAMESPACE`/`TEMPORAL_TASK_QUEUE`/`TEMPORAL_TLS`/`TEMPORAL_API_KEY`/`TEMPORAL_WORKFLOWS_PATH`], lazy `@temporalio/*` SDK, durable replay + workflow-id idempotency on top of the DB CAS; boot fails fast if selected without an address; cluster stays operator-provided).
+  - Supervisor orchestration engine — `WORKFLOW_ENGINE=inprocess|temporal` (+ `TEMPORAL_*` when `temporal`).
 
 ## Stack
 
@@ -89,7 +91,7 @@ Moved to `docs/ARCHITECTURE.md` **Appendix A — Implementation decisions log** 
 
 ## Product
 
-- Auth (session cookies), per-tenant chat sessions, AG-UI SSE chat over findings.
+- Auth (session cookies), per-tenant chat sessions, AG-UI SSE chat over findings. Chat agent has working memory (M18): each turn replays the session's persisted conversation into the LLM via a token+turn-budgeted sliding window, with an opt-in (`CHAT_MEMORY_SUMMARY`) rolling per-session summary for context that overflows the window (PHI-rescanned, ledgered counts-only). Opt-in **semantic recall (M19, `CHAT_MEMORY_SEMANTIC_RECALL`)** upgrades that window from most-recent to most-RELEVANT: per-message embeddings (`chat_message_embeddings`, pgvector cosine) retrieve the top-K prior turns ∪ a recency tail, under the same budgets, falling back to the recency window on any failure (offline embedder ⇒ credential-free; no LLM call, no new ledger events).
 - Findings browse + single-finding read, all RLS-scoped, raw evidence excluded by safe projection.
 - Hybrid search exposed to the chat agent as a tool; agents cite findings as `[F:<id>]`.
 - `structured_query` agent tool: a Zod-validated **typed filter** (classification/severity/status/source[]/limit) resolved through `findingSafeColumns` — the agent plane never emits SQL (threat_model §EoP "no raw SQL from LLMs").

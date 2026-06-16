@@ -147,6 +147,46 @@ ALTER TABLE finding_embeddings_default ENABLE ROW LEVEL SECURITY;
 ALTER TABLE finding_embeddings_default FORCE ROW LEVEL SECURITY;`;
 }
 
+// M19 (opt-in CHAT_MEMORY_SEMANTIC_RECALL): per-chat-message embeddings for
+// semantic recall over a session's conversation. One row per chat message,
+// tenant- and session-scoped, RLS-isolated like the parent table. The embedded
+// text (chat_messages.content) is already PHI-safe — user input is refused and
+// assistant output is scanned before persistence (see routes/chat.ts) — and the
+// embedder is PHI-guarded (PhiGuardEmbedder), so no raw PHI reaches this tier.
+// Default-inert: the table is created but only written/read when the switch is
+// on; off ⇒ byte-identical to M18. Vector dim matches EMBEDDING_DIM (same as
+// finding_embeddings). LIST-by-tenant partitioning is deferred (chat embeddings
+// are session-scoped and TTL-able); the single-table layout matches M18 posture.
+function chatEmbeddingsDdl(dim: number): string {
+  return `CREATE TABLE IF NOT EXISTS chat_message_embeddings (
+  message_id text PRIMARY KEY REFERENCES chat_messages(id) ON DELETE CASCADE,
+  session_id text NOT NULL,
+  tenant_id text NOT NULL,
+  embedding vector(${dim}) NOT NULL,
+  embedder_version text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS chat_message_embeddings_session_idx
+  ON chat_message_embeddings (tenant_id, session_id);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'chat_message_embeddings_vec_idx'
+  ) THEN
+    EXECUTE 'CREATE INDEX chat_message_embeddings_vec_idx ON chat_message_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10)';
+  END IF;
+END $$;
+
+ALTER TABLE chat_message_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_message_embeddings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON chat_message_embeddings;
+CREATE POLICY tenant_isolation ON chat_message_embeddings
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));`;
+}
+
 export function buildSetupSql(opts: SetupSqlOptions = {}): string {
   const dim = opts.embeddingDim ?? DEFAULT_EMBEDDING_DIM;
   if (!Number.isInteger(dim) || dim <= 0 || dim > 16000) {
@@ -323,6 +363,17 @@ CREATE TABLE IF NOT EXISTS memory_consolidation_summaries (
 CREATE UNIQUE INDEX IF NOT EXISTS memory_summary_tenant_group_idx
   ON memory_consolidation_summaries (tenant_id, group_key);
 
+-- Chat working-memory rolling summary (opt-in CHAT_MEMORY_SUMMARY). Added
+-- idempotently so a DB seeded before this milestone upgrades cleanly; existing
+-- sessions default to no summary (memory_summary NULL, covered_count 0), which
+-- preserves the prior sliding-window-only behavior. See chat-memory.ts.
+ALTER TABLE chat_sessions
+  ADD COLUMN IF NOT EXISTS memory_summary text;
+ALTER TABLE chat_sessions
+  ADD COLUMN IF NOT EXISTS memory_summary_covered_count integer NOT NULL DEFAULT 0;
+ALTER TABLE chat_sessions
+  ADD COLUMN IF NOT EXISTS memory_summary_model text;
+
 DO $$
 DECLARE
   t text;
@@ -360,6 +411,8 @@ CREATE INDEX IF NOT EXISTS findings_search_tsv_idx
   ON findings USING GIN (search_tsv);
 
 ${embeddingsBlock}
+
+${chatEmbeddingsDdl(dim)}
 
 CREATE OR REPLACE VIEW findings_redacted AS
 SELECT

@@ -31,3 +31,25 @@ export function safeRelativeTime(ts: unknown): string {
   const d = parse(ts);
   return d ? formatDistanceToNow(d, { addSuffix: true }) : PLACEHOLDER;
 }
+
+// Compact relative timestamp for tight, repeated inline labels (e.g. the stacked
+// break-glass access-change banners) where the verbose date-fns phrasing ("less
+// than a minute ago") is too long. Accepts either an epoch-ms number (how the
+// banner captures its transition time) or an ISO string. Returns "just now",
+// "12 sec ago", "2 min ago", "3 hr ago", "1 day ago". `now` is injectable so the
+// formatting is pure and unit-testable without faking the clock; a future
+// timestamp (clock skew) clamps to "just now" rather than rendering a negative
+// duration. Degrades to the shared placeholder on a malformed value.
+export function compactRelativeTime(ts: unknown, now: number = Date.now()): string {
+  const ms = typeof ts === "number" ? ts : parse(ts)?.getTime();
+  if (ms === undefined || Number.isNaN(ms)) return PLACEHOLDER;
+  const diffSec = Math.round((now - ms) / 1000);
+  if (diffSec < 5) return "just now";
+  if (diffSec < 60) return `${diffSec} sec ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} min ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} hr ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay} day${diffDay === 1 ? "" : "s"} ago`;
+}

@@ -18,6 +18,21 @@ import { SseStream } from "../lib/sse";
 import { appendLedger } from "../lib/ledger";
 import { runChatTurn } from "../lib/chat-agent";
 import { scanForPhi, SAFE_REFUSAL } from "../lib/redact";
+import {
+  getChatMemoryConfigFromEnv,
+  selectWindow,
+  assembleRecallWindow,
+  toHistoryTurns,
+  summarizeChatOverflow,
+  type StoredChatMessage,
+  type RecallCandidate,
+} from "../lib/chat-memory";
+import {
+  embedAndStoreChatMessage,
+  semanticRecallMessageIds,
+} from "../lib/chat-recall";
+import { resolveLlmForDecisionPoint } from "../lib/llm-decision-points";
+import { CHAT_AGENT_MODEL } from "../lib/prompts";
 
 const router: IRouter = Router();
 
@@ -200,6 +215,194 @@ router.post(
       return;
     }
 
+    // ---- Working memory: token-budgeted sliding window (+ optional rolling
+    // summary) over the persisted conversation. Built BEFORE the new user
+    // message is inserted so the current question is not double-counted.
+    // chat_messages content is already PHI-safe (input refused / output scanned
+    // before persistence), so replaying it introduces no new raw PHI.
+    const memCfg = getChatMemoryConfigFromEnv();
+    // Loaded with ids (chronological) so semantic recall can dedupe + look up
+    // similarity hits; the recency window/summary only needs {role, content}.
+    const priorCandidates = await withTenant(tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          id: chatMessagesTable.id,
+          role: chatMessagesTable.role,
+          content: chatMessagesTable.content,
+        })
+        .from(chatMessagesTable)
+        .where(
+          and(
+            eq(chatMessagesTable.sessionId, sessionId),
+            eq(chatMessagesTable.tenantId, tenantId),
+          ),
+        )
+        .orderBy(asc(chatMessagesTable.createdAt))
+        .limit(500);
+      return rows
+        .filter((r) => r.role === "user" || r.role === "assistant")
+        .map((r) => ({
+          id: r.id,
+          role: r.role as "user" | "assistant",
+          content: r.content,
+        })) satisfies RecallCandidate[];
+    });
+    const priorMessages: StoredChatMessage[] = priorCandidates.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+
+    // The recency window + its overflow drive the M18 rolling summary (kept
+    // byte-identical so the monotonic coveredCount invariant holds). Semantic
+    // recall only swaps the REPLAYED window below — the two are orthogonal.
+    const { window, overflow } = selectWindow(priorMessages, memCfg);
+
+    // M19: when CHAT_MEMORY_SEMANTIC_RECALL is on, replay the most-RELEVANT
+    // prior turns (pgvector cosine over per-message embeddings) ∪ a recency
+    // tail, instead of pure recency. Best-effort: any failure (or no embeddings
+    // yet) falls back to the recency window so a turn never breaks.
+    let replayWindow = window;
+    if (memCfg.semanticRecallEnabled && priorCandidates.length > 0) {
+      try {
+        const relevantIds = await semanticRecallMessageIds({
+          tenantId,
+          sessionId,
+          query: parsed.data.content,
+          k: memCfg.semanticRecallK,
+        });
+        if (relevantIds.length > 0) {
+          replayWindow = assembleRecallWindow(
+            priorCandidates,
+            relevantIds,
+            memCfg,
+          ).window;
+        }
+      } catch (err) {
+        req.log.error(
+          { err_name: err instanceof Error ? err.name : "unknown" },
+          "chat semantic recall failed; falling back to recency window",
+        );
+      }
+    }
+
+    // Rolling summary (opt-in CHAT_MEMORY_SUMMARY). Fold any overflow not yet
+    // represented by the stored summary into an updated summary, re-scan it for
+    // PHI, persist, and ledger (counts + model only). Best-effort: any failure
+    // keeps the prior summary and never breaks the turn.
+    let summaryForPrompt: string | null = null;
+    if (memCfg.summaryEnabled) {
+      summaryForPrompt = session.memorySummary ?? null;
+      // Snapshot the persisted coverage so the write below can compare-and-swap
+      // against it — two turns racing on the same session must not roll the
+      // counter back or clobber each other's summary.
+      const storedCovered = session.memorySummaryCoveredCount ?? 0;
+      const covered = Math.min(storedCovered, overflow.length);
+      const newOverflow = overflow.slice(
+        covered,
+        covered + memCfg.summaryMaxMessages,
+      );
+      if (newOverflow.length > 0) {
+        const { runtime, modelId } = resolveLlmForDecisionPoint(
+          "chat",
+          memCfg.summaryModel ?? CHAT_AGENT_MODEL,
+        );
+        try {
+          const gen = await summarizeChatOverflow({
+            runtime,
+            modelId,
+            priorSummary: summaryForPrompt,
+            newMessages: newOverflow,
+          });
+          // Defense-in-depth: re-scan the model output before it is persisted or
+          // used. Any hit keeps the prior summary and is ledgered (reason only).
+          if (gen.text !== "" && scanForPhi(gen.text).length === 0) {
+            // covered >= storedCovered is impossible to regress here: covered is
+            // min(storedCovered, overflow.length) and newOverflow is non-empty
+            // only when storedCovered <= overflow.length, so newCovered grows.
+            const newCovered = covered + newOverflow.length;
+            // Optimistic CAS on the snapshotted coverage: the update applies
+            // only if no concurrent turn advanced the counter in the meantime.
+            const updated = await withTenant(tenantId, async (tx) =>
+              tx
+                .update(chatSessionsTable)
+                .set({
+                  memorySummary: gen.text,
+                  memorySummaryCoveredCount: newCovered,
+                  memorySummaryModel: gen.modelId,
+                })
+                .where(
+                  and(
+                    eq(chatSessionsTable.id, sessionId),
+                    eq(chatSessionsTable.tenantId, tenantId),
+                    eq(
+                      chatSessionsTable.memorySummaryCoveredCount,
+                      storedCovered,
+                    ),
+                  ),
+                )
+                .returning({ id: chatSessionsTable.id }),
+            );
+            if (updated.length === 0) {
+              // A concurrent turn already advanced the rolling summary. Keep the
+              // prior summary for this turn's prompt (best-effort) and skip the
+              // ledger write — nothing was persisted, so there is nothing to
+              // attribute and re-folding happens on a later turn if needed.
+              req.log.info(
+                { session_id: sessionId },
+                "chat memory summary skipped: concurrent update won the CAS",
+              );
+            } else {
+              summaryForPrompt = gen.text;
+              await appendLedger({
+                tenantId,
+                actor: { kind: "system", id: "chat_memory" },
+                eventType: "chat.memory_summarized",
+                subjectType: "chat_session",
+                subjectId: sessionId,
+                // Counts + model only — never message text, summary text, or PHI.
+                payload: {
+                  session_id: sessionId,
+                  folded: newOverflow.length,
+                  covered: newCovered,
+                  model_id: gen.modelId,
+                },
+              });
+            }
+          } else {
+            await appendLedger({
+              tenantId,
+              actor: { kind: "system", id: "chat_memory" },
+              eventType: "chat.memory_summary_failed",
+              subjectType: "chat_session",
+              subjectId: sessionId,
+              payload: {
+                session_id: sessionId,
+                error: gen.text === "" ? "empty_output" : "phi_in_output",
+              },
+            });
+          }
+        } catch (err) {
+          req.log.error(
+            { err_name: err instanceof Error ? err.name : "unknown" },
+            "chat memory summarization failed; keeping prior summary",
+          );
+          await appendLedger({
+            tenantId,
+            actor: { kind: "system", id: "chat_memory" },
+            eventType: "chat.memory_summary_failed",
+            subjectType: "chat_session",
+            subjectId: sessionId,
+            payload: {
+              session_id: sessionId,
+              error: err instanceof Error ? err.name : "unknown",
+            },
+          });
+        }
+      }
+    }
+
+    const priorHistory = toHistoryTurns(replayWindow, summaryForPrompt);
+
     // Open SSE stream.
     const sse = new SseStream(res);
     const runId = `run_${randomUUID()}`;
@@ -220,6 +423,25 @@ router.post(
       }),
     );
     sse.userMessage(userMessageId, parsed.data.content);
+
+    // M19: embed the user message for future semantic recall (opt-in). The
+    // content is already PHI-safe and the embedder is PhiGuard-wrapped.
+    // Best-effort — never break the turn if embedding/storage fails.
+    if (memCfg.semanticRecallEnabled) {
+      try {
+        await embedAndStoreChatMessage({
+          tenantId,
+          sessionId,
+          messageId: userMessageId,
+          content: parsed.data.content,
+        });
+      } catch (err) {
+        req.log.error(
+          { err_name: err instanceof Error ? err.name : "unknown" },
+          "chat recall: failed to embed user message",
+        );
+      }
+    }
 
     const contentHash = createHash("sha256")
       .update(parsed.data.content)
@@ -251,6 +473,8 @@ router.post(
         tenantId,
         userId,
         userQuestion: parsed.data.content,
+        // Working memory: replay the token-budgeted window (+ rolling summary).
+        priorHistory,
         // IMPORTANT: do NOT forward token deltas to SSE here. PHI in agent
         // output must be detected and replaced BEFORE anything reaches the
         // client. We accumulate the full response inside runChatTurn, run
@@ -350,6 +574,25 @@ router.post(
         agentIdentity: result.agent_identity,
       }),
     );
+
+    // M19: embed the assistant message for future semantic recall (opt-in).
+    // finalText is post-PHI-scan (SAFE_REFUSAL if a hit was found) and the
+    // embedder is PhiGuard-wrapped. Best-effort — never break the turn.
+    if (memCfg.semanticRecallEnabled) {
+      try {
+        await embedAndStoreChatMessage({
+          tenantId,
+          sessionId,
+          messageId: agentMessageId,
+          content: finalText,
+        });
+      } catch (err) {
+        req.log.error(
+          { err_name: err instanceof Error ? err.name : "unknown" },
+          "chat recall: failed to embed assistant message",
+        );
+      }
+    }
 
     // Output was buffered in runChatTurn (no token deltas sent). Emit the
     // post-scan final text as a single AG-UI text message (START→CONTENT→END)

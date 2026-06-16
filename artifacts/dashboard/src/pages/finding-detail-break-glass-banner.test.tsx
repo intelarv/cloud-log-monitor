@@ -43,6 +43,7 @@ vi.mock("wouter", async (importOriginal) => {
 });
 
 import FindingDetail, { AccessChangeBanner } from "./finding-detail";
+import { safeTimestamp } from "../lib/format";
 import type { BreakGlassGrant } from "@workspace/api-client-react";
 
 function grant(overrides: Partial<BreakGlassGrant>): BreakGlassGrant {
@@ -111,7 +112,7 @@ afterEach(() => {
 
 describe("AccessChangeBanner", () => {
   it("renders approved as a non-destructive status banner", () => {
-    render(<AccessChangeBanner notice="approved" onDismiss={() => {}} />);
+    render(<AccessChangeBanner notice="approved" at={Date.now()} onDismiss={() => {}} />);
     const banner = screen.getByTestId("break-glass-access-banner");
     expect(banner).toHaveAttribute("data-variant", "approved");
     expect(banner).toHaveAttribute("role", "status");
@@ -119,16 +120,47 @@ describe("AccessChangeBanner", () => {
   });
 
   it("renders revoked and expired as destructive alert banners", () => {
-    const { rerender } = render(<AccessChangeBanner notice="revoked" onDismiss={() => {}} />);
+    const { rerender } = render(
+      <AccessChangeBanner notice="revoked" at={Date.now()} onDismiss={() => {}} />,
+    );
     let banner = screen.getByTestId("break-glass-access-banner");
     expect(banner).toHaveAttribute("data-variant", "destructive");
     expect(banner).toHaveAttribute("role", "alert");
     expect(within(banner).getByText("Break-glass access revoked")).toBeInTheDocument();
 
-    rerender(<AccessChangeBanner notice="expired" onDismiss={() => {}} />);
+    rerender(<AccessChangeBanner notice="expired" at={Date.now()} onDismiss={() => {}} />);
     banner = screen.getByTestId("break-glass-access-banner");
     expect(banner).toHaveAttribute("data-variant", "destructive");
     expect(within(banner).getByText("Break-glass access expired")).toBeInTheDocument();
+  });
+
+  it("renders a compact relative timestamp of when the transition was observed", () => {
+    render(
+      <AccessChangeBanner
+        notice="approved"
+        at={Date.now() - 2 * 60_000}
+        onDismiss={() => {}}
+      />,
+    );
+    const banner = screen.getByTestId("break-glass-access-banner");
+    expect(within(banner).getByTestId("break-glass-access-time")).toHaveTextContent("2 min ago");
+  });
+
+  it("renders a freshly-captured transition as 'just now'", () => {
+    render(<AccessChangeBanner notice="revoked" at={Date.now()} onDismiss={() => {}} />);
+    const banner = screen.getByTestId("break-glass-access-banner");
+    expect(within(banner).getByTestId("break-glass-access-time")).toHaveTextContent("just now");
+  });
+
+  it("exposes the exact wall-clock timestamp as a hover tooltip on the relative time", () => {
+    const at = new Date("2026-06-14T12:00:05.000Z").getTime();
+    const expected = safeTimestamp(new Date(at).toISOString());
+    render(<AccessChangeBanner notice="approved" at={at} onDismiss={() => {}} />);
+    const banner = screen.getByTestId("break-glass-access-banner");
+    const time = within(banner).getByTestId("break-glass-access-time");
+    // Must be a real formatted wall-clock time, not the "unknown time" placeholder.
+    expect(expected).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    expect(time).toHaveAttribute("title", expected);
   });
 });
 
@@ -215,6 +247,11 @@ describe("FindingDetail persistent access-change banner", () => {
     // Newest first: the revoke (destructive) is stacked above the approval.
     expect(banners[0]).toHaveAttribute("data-variant", "destructive");
     expect(banners[1]).toHaveAttribute("data-variant", "approved");
+
+    // Each stacked entry carries its own captured-at relative timestamp so the
+    // order of the burst is unambiguous without opening the History timeline.
+    expect(within(banners[0]).getByTestId("break-glass-access-time")).toBeInTheDocument();
+    expect(within(banners[1]).getByTestId("break-glass-access-time")).toBeInTheDocument();
   });
 
   it("dismisses one stacked entry individually without affecting the others", async () => {

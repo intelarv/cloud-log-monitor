@@ -267,6 +267,11 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // through the ledger.
   "chat.user_turn",
   "chat.agent_turn",
+  // Chat working-memory rolling-summary events. Routine + best-effort: a
+  // summary refresh is normal, and a failure just keeps the prior summary for
+  // that turn (no data loss, no PHI leak), so neither pages on-call.
+  "chat.memory_summarized",
+  "chat.memory_summary_failed",
   // Successful step-up — legitimate by definition. (No `auth.login_success`
   // event today — login routes log but don't ledger; if that changes, the
   // §25.4 coverage test will require a decision.)

@@ -137,6 +137,11 @@ export interface RunChatTurnOpts {
     result?: unknown;
     error?: string;
   }) => void;
+  /** Working-memory: prior conversation turns (oldest first) to replay before
+   *  this turn's question. Built by the route from the token-budgeted sliding
+   *  window (+ optional rolling summary) in chat-memory.ts. Omit/empty for a
+   *  fresh session — then the loop is byte-identical to the stateless path. */
+  priorHistory?: LlmHistoryTurn[];
 }
 
 /** A tool executor bound to a tenant/user/agent context. Injected so the loop
@@ -465,8 +470,12 @@ Respond per the system instructions.`;
 
   // Multi-turn conversation: `history` accumulates prior turns (model
   // responses + tool-result user messages); `nextUserPrompt` is the last
-  // user message that the runtime should respond to.
-  const history: LlmHistoryTurn[] = [];
+  // user message that the runtime should respond to. Seed it with the
+  // working-memory window (prior conversation turns) when the route supplied
+  // one; empty for a fresh session ⇒ byte-identical to the stateless path.
+  const history: LlmHistoryTurn[] = opts.priorHistory
+    ? [...opts.priorHistory]
+    : [];
   let nextUserPrompt = initialPrompt;
 
   const toolCalls: ChatTurnResult["tool_calls"] = [];

@@ -159,6 +159,28 @@ describe("runAgentLoop", () => {
     expect(res.degraded).toBe(false);
   });
 
+  it("seeds the loop's history with priorHistory (working memory)", async () => {
+    let seenHistory: ReadonlyArray<{ role: string; text: string }> = [];
+    const runtime: LlmAgentRuntime = {
+      async generate(opts: LlmGenerateOpts): Promise<LlmGenerateResult> {
+        seenHistory = opts.history ?? [];
+        return { text: "Recalling earlier, see [F:F-1].", approxOutputTokens: 4, modelId: opts.modelId };
+      },
+    };
+    const priorHistory = [
+      { role: "user" as const, text: "what tenants are affected?" },
+      { role: "model" as const, text: "Tenant t_test, see [F:F-1]." },
+    ];
+    const res = await runAgentLoop(
+      { ...baseOpts(), priorHistory },
+      FINDINGS,
+      { runtime, callTool: okTool },
+    );
+    // The replayed turns precede this turn's question in the model's history.
+    expect(seenHistory.slice(0, 2)).toEqual(priorHistory);
+    expect(res.degraded).toBe(false);
+  });
+
   it("treats malformed tool-call JSON as a final answer (no execution)", async () => {
     const runtime = scriptedRuntime(['{"tool_call": not-valid-json']);
     let calls = 0;

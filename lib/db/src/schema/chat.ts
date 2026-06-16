@@ -3,6 +3,7 @@ import {
   text,
   jsonb,
   timestamp,
+  integer,
   index,
 } from "drizzle-orm/pg-core";
 
@@ -13,6 +14,15 @@ export const chatSessionsTable = pgTable(
     tenantId: text("tenant_id").notNull(),
     userId: text("user_id").notNull(),
     title: text("title"),
+    // Chat working-memory rolling summary (opt-in CHAT_MEMORY_SUMMARY). Holds a
+    // PHI-scanned natural-language summary of conversation turns that have
+    // overflowed the sliding window; `coveredCount` is how many of the oldest
+    // messages it represents so the next fold is incremental. See chat-memory.ts.
+    memorySummary: text("memory_summary"),
+    memorySummaryCoveredCount: integer("memory_summary_covered_count")
+      .notNull()
+      .default(0),
+    memorySummaryModel: text("memory_summary_model"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

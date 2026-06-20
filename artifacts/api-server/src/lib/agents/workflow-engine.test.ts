@@ -186,8 +186,9 @@ const TEMPORAL_CFG: TemporalConfig = {
   tls: false,
 };
 
-function fakeRuntime() {
+function fakeRuntime(opts?: { executeResult?: unknown }) {
   const started: StartWorkflowArgs[] = [];
+  const executed: StartWorkflowArgs[] = [];
   let workerRan = false;
   let shutdownCalled = false;
   let resolveWorker: () => void = () => {};
@@ -201,6 +202,10 @@ function fakeRuntime() {
       }
       alreadyStartedIds.add(args.workflowId);
       started.push(args);
+    },
+    async executeWorkflow(args) {
+      executed.push(args);
+      return opts?.executeResult;
     },
     runWorker() {
       workerRan = true;
@@ -216,6 +221,7 @@ function fakeRuntime() {
   return {
     runtime,
     started,
+    executed,
     get workerRan() {
       return workerRan;
     },
@@ -258,7 +264,9 @@ describe("TemporalWorkflowEngine (fake runtime)", () => {
       workflowId: workflowIdFor("t1", "f1"),
       workflowType: "reviewFindingWorkflow",
       taskQueue: "phi-audit-review",
-      args: [{ findingId: "f1", tenantId: "t1" }],
+      // M23: the extended-pipeline flag is frozen into the workflow args at
+      // dispatch (read client-side, deterministic on the cluster). Default off.
+      args: [{ findingId: "f1", tenantId: "t1", extendedPipeline: false }],
     });
 
     await engine.stop();
@@ -370,6 +378,35 @@ describe("TemporalWorkflowEngine (fake runtime)", () => {
     });
   });
 
+  it("ledgers supervisor.review_dropped when submitReview arrives after stop", async () => {
+    const fake = fakeRuntime();
+    const factory: TemporalRuntimeFactory = async () => fake.runtime;
+    const dropped: LedgerWriteInput[] = [];
+    const ledgerWrite = async (input: LedgerWriteInput) => {
+      dropped.push(input);
+    };
+    const engine = new TemporalWorkflowEngine(
+      TEMPORAL_CFG,
+      undefined,
+      factory,
+      ledgerWrite,
+    );
+    await engine.start();
+    await engine.stop();
+    // The worker is gone; this review can never run, so the drop must land on
+    // the tamper-evident ledger (high) instead of vanishing in a log line.
+    engine.submitReview("late", "t1");
+    await tick();
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      tenantId: "t1",
+      eventType: "supervisor.review_dropped",
+      subjectType: "finding",
+      subjectId: "late",
+      payload: { reason: "engine_stopped" },
+    });
+  });
+
   it("ledgers supervisor.review_dropped on a non-idempotency startWorkflow failure", async () => {
     const fake = fakeRuntime();
     // Make startWorkflow reject with a non-AlreadyStarted error.
@@ -427,6 +464,98 @@ describe("TemporalWorkflowEngine (fake runtime)", () => {
     await tick();
     expect(dropped).toHaveLength(0);
     await engine.stop();
+  });
+
+  it("tracks buffered/dispatched/dropped counters (operator visibility, #82)", async () => {
+    const fake = fakeRuntime();
+    const factory: TemporalRuntimeFactory = async () => fake.runtime;
+    const ledgerWrite = async () => {};
+    const engine = new TemporalWorkflowEngine(
+      TEMPORAL_CFG,
+      undefined,
+      factory,
+      ledgerWrite,
+    );
+
+    // Buffered before start (async startup window).
+    engine.submitReview("f1", "t1");
+    engine.submitReview("f2", "t1");
+    expect(engine.metrics()).toMatchObject({
+      buffered: 2,
+      dispatched: 0,
+      dropped: 0,
+      pendingDepth: 2,
+    });
+
+    // start() flushes the buffer -> both dispatch.
+    await engine.start();
+    await tick();
+    expect(engine.metrics()).toMatchObject({
+      buffered: 2,
+      dispatched: 2,
+      dropped: 0,
+      pendingDepth: 0,
+    });
+
+    // A fresh review while running dispatches directly (not buffered).
+    engine.submitReview("f3", "t1");
+    await tick();
+    expect(engine.metrics()).toMatchObject({ buffered: 2, dispatched: 3 });
+
+    // A duplicate emit (AlreadyStarted) still counts as dispatched, not dropped.
+    engine.submitReview("f3", "t1");
+    await tick();
+    expect(engine.metrics()).toMatchObject({ dispatched: 4, dropped: 0 });
+
+    await engine.stop();
+    // After stop, a late submit drops (engine_stopped) and is counted by reason.
+    engine.submitReview("late", "t1");
+    await tick();
+    expect(engine.metrics()).toMatchObject({
+      dropped: 1,
+      droppedByReason: { engine_stopped: 1 },
+    });
+  });
+
+  it("counts dispatch-failure drops by reason (#82)", async () => {
+    const fake = fakeRuntime();
+    const failing: TemporalRuntime = {
+      ...fake.runtime,
+      async startWorkflow() {
+        const err = new Error("connect ECONNREFUSED");
+        (err as { name?: string }).name = "TransportError";
+        throw err;
+      },
+    };
+    const factory: TemporalRuntimeFactory = async () => failing;
+    const engine = new TemporalWorkflowEngine(
+      TEMPORAL_CFG,
+      undefined,
+      factory,
+      async () => {},
+    );
+    await engine.start();
+    engine.submitReview("f1", "t1");
+    await tick();
+    expect(engine.metrics()).toMatchObject({
+      dispatched: 0,
+      dropped: 1,
+      droppedByReason: { start_workflow_failed: 1 },
+    });
+    await engine.stop();
+  });
+
+  it("metrics() returns a defensive copy (callers can't mutate live counters)", async () => {
+    const engine = new TemporalWorkflowEngine(TEMPORAL_CFG, undefined, async () =>
+      fakeRuntime().runtime,
+    );
+    const snap = engine.metrics();
+    snap.droppedByReason["injected"] = 99;
+    snap.dispatched = 99;
+    expect(engine.metrics()).toMatchObject({
+      dispatched: 0,
+      droppedByReason: {},
+    });
   });
 
   it("resets to idle when start() fails so a retry can start clean", async () => {
@@ -526,6 +655,47 @@ describe("InProcessWorkflowEngine", () => {
     engine.submitReview("f1", "default");
     await engine.drain(500);
     expect(fake.calls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One-shot job seam (executeOneShot). The boot search-index reconcile + the dev
+// fixture ingest replay ride this generic capability so they can be made durable
+// under Temporal while staying a plain inline call in-process.
+// ---------------------------------------------------------------------------
+
+describe("InProcessWorkflowEngine.executeOneShot", () => {
+  it("runs the one-shot unit inline and returns its result", async () => {
+    let runs = 0;
+    const engine = new InProcessWorkflowEngine(fakeActivities().activities);
+    engine.start();
+    const out = await engine.executeOneShot({
+      name: "search-reindex",
+      workflowType: "searchReindexWorkflow",
+      run: async () => {
+        runs += 1;
+        return { indexed: 3, skipped: 1 };
+      },
+    });
+    expect(runs).toBe(1);
+    expect(out).toEqual({ indexed: 3, skipped: 1 });
+  });
+
+  it("runs independently of the review pump's stopped flag", async () => {
+    // The engine is NOT start()ed -> review submits are ignored, but a one-shot
+    // (boot reconcile) must still run (mirrors schedulePeriodic's posture).
+    let runs = 0;
+    const engine = new InProcessWorkflowEngine(fakeActivities().activities);
+    const out = await engine.executeOneShot({
+      name: "ingest-replay",
+      workflowType: "ingestReplayWorkflow",
+      run: async () => {
+        runs += 1;
+        return { replayed: 2, delivered: 2, errors: 0 };
+      },
+    });
+    expect(runs).toBe(1);
+    expect(out).toEqual({ replayed: 2, delivered: 2, errors: 0 });
   });
 });
 
@@ -647,6 +817,79 @@ describe("TemporalWorkflowEngine.schedulePeriodic (fake runtime)", () => {
     engine.schedulePeriodic({ ...NOTARIZER_PERIODIC, run: async () => {} });
     await tick();
     expect(fake.started).toHaveLength(0);
+  });
+});
+
+describe("TemporalWorkflowEngine.executeOneShot (fake runtime)", () => {
+  it("executes a durable one-shot workflow and returns its result while running", async () => {
+    const fake = fakeRuntime({ executeResult: { indexed: 5, skipped: 0 } });
+    const factory: TemporalRuntimeFactory = async () => fake.runtime;
+    const engine = new TemporalWorkflowEngine(TEMPORAL_CFG, undefined, factory);
+    await engine.start();
+
+    let inlineRan = false;
+    const out = await engine.executeOneShot({
+      name: "search-reindex",
+      workflowType: "searchReindexWorkflow",
+      run: async () => {
+        inlineRan = true;
+        return { indexed: -1, skipped: -1 };
+      },
+    });
+
+    // The durable workflow ran (its result is returned); the inline fallback did NOT.
+    expect(inlineRan).toBe(false);
+    expect(out).toEqual({ indexed: 5, skipped: 0 });
+    expect(fake.executed).toHaveLength(1);
+    expect(fake.executed[0].workflowType).toBe("searchReindexWorkflow");
+    expect(fake.executed[0].taskQueue).toBe("phi-audit-review");
+    expect(fake.executed[0].args).toEqual([]);
+    expect(fake.executed[0].workflowId).toMatch(/^oneshot-search-reindex-/);
+    await engine.stop();
+  });
+
+  it("uses a unique workflow id per execution (one-shots are not deduped)", async () => {
+    const fake = fakeRuntime({ executeResult: {} });
+    const factory: TemporalRuntimeFactory = async () => fake.runtime;
+    const engine = new TemporalWorkflowEngine(TEMPORAL_CFG, undefined, factory);
+    await engine.start();
+
+    await engine.executeOneShot({
+      name: "ingest-replay",
+      workflowType: "ingestReplayWorkflow",
+      run: async () => ({}),
+    });
+    await engine.executeOneShot({
+      name: "ingest-replay",
+      workflowType: "ingestReplayWorkflow",
+      run: async () => ({}),
+    });
+
+    expect(fake.executed).toHaveLength(2);
+    expect(fake.executed[0].workflowId).not.toBe(fake.executed[1].workflowId);
+    await engine.stop();
+  });
+
+  it("falls back to an inline run when the engine is not running", async () => {
+    const fake = fakeRuntime({ executeResult: { indexed: 9, skipped: 9 } });
+    const factory: TemporalRuntimeFactory = async () => fake.runtime;
+    // NOT started -> phase is idle -> no durable execution available yet (this is
+    // exactly the boot-reconcile path: it runs before the engine is selected+started).
+    const engine = new TemporalWorkflowEngine(TEMPORAL_CFG, undefined, factory);
+
+    let inlineRan = false;
+    const out = await engine.executeOneShot({
+      name: "search-reindex",
+      workflowType: "searchReindexWorkflow",
+      run: async () => {
+        inlineRan = true;
+        return { indexed: 3, skipped: 1 };
+      },
+    });
+
+    expect(inlineRan).toBe(true);
+    expect(out).toEqual({ indexed: 3, skipped: 1 });
+    expect(fake.executed).toHaveLength(0);
   });
 });
 

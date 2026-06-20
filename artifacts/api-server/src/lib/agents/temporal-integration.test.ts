@@ -16,6 +16,13 @@
 // tears the server down afterwards.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, gt } from "drizzle-orm";
+import {
+  bootstrap,
+  db,
+  findingsTable,
+  ledgerEntriesTable,
+} from "@workspace/db";
 import {
   TemporalWorkflowEngine,
   workflowIdFor,
@@ -28,6 +35,15 @@ import type {
   TriageStepResult,
   VerifierStepResult,
 } from "./review-orchestration";
+import type { FindingSafe } from "@workspace/db";
+import { withTenant } from "../db-context";
+import { appendLedgerWithStatus } from "../ledger";
+import {
+  chargeBudget,
+  setBudgetStore,
+  tokensUsedToday,
+} from "./agent-budget";
+import { uniq, uniqueTenant } from "../../test-support/ledger-harness";
 
 const RUN = process.env.TEMPORAL_INTEGRATION === "1";
 const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7233";
@@ -423,6 +439,270 @@ describe.skipIf(!RUN)("Temporal engine against a live cluster", () => {
         expect(c.triageCharges).toBe(1);
       } finally {
         await engine.stop();
+      }
+    },
+    T,
+  );
+
+  // #93: the self-heal test above proves the idempotency CONTRACT against a real
+  // cluster, but with a SIMULATED in-memory ledger. This test raises the bar:
+  // the verifier step performs a REAL tamper-evident ledger write
+  // (appendLedgerWithStatus -> Postgres, advisory-locked hash chain) and a REAL
+  // budget charge, exactly like review-steps.ts, so the dedupe gate is exercised
+  // against the actual DB under the live worker's bounded auto-retry. After the
+  // workflow self-heals we assert directly against Postgres that the retried
+  // verifier left exactly ONE `agent.verifier_complete` row and charged the
+  // budget exactly once — the strongest form of the exactly-once guarantee.
+  it(
+    "self-heals against the REAL Postgres ledger + budget with exactly-once side effects (#93)",
+    async () => {
+      await bootstrap({ embeddingDim: 256 });
+      // Use the in-memory budget store so the charge is observable in-process
+      // (the Node worker runs activities in this same process) and isolated from
+      // any postgres budget table the env might otherwise select.
+      const { MemoryBudgetStore } = await import("./agent-budget");
+      setBudgetStore(new MemoryBudgetStore());
+
+      const tenantId = uniqueTenant("temporal-real-ledger");
+      const findingId = `f-real-${uniq()}`;
+      await withTenant(tenantId, async (tx) =>
+        tx.insert(findingsTable).values({
+          id: findingId,
+          tenantId,
+          classification: "phi",
+          severity: "high",
+          status: "open",
+          source: `test:temporal:${uniq()}`,
+          fingerprint: `test:${findingId}`,
+          redactedEvidence: {
+            snippet: "applicant_ssn=[REDACTED:ssn] status=retry",
+            redactions: ["ssn"],
+            truncated: false,
+            trust: "untrusted",
+          },
+          detectorVersion: "test@0.0.0",
+          firstSeenAt: new Date(),
+          lastSeenAt: new Date(),
+          occurrenceCount: 1,
+          agentReviewStatus: "pending",
+        }),
+      );
+
+      const VERIFIER_KEY = `verifier:${tenantId}:${findingId}`;
+      const TRIAGE_KEY = `triage:${tenantId}:${findingId}`;
+      const VERIFIER_TOKENS = 7;
+      const TRIAGE_TOKENS = 5;
+      let verifierAttempts = 0;
+      const failVerifierAttempts = 2;
+      const calls: string[] = [];
+
+      // A real-ledger-backed activity set: triage + verifier perform the same
+      // dedupe-gated ledger write + charge as review-steps.ts. The verifier is
+      // rigged to fail its first two attempts (1 = pre-write transient, 2 =
+      // post-write crash) to drive the worker's bounded auto-retry.
+      const activities: ReviewActivities = {
+        async acquireFinding(): Promise<FindingSafe> {
+          calls.push("acquire");
+          return withTenant(tenantId, async (tx) =>
+            tx
+              .select()
+              .from(findingsTable)
+              .where(
+                and(
+                  eq(findingsTable.id, findingId),
+                  eq(findingsTable.tenantId, tenantId),
+                ),
+              )
+              .limit(1)
+              .then((r) => r[0] as unknown as FindingSafe),
+          );
+        },
+        async checkBudgetPre(): Promise<BudgetCheck> {
+          return { exceeded: false, tokensUsedToday: 0 };
+        },
+        async persistSkippedPreBudget() {},
+        async triageStep(): Promise<TriageStepResult> {
+          calls.push("triage");
+          const { deduped } = await appendLedgerWithStatus({
+            tenantId,
+            actor: { kind: "system", id: "supervisor" },
+            eventType: "agent.triage_complete",
+            subjectType: "finding",
+            subjectId: findingId,
+            payload: { finding_id: findingId, stage: "triage" },
+            idempotencyKey: TRIAGE_KEY,
+          });
+          if (!deduped) await chargeBudget(tenantId, TRIAGE_TOKENS);
+          return {
+            triage: {
+              decision: "confirm",
+              confidence: 0.9,
+              rationale: "ok",
+            } as never,
+            budgetExceededAfter: false,
+            tokensUsedToday: TRIAGE_TOKENS,
+          };
+        },
+        async persistSkippedAfterTriage() {},
+        async verifierStep(): Promise<VerifierStepResult> {
+          verifierAttempts += 1;
+          calls.push(`verify#${verifierAttempts}`);
+          // Attempt 1: transient failure BEFORE any side effect.
+          if (verifierAttempts === 1) {
+            throw new Error("transient verifier failure (pre-write)");
+          }
+          // Attempt >=2: the dedupe-gated write. A retry that finds the row
+          // already present returns deduped:true -> no re-charge.
+          const { deduped } = await appendLedgerWithStatus({
+            tenantId,
+            actor: { kind: "system", id: "supervisor" },
+            eventType: "agent.verifier_complete",
+            subjectType: "finding",
+            subjectId: findingId,
+            payload: { finding_id: findingId, stage: "verifier" },
+            idempotencyKey: VERIFIER_KEY,
+          });
+          if (!deduped) await chargeBudget(tenantId, VERIFIER_TOKENS);
+          // Crash AFTER the write for the rigged attempts to force the
+          // post-write retry that must dedupe on the row just committed.
+          if (verifierAttempts <= failVerifierAttempts) {
+            throw new Error("crash after verifier_complete write (post-write)");
+          }
+          return {
+            verifier: { agree: true, confidence: 0.9, rationale: "ok" } as never,
+          };
+        },
+        async contextStep() {
+          throw new Error("context step not expected in two-agent path");
+        },
+        async notifierStep() {
+          throw new Error("notifier step not expected in two-agent path");
+        },
+        async persistCompleted() {
+          calls.push("completed");
+        },
+        async persistFailed() {
+          calls.push("failed");
+        },
+      };
+
+      const engine = new TemporalWorkflowEngine(
+        cfg(uniqueTaskQueue("real-ledger")),
+        activities,
+      );
+      await engine.start();
+      try {
+        engine.submitReview(findingId, tenantId);
+        await waitFor(() => calls.includes("completed"), 90_000);
+
+        // The verifier was retried (failed twice, succeeded on #3) and never
+        // fell through to persistFailed.
+        expect(verifierAttempts).toBe(3);
+        expect(calls).toContain("completed");
+        expect(calls).not.toContain("failed");
+
+        // Exactly ONE agent.verifier_complete row in the REAL ledger for this
+        // finding, despite the 3 attempts.
+        const verifierRows = await db
+          .select({ seq: ledgerEntriesTable.seq })
+          .from(ledgerEntriesTable)
+          .where(
+            and(
+              eq(ledgerEntriesTable.subjectId, findingId),
+              eq(ledgerEntriesTable.eventType, "agent.verifier_complete"),
+            ),
+          );
+        expect(verifierRows).toHaveLength(1);
+
+        // The budget was charged exactly once per step (the dedupe gate
+        // suppressed the re-charge on the recovering retry).
+        expect(await tokensUsedToday(tenantId)).toBe(
+          TRIAGE_TOKENS + VERIFIER_TOKENS,
+        );
+      } finally {
+        await engine.stop();
+      }
+    },
+    T,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #89: durable notarizer cron against a live cluster. Unlike the review tests,
+// the notarizer rides the schedulePeriodic seam -> a Temporal CRON workflow
+// (`notarizationWorkflow`). This drives a REAL worker (own NativeConnection,
+// like the resume test) registering that workflow with a RECORDING `runCycle`
+// activity, and proves both shapes the durable path relies on:
+//   1. the workflow resolves + runs its activity when EXECUTED directly, and
+//   2. a CRON schedule actually fires the cycle on the cluster on its own.
+// Recording (not the real chain-verifier checkpoint) keeps it deterministic and
+// off the shared dev ledger (the gotcha about forged checkpoint rows).
+// ---------------------------------------------------------------------------
+describe.skipIf(!RUN)("Durable notarizer cron against a live cluster", () => {
+  it(
+    "runs the notarizer cycle via a directly-executed workflow + a cron schedule (#89)",
+    async () => {
+      const taskQueue = uniqueTaskQueue("notarizer");
+      const clientMod = (await import("@temporalio/client")) as any;
+      const workerMod = (await import("@temporalio/worker")) as any;
+      const { fileURLToPath } = await import("node:url");
+      const path = await import("node:path");
+      const workflowsPath = path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "temporal-workflows.ts",
+      );
+
+      let cycles = 0;
+      // The notarizer activity set the worker resolves `notarizationWorkflow`
+      // against. RECORDING only — no DB, no real checkpoint.
+      const activities = {
+        async runCycle() {
+          cycles += 1;
+        },
+      };
+
+      const connection = await clientMod.Connection.connect({ address: ADDRESS });
+      const client = new clientMod.Client({ connection, namespace: NAMESPACE });
+      const nativeConn = await workerMod.NativeConnection.connect({
+        address: ADDRESS,
+      });
+      const worker = await workerMod.Worker.create({
+        connection: nativeConn,
+        namespace: NAMESPACE,
+        taskQueue,
+        workflowsPath,
+        activities,
+      });
+      const workerRun = worker.run();
+      try {
+        // (1) Directly EXECUTE the workflow once and await it: deterministic
+        // proof the cron workflow body resolves + runs the runCycle activity on
+        // a real worker.
+        await client.workflow.execute("notarizationWorkflow", {
+          workflowId: `notarizer-direct-${Date.now()}`,
+          taskQueue,
+        });
+        expect(cycles).toBe(1);
+
+        // (2) Schedule it on a real CRON (every minute) and prove the cluster
+        // fires the cycle on its own. Temporal's first cron run lands at the
+        // next minute boundary, so allow up to ~90s.
+        const cronId = `periodic-notarizer-${Date.now()}`;
+        await client.workflow.start("notarizationWorkflow", {
+          workflowId: cronId,
+          taskQueue,
+          cronSchedule: "* * * * *",
+        });
+        await waitFor(() => cycles >= 2, 90_000);
+        expect(cycles).toBeGreaterThanOrEqual(2);
+
+        // Cron workflows run forever; terminate so the worker can drain.
+        await client.workflow.getHandle(cronId).terminate("test complete");
+      } finally {
+        worker.shutdown();
+        await workerRun.catch(() => {});
+        await nativeConn.close().catch(() => {});
+        await connection.close().catch(() => {});
       }
     },
     T,

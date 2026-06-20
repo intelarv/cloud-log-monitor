@@ -283,4 +283,66 @@ describe("re-review finding (HTTP)", () => {
     );
     expect(res.status).toBe(404);
   });
+
+  // #97: per-user + per-finding rate limit. Each replay re-runs the
+  // Triage->Verifier LLM pipeline (real token cost), so a single analyst
+  // hammering replay on one finding is throttled at 5/min BEFORE it reaches
+  // the per-tenant budget breaker. The key is user+finding, so the throttle is
+  // surgical: a burst on finding A must never starve a legitimate replay of
+  // finding B, and a different analyst must not inherit A's counter.
+  it("rate-limits a single analyst hammering replay on ONE finding (5/min)", async () => {
+    const findingId = await createReviewedFinding("completed", 1);
+    const { c } = await authedClient(`op-${uniq()}`);
+
+    // The endpoint resets to "pending" and re-enqueues; a "pending" finding is
+    // still replayable (only "in_progress" is refused), so the first 5 calls
+    // all succeed and exercise the limiter's allowance.
+    for (let i = 0; i < 5; i++) {
+      const ok = await c.post(`/api/admin/findings/${findingId}/re-review`, {});
+      expect(ok.status).toBe(200);
+    }
+    const limited = await c.post(
+      `/api/admin/findings/${findingId}/re-review`,
+      {},
+    );
+    expect(limited.status).toBe(429);
+  });
+
+  it("scopes the re-review limit per finding — a burst on one finding does not throttle another", async () => {
+    const findingA = await createReviewedFinding("completed", 1);
+    const findingB = await createReviewedFinding("completed", 1);
+    const { c } = await authedClient(`op-${uniq()}`);
+
+    // Exhaust the allowance for finding A.
+    for (let i = 0; i < 5; i++) {
+      await c.post(`/api/admin/findings/${findingA}/re-review`, {});
+    }
+    expect(
+      (await c.post(`/api/admin/findings/${findingA}/re-review`, {})).status,
+    ).toBe(429);
+
+    // The SAME analyst can still replay a DIFFERENT finding — the counter is
+    // keyed by user+finding, not user alone.
+    expect(
+      (await c.post(`/api/admin/findings/${findingB}/re-review`, {})).status,
+    ).toBe(200);
+  });
+
+  it("scopes the re-review limit per analyst — one analyst's burst does not throttle another", async () => {
+    const findingId = await createReviewedFinding("completed", 1);
+    const { c: c1 } = await authedClient(`op-${uniq()}`);
+    const { c: c2 } = await authedClient(`op-${uniq()}`);
+
+    for (let i = 0; i < 5; i++) {
+      await c1.post(`/api/admin/findings/${findingId}/re-review`, {});
+    }
+    expect(
+      (await c1.post(`/api/admin/findings/${findingId}/re-review`, {})).status,
+    ).toBe(429);
+
+    // A different analyst replaying the SAME finding has their own allowance.
+    expect(
+      (await c2.post(`/api/admin/findings/${findingId}/re-review`, {})).status,
+    ).toBe(200);
+  });
 });

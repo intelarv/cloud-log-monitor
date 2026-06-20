@@ -414,6 +414,43 @@ export const StepUpResponse = zod.object({
 
 
 /**
+ * @summary Active step-up provider and (for TOTP) the caller's factor status.
+ */
+export const StepUpStatusResponse = zod.object({
+  "provider": zod.enum(['dev', 'totp']),
+  "enrolled": zod.boolean(),
+  "verified": zod.boolean()
+})
+
+
+/**
+ * @summary Provision a fresh TOTP secret (STEP_UP_PROVIDER=totp only). Returns the
+otpauth URI + base32 secret to display once; the factor is UNVERIFIED
+until confirmed.
+
+ */
+export const StepUpEnrollResponse = zod.object({
+  "otpauth_uri": zod.string(),
+  "secret": zod.string()
+})
+
+
+/**
+ * @summary Confirm a pending TOTP enrollment with a live 6-digit code.
+ */
+export const stepUpEnrollVerifyBodyCodeRegExp = new RegExp('^[0-9]{6}$');
+
+
+export const StepUpEnrollVerifyBody = zod.object({
+  "code": zod.string().regex(stepUpEnrollVerifyBodyCodeRegExp)
+})
+
+export const StepUpEnrollVerifyResponse = zod.object({
+  "verified": zod.boolean()
+})
+
+
+/**
  * @summary List the caller's break-glass grants (most recent first).
  */
 export const ListBreakGlassGrantsResponseItem = zod.object({
@@ -675,7 +712,7 @@ until a human confirms. Session only; optional `?status` filter.
 
  */
 export const ListRemediationProposalsQueryParams = zod.object({
-  "status": zod.enum(['pending', 'confirmed', 'rejected']).optional()
+  "status": zod.enum(['pending', 'confirmed', 'rejected', 'executing', 'executed', 'execution_failed']).optional()
 })
 
 export const ListRemediationProposalsResponseItem = zod.object({
@@ -687,11 +724,15 @@ export const ListRemediationProposalsResponseItem = zod.object({
   "rationale": zod.string(),
   "proposed_by_agent": zod.string(),
   "proposed_by_user_id": zod.string(),
-  "status": zod.enum(['pending', 'confirmed', 'rejected']),
+  "status": zod.enum(['pending', 'confirmed', 'rejected', 'executing', 'executed', 'execution_failed']),
   "created_at": zod.coerce.date(),
   "decided_by_user_id": zod.string().nullable(),
   "decided_at": zod.coerce.date().nullable(),
-  "decision_note": zod.string().nullable()
+  "decision_note": zod.string().nullable(),
+  "executed_at": zod.coerce.date().nullable(),
+  "external_ref": zod.string().nullable(),
+  "execution_error": zod.string().nullable(),
+  "executor_kind": zod.string().nullable()
 })
 export const ListRemediationProposalsResponse = zod.array(ListRemediationProposalsResponseItem)
 
@@ -724,11 +765,15 @@ export const ConfirmRemediationProposalResponse = zod.object({
   "rationale": zod.string(),
   "proposed_by_agent": zod.string(),
   "proposed_by_user_id": zod.string(),
-  "status": zod.enum(['pending', 'confirmed', 'rejected']),
+  "status": zod.enum(['pending', 'confirmed', 'rejected', 'executing', 'executed', 'execution_failed']),
   "created_at": zod.coerce.date(),
   "decided_by_user_id": zod.string().nullable(),
   "decided_at": zod.coerce.date().nullable(),
-  "decision_note": zod.string().nullable()
+  "decision_note": zod.string().nullable(),
+  "executed_at": zod.coerce.date().nullable(),
+  "external_ref": zod.string().nullable(),
+  "execution_error": zod.string().nullable(),
+  "executor_kind": zod.string().nullable()
 })
 
 
@@ -758,11 +803,15 @@ export const RejectRemediationProposalResponse = zod.object({
   "rationale": zod.string(),
   "proposed_by_agent": zod.string(),
   "proposed_by_user_id": zod.string(),
-  "status": zod.enum(['pending', 'confirmed', 'rejected']),
+  "status": zod.enum(['pending', 'confirmed', 'rejected', 'executing', 'executed', 'execution_failed']),
   "created_at": zod.coerce.date(),
   "decided_by_user_id": zod.string().nullable(),
   "decided_at": zod.coerce.date().nullable(),
-  "decision_note": zod.string().nullable()
+  "decision_note": zod.string().nullable(),
+  "executed_at": zod.coerce.date().nullable(),
+  "external_ref": zod.string().nullable(),
+  "execution_error": zod.string().nullable(),
+  "executor_kind": zod.string().nullable()
 })
 
 

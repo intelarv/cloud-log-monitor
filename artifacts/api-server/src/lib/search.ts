@@ -356,6 +356,16 @@ export function resolveReindexBatchSize(
   return n;
 }
 
+/** Reconcile-cycle result. Named so the one-shot Temporal workflow seam
+ *  (`SearchReindexActivities`) can reference the shape via a type-only import
+ *  without pulling this DB/search module into the deterministic workflow
+ *  sandbox. `skipped` = the active provider maintains no external index
+ *  (Postgres dev default), so nothing was mirrored. */
+export interface ReconcileResult {
+  indexed: number;
+  skipped: boolean;
+}
+
 export interface ReconcileSearchIndexOpts {
   searchProvider?: LexicalSearchProvider;
   /** Page size for the keyset scan + bulk mirror. Defaults to
@@ -421,7 +431,7 @@ export function planReindexResume(
 // evidence is never read, so PHI cannot reach the searchable tier.
 export async function reconcileSearchIndex(
   opts: ReconcileSearchIndexOpts = {},
-): Promise<{ indexed: number; skipped: boolean }> {
+): Promise<ReconcileResult> {
   const provider = opts.searchProvider ?? getSearchProvider();
   if (!provider.maintainsExternalIndex) return { indexed: 0, skipped: true };
 

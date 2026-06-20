@@ -21,6 +21,12 @@ export interface BootstrapOptions {
    * EMBEDDINGS_TENANT_PARTITIONING at the API layer. See setup-sql.ts.
    */
   tenantPartitioning?: boolean;
+  /**
+   * Opt-in LIST-partitioning of chat_message_embeddings by tenant_id (default
+   * false ⇒ single-table layout, byte-identical). Driven by
+   * CHAT_EMBEDDINGS_TENANT_PARTITIONING at the API layer. See setup-sql.ts.
+   */
+  chatTenantPartitioning?: boolean;
 }
 
 export interface BootstrapResult {
@@ -41,6 +47,7 @@ export async function bootstrap(
         buildSetupSql({
           embeddingDim,
           tenantPartitioning: opts.tenantPartitioning === true,
+          chatTenantPartitioning: opts.chatTenantPartitioning === true,
         }),
       ),
     );

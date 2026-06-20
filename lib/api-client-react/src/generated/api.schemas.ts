@@ -326,6 +326,34 @@ export interface StepUpResult {
   ttl_seconds: number;
 }
 
+export type StepUpStatusProvider = typeof StepUpStatusProvider[keyof typeof StepUpStatusProvider];
+
+
+export const StepUpStatusProvider = {
+  dev: 'dev',
+  totp: 'totp',
+} as const;
+
+export interface StepUpStatus {
+  provider: StepUpStatusProvider;
+  enrolled: boolean;
+  verified: boolean;
+}
+
+export interface StepUpEnrollResult {
+  otpauth_uri: string;
+  secret: string;
+}
+
+export interface StepUpEnrollVerifyInput {
+  /** @pattern ^[0-9]{6}$ */
+  code: string;
+}
+
+export interface StepUpEnrollVerifyResult {
+  verified: boolean;
+}
+
 export interface BreakGlassGrantInput {
   /**
      * @minLength 1
@@ -503,6 +531,9 @@ export const RemediationProposalStatus = {
   pending: 'pending',
   confirmed: 'confirmed',
   rejected: 'rejected',
+  executing: 'executing',
+  executed: 'executed',
+  execution_failed: 'execution_failed',
 } as const;
 
 export interface RemediationProposal {
@@ -522,6 +553,14 @@ export interface RemediationProposal {
   decided_at: string | null;
   /** @nullable */
   decision_note: string | null;
+  /** @nullable */
+  executed_at: string | null;
+  /** @nullable */
+  external_ref: string | null;
+  /** @nullable */
+  execution_error: string | null;
+  /** @nullable */
+  executor_kind: string | null;
 }
 
 export type ListFindingsParams = {
@@ -594,5 +633,8 @@ export const ListRemediationProposalsStatus = {
   pending: 'pending',
   confirmed: 'confirmed',
   rejected: 'rejected',
+  executing: 'executing',
+  executed: 'executed',
+  execution_failed: 'execution_failed',
 } as const;
 

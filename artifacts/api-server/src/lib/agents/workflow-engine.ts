@@ -44,17 +44,49 @@ export interface PeriodicJob {
   run: () => Promise<void>;
 }
 
+/** A ONE-SHOT unit of maintenance/ingest work routed through the engine seam
+ *  (the boot search-index reconcile and the dev fixture ingest replay are the
+ *  first two). Like `PeriodicJob`, both the in-process unit (`run`) and the
+ *  registered Temporal workflow are declared so a single call site drives
+ *  whichever backend is active — but it runs ONCE, returning a result, rather
+ *  than on a cadence:
+ *   - in-process runs `run()` inline and returns its result (byte-identical to
+ *     the direct call it replaces);
+ *   - Temporal EXECUTES `workflowType` once (no cron), awaits its result, and
+ *     IGNORES `run()` (the work happens in the registered workflow's activities
+ *     on the worker). If the Temporal runtime is not up yet (the pre-start boot
+ *     window) or is shutting down, it falls back to running `run()` inline so a
+ *     one-shot's result is never lost. */
+export interface OneShotJob<T> {
+  /** Stable identity: in-process log label + Temporal workflow-id seed. */
+  name: string;
+  /** Registered Temporal workflow type to execute once (durable backend). */
+  workflowType: string;
+  /** Args passed to the Temporal workflow (must be serializable). Most one-shot
+   *  jobs re-derive their inputs from env/DB inside the activity, so this is
+   *  usually empty. */
+  args?: unknown[];
+  /** In-process unit of work — returns the result the caller needs (reconcile
+   *  counts / replay counts). The Temporal backend calls this only as the
+   *  not-running fallback; otherwise the work runs in the registered workflow's
+   *  activities. */
+  run: () => Promise<T>;
+}
+
 /** What the ledger hook and bootstrap depend on. `submitReview` is sync
  *  fire-and-forget (matches the old `enqueueReview`); start/stop may be async
  *  because the Temporal engine connects/disconnects a cluster.
  *  `schedulePeriodic` registers a recurring maintenance job and returns a stop
- *  handle (a no-op for the Temporal cron, which lives on the cluster by design). */
+ *  handle (a no-op for the Temporal cron, which lives on the cluster by design).
+ *  `executeOneShot` runs a one-shot job once and returns its result (durable
+ *  workflow under Temporal, inline under in-process). */
 export interface WorkflowEngine {
   readonly kind: "inprocess" | "temporal";
   start(): void | Promise<void>;
   stop(): void | Promise<void>;
   submitReview(findingId: string, tenantId: string): void;
   schedulePeriodic(job: PeriodicJob): () => void;
+  executeOneShot<T>(job: OneShotJob<T>): Promise<T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +100,11 @@ const CONCURRENCY = 2;
 
 export class InProcessWorkflowEngine implements WorkflowEngine {
   readonly kind = "inprocess" as const;
-  private readonly pending: { findingId: string; tenantId: string }[] = [];
+  private readonly pending: {
+    findingId: string;
+    tenantId: string;
+    extendedPipeline: boolean;
+  }[] = [];
   private active = 0;
   // Default OFF. Production `index.ts` calls `startAgentSupervisor()` after the
   // ingest pipeline is wired; tests opt in per-test. This avoids the global
@@ -92,7 +128,14 @@ export class InProcessWorkflowEngine implements WorkflowEngine {
 
   submitReview(findingId: string, tenantId: string): void {
     if (this.stopped) return;
-    this.pending.push({ findingId, tenantId });
+    // Read the extended-pipeline flag once at submit time (mirrors how the
+    // Temporal engine reads it client-side at dispatch). Default off ⇒ the job
+    // runs the byte-identical two-agent orchestration.
+    this.pending.push({
+      findingId,
+      tenantId,
+      extendedPipeline: isExtendedPipelineEnabled(),
+    });
     this.pump();
   }
 
@@ -104,6 +147,14 @@ export class InProcessWorkflowEngine implements WorkflowEngine {
     const timer = setInterval(() => void job.run(), job.intervalMs);
     timer.unref?.();
     return () => clearInterval(timer);
+  }
+
+  /** Run the one-shot unit inline and return its result. Byte-identical to the
+   *  direct call this replaces. Independent of the review pump's `stopped` flag —
+   *  a boot reconcile / operator replay must run regardless of whether the
+   *  supervisor is accepting reviews (same posture as `schedulePeriodic`). */
+  executeOneShot<T>(job: OneShotJob<T>): Promise<T> {
+    return job.run();
   }
 
   private pump(): void {
@@ -138,6 +189,15 @@ function boolEnv(v: string | undefined): boolean {
   if (v === undefined) return false;
   const s = v.trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+/** M23: read once per submitted review whether the extended (Context + Notifier)
+ *  pipeline is on. Default-inert — unset ⇒ false ⇒ orchestration byte-identical
+ *  to the two-agent path, so the credential-free eval gate is unaffected. */
+export function isExtendedPipelineEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return boolEnv(env["AGENT_PIPELINE_EXTENDED"]);
 }
 
 /** Parse `WORKFLOW_ENGINE` + the Temporal connection env. Fails fast (throws)

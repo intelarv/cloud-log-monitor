@@ -25,8 +25,8 @@ import { isPast } from "date-fns";
 import { safeTimestamp, safeRelativeTime } from "../lib/format";
 import { useToast } from "@/hooks/use-toast";
 import StepUpModal from "../components/step-up-modal";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import BreakGlassNoteModal from "../components/break-glass-note-modal";
+import TotpEnrollment from "../components/totp-enrollment";
 
 export default function Admin() {
   const { data: activeGrants, isLoading: loadingGrants } = useListBreakGlassGrants();
@@ -42,6 +42,12 @@ export default function Admin() {
   const [revokingGrantId, setRevokingGrantId] = React.useState<string | null>(null);
   const [showStepUp, setShowStepUp] = React.useState(false);
   const [stepUpReason, setStepUpReason] = React.useState("Approve break-glass grant");
+  // #59: after step-up succeeds we collect the revoke reason / approval note in
+  // an in-app modal (not a browser prompt). `noteModal` names which flow is
+  // active so a single modal component can serve both.
+  const [noteModal, setNoteModal] = React.useState<
+    { kind: "revoke" | "approve"; id: string } | null
+  >(null);
 
   const handleReplay = async () => {
     try {
@@ -78,15 +84,11 @@ export default function Admin() {
   const handleStepUpSuccess = () => {
     setShowStepUp(false);
     if (revokingGrantId) {
-      const reason = prompt("Optionally, why are you revoking this access? (leave blank to skip)");
-      submitRevoke(revokingGrantId, reason?.trim() || undefined);
+      setNoteModal({ kind: "revoke", id: revokingGrantId });
       return;
     }
     if (approvingGrantId) {
-      const note = prompt("Enter approval justification note (≥10 chars):");
-      if (note) {
-        submitApproval(approvingGrantId, note);
-      }
+      setNoteModal({ kind: "approve", id: approvingGrantId });
     }
   };
 
@@ -261,6 +263,8 @@ export default function Admin() {
             </CardContent>
           </Card>
 
+          <TotpEnrollment />
+
           <Card>
             <CardHeader>
               <CardTitle className="text-lg flex items-center gap-2">
@@ -393,6 +397,51 @@ export default function Admin() {
         onOpenChange={setShowStepUp}
         onSuccess={handleStepUpSuccess}
         reason={stepUpReason}
+      />
+
+      <BreakGlassNoteModal
+        open={noteModal?.kind === "revoke"}
+        onOpenChange={(v) => {
+          if (!v) {
+            setNoteModal(null);
+            setRevokingGrantId(null);
+          }
+        }}
+        title="Revoke break-glass access"
+        description="Cut off raw-PHI access for this grant. You can optionally record why — this note is saved to the immutable audit ledger."
+        label="Reason"
+        placeholder="e.g., Investigation complete; access no longer needed."
+        optional
+        pending={revokeGrant.isPending}
+        confirmLabel="Revoke access"
+        onConfirm={(note) => {
+          const id = noteModal!.id;
+          setNoteModal(null);
+          submitRevoke(id, note || undefined);
+        }}
+      />
+
+      <BreakGlassNoteModal
+        open={noteModal?.kind === "approve"}
+        onOpenChange={(v) => {
+          if (!v) {
+            setNoteModal(null);
+            setApprovingGrantId(null);
+          }
+        }}
+        title="Approve break-glass request"
+        description="Grant a second-analyst approval for this critical-severity request. Your justification note is saved to the immutable audit ledger."
+        label="Approval justification"
+        placeholder="e.g., Verified incident IR-1042 with requester; approval warranted."
+        minLength={10}
+        pending={approveGrant.isPending}
+        confirmLabel="Approve request"
+        onConfirm={(note) => {
+          const id = noteModal!.id;
+          setNoteModal(null);
+          setApprovingGrantId(null);
+          submitApproval(id, note);
+        }}
       />
     </Layout>
   );

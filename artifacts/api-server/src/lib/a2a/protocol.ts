@@ -14,6 +14,8 @@ import { z } from "zod/v4";
 import type { FindingSafe } from "@workspace/db";
 import { triageVerdictSchema, type TriageVerdict } from "../agents/triage";
 import { verifierVerdictSchema, type VerifierVerdict } from "../agents/verifier";
+import { contextVerdictSchema, type ContextVerdict } from "../agents/context";
+import { notifierDraftSchema, type NotifierDraft } from "../agents/notifier";
 
 // ---------------------------------------------------------------------------
 // DataPart payload schemas (the `data` object inside an A2A DataPart).
@@ -69,6 +71,36 @@ export const verifyResponseSchema = z.object({
   modelId: z.string(),
 });
 
+// M23: Context + Notifier requests/responses (extended pipeline only). Same
+// redacted-only guarantee — the request carries `FindingSafe` (+ upstream
+// verdicts) and Zod strips any unexpected key, so `rawEvidence` can never ride.
+export const contextRequestSchema = z.object({
+  kind: z.literal("context_request"),
+  finding: findingShapeSchema,
+});
+
+export const contextResponseSchema = z.object({
+  kind: z.literal("context_response"),
+  verdict: contextVerdictSchema,
+  approxOutputTokens: z.number().int().nonnegative(),
+  modelId: z.string(),
+});
+
+export const notifyRequestSchema = z.object({
+  kind: z.literal("notify_request"),
+  finding: findingShapeSchema,
+  triage: triageVerdictSchema,
+  verifier: verifierVerdictSchema,
+  context: contextVerdictSchema,
+});
+
+export const notifyResponseSchema = z.object({
+  kind: z.literal("notify_response"),
+  verdict: notifierDraftSchema,
+  approxOutputTokens: z.number().int().nonnegative(),
+  modelId: z.string(),
+});
+
 // ---------------------------------------------------------------------------
 // AgentInvoker seam.
 // ---------------------------------------------------------------------------
@@ -85,12 +117,33 @@ export interface VerifierInvokeResult {
   modelId: string;
 }
 
+export interface ContextInvokeResult {
+  verdict: ContextVerdict;
+  approxOutputTokens: number;
+  modelId: string;
+}
+
+export interface NotifierInvokeResult {
+  verdict: NotifierDraft;
+  approxOutputTokens: number;
+  modelId: string;
+}
+
 /** The Supervisor depends only on this interface. Production wires the A2A
  *  client implementation (`A2AAgentInvoker`, JSON-RPC over loopback); tests
- *  inject `inProcessAgentInvoker` to stay hermetic/offline. */
+ *  inject `inProcessAgentInvoker` to stay hermetic/offline. The context/notify
+ *  methods are only invoked by the extended pipeline (AGENT_PIPELINE_EXTENDED);
+ *  the default Triage→Verifier path never calls them. */
 export interface AgentInvoker {
   triage(finding: FindingSafe): Promise<TriageInvokeResult>;
   verify(finding: FindingSafe, triage: TriageVerdict): Promise<VerifierInvokeResult>;
+  context(finding: FindingSafe): Promise<ContextInvokeResult>;
+  notify(
+    finding: FindingSafe,
+    triage: TriageVerdict,
+    verifier: VerifierVerdict,
+    context: ContextVerdict,
+  ): Promise<NotifierInvokeResult>;
 }
 
 // Loopback agent route paths. The agent endpoints are deliberately NOT in the
@@ -100,6 +153,8 @@ export interface AgentInvoker {
 // still genuinely speaking the A2A protocol.
 export const TRIAGE_AGENT_PATH = "/a2a/triage";
 export const VERIFY_AGENT_PATH = "/a2a/verify";
+export const CONTEXT_AGENT_PATH = "/a2a/context";
+export const NOTIFY_AGENT_PATH = "/a2a/notify";
 export const A2A_CARD_SUFFIX = "/.well-known/agent-card.json";
 
 export const A2A_PROTOCOL_VERSION = "0.3.0";

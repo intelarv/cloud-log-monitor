@@ -20,7 +20,7 @@ import {
   type LlmAgentRuntime,
   type LlmHistoryTurn,
 } from "./llm-runtime";
-import { resolveLlmForDecisionPoint } from "./llm-decision-points";
+import { resolveLlmForRequest } from "./llm-router";
 import { withTimeout } from "./with-timeout";
 
 // ---------------------------------------------------------------------------
@@ -430,10 +430,15 @@ export async function runAgentLoop(
   deps: AgentLoopDeps = {},
 ): Promise<ChatTurnResult> {
   // Injected runtime (tests) wins and keeps the prompt-pinned model. With no
-  // injection, resolve the chat point's own provider/model (M17).
+  // injection, route this request to a runtime: the input-based router picks a
+  // model per request from the question's content/risk when `LLM_ROUTER` is on,
+  // else falls through to the chat point's static M17 selection (byte-identical
+  // when both the router and per-point overrides are off).
   const { runtime, modelId: chatModelId } = deps.runtime
     ? { runtime: deps.runtime, modelId: CHAT_AGENT_MODEL }
-    : resolveLlmForDecisionPoint("chat", CHAT_AGENT_MODEL);
+    : resolveLlmForRequest("chat", CHAT_AGENT_MODEL, {
+        text: opts.userQuestion,
+      });
   const limits = { ...defaultHarnessLimits(), ...deps.limits };
   const callTool: CallTool =
     deps.callTool ??

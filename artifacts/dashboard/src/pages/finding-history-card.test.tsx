@@ -189,6 +189,72 @@ describe("FindingHistoryCard", () => {
     expect(manualIdx).toBeLessThan(autoIdx);
   });
 
+  it("renders a standalone close-out auto-revoke with the system actor and the qualifier", () => {
+    // Tighter coverage of the close-out auto-revoke in isolation (Task #110):
+    // when a grant ends ONLY because the finding was closed out (no preceding
+    // manual revoke), the timeline must still (a) carry the "auto-revoked"
+    // qualifier, (b) attribute it to the *system* auto-revoke actor — never to a
+    // human — and (c) surface the close-out reason. This guards the audit story
+    // "access ended by policy, not by a person" for the common single-revoke
+    // path that the mixed manual+auto test above doesn't isolate.
+    const events: HistoryEvent[] = [
+      {
+        seq: 40,
+        ts: "2026-06-02T10:00:00.000Z",
+        event_type: "break_glass.revoked",
+        actor: { kind: "system", id: "auto-revoke" },
+        payload: { auto_revoked: true, reason: "Finding closed out." },
+      },
+      {
+        seq: 30,
+        ts: "2026-06-02T09:30:00.000Z",
+        event_type: "finding.resolved",
+        actor: { kind: "human", id: "analyst-close" },
+        payload: { status: "resolved" },
+      },
+      {
+        seq: 20,
+        ts: "2026-06-02T09:00:00.000Z",
+        event_type: "break_glass.granted",
+        actor: { kind: "human", id: "analyst-bg" },
+        payload: { justification: "Need raw evidence to confirm SSN exposure." },
+      },
+      {
+        seq: 10,
+        ts: "2026-06-02T08:00:00.000Z",
+        event_type: "finding.created",
+        actor: { kind: "system", id: "ingest" },
+        payload: {},
+      },
+    ];
+    setHistory(events);
+
+    render(<FindingHistoryCard findingId="f_autorevoke_only" />);
+
+    const items = screen.getAllByRole("listitem");
+    expect(items).toHaveLength(4);
+
+    // Exactly one revoke, and it carries the qualifier.
+    expect(screen.getByText("Break-glass revoked")).toBeInTheDocument();
+    expect(screen.getAllByText("auto-revoked")).toHaveLength(1);
+
+    const autoItem = items.find((li) =>
+      li.textContent?.includes("Break-glass revoked"),
+    )!;
+    expect(autoItem).toBeTruthy();
+    // Qualifier badge + close-out reason both render on the revoke entry.
+    expect(within(autoItem).getByText("auto-revoked")).toBeInTheDocument();
+    expect(within(autoItem).getByText("Finding closed out.")).toBeInTheDocument();
+    // Attributed to the system auto-revoke actor — NOT a human analyst. The
+    // actor renders on the muted metadata line (actor · timestamp), distinct
+    // from the "auto-revoked" badge.
+    expect(
+      within(autoItem).getByText(/auto-revoke\s+·/),
+    ).toBeInTheDocument();
+    expect(autoItem.textContent).not.toContain("analyst-bg");
+    expect(autoItem.textContent).not.toContain("analyst-close");
+  });
+
   it("shows the empty state when there are no events", () => {
     setHistory([]);
     render(<FindingHistoryCard findingId="f_empty" />);

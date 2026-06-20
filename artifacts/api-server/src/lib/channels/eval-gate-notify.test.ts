@@ -12,17 +12,23 @@ import {
   buildSlackMessage,
   buildSummaryText,
   classifyOutcome,
+  computeSparklines,
   computeTrends,
   countRecentRecoveries,
   defaultHeartbeatDedupKey,
   defaultPagerDutyDedupKey,
+  detectDownwardDrift,
   detectRecovery,
+  driftConfig,
   extractScores,
   failingStreakStart,
   failingSuites,
+  fmtDriftWarning,
   fmtDuration,
+  fmtSparkline,
   fmtTrend,
   historyLimit,
+  sparkline,
   isRecoveryFlapping,
   loadHistory,
   notifyEvalGate,
@@ -592,6 +598,157 @@ describe("eval-gate notifier", () => {
     expect(payload.severity).toBe("warning");
     expect(payload.outcome).toBe("clean");
     expect(payload.ok).toBe(true);
+  });
+
+  describe("#23 per-suite score sparkline", () => {
+    it("renders an empty string for an empty / all-non-finite window", () => {
+      expect(sparkline([])).toBe("");
+      expect(sparkline([NaN, Infinity])).toBe("");
+      expect(sparkline()).toBe("");
+    });
+
+    it("renders a flat window as a full bar (never all-min)", () => {
+      expect(sparkline([0.9, 0.9, 0.9])).toBe("███");
+    });
+
+    it("scales a rising window across its own min..max", () => {
+      // min=0, max=1 ⇒ first glyph is the lowest tick, last is the highest.
+      const s = sparkline([0, 0.5, 1]);
+      expect(s).toHaveLength(3);
+      expect(s[0]).toBe("▁");
+      expect(s[2]).toBe("█");
+      expect(s).toBe("▁▅█");
+    });
+
+    it("computeSparklines appends this run and only draws suites with >=2 points", () => {
+      const history = [
+        { ts: "a", ok: true, outcome: "clean" as const, scores: { "detector-phi": 0.8 } },
+        { ts: "b", ok: true, outcome: "clean" as const, scores: { "detector-phi": 0.9 } },
+      ];
+      const sparks = computeSparklines(history, {
+        "detector-phi": { score: 1.0, status: "ok" },
+        // No history for this suite (only this run) ⇒ no sparkline (1 point).
+        "agent-agreement": { score: 0.5, status: "ok" },
+      });
+      // detector-phi: [0.8, 0.9, 1.0] ⇒ rising, ends on the top tick.
+      expect(sparks["detector-phi"]).toBe("▁▅█");
+      expect(sparks["agent-agreement"]).toBeUndefined();
+    });
+
+    it("fmtSparkline prefixes two spaces, or returns '' when absent", () => {
+      expect(fmtSparkline("▁▅█")).toBe("  ▁▅█");
+      expect(fmtSparkline("")).toBe("");
+      expect(fmtSparkline(undefined)).toBe("");
+    });
+
+    it("buildSummaryText appends the sparkline after the trend on each suite line", () => {
+      const text = buildSummaryText(FAIL_SUMMARY, {
+        sparks: { "detector-phi": "▁▅█" },
+      });
+      expect(text).toContain("▁▅█");
+    });
+  });
+
+  describe("#24 multi-night downward-drift warning", () => {
+    const driftSuite = (scores: number[]) =>
+      scores.map((score, i) => ({
+        ts: `2026-06-0${i + 1}T00:00:00.000Z`,
+        ok: true,
+        outcome: "clean" as const,
+        scores: { "detector-phi": score },
+      }));
+
+    it("driftConfig defaults to 3 runs / 0pt and clamps env", () => {
+      expect(driftConfig({})).toEqual({ runs: 3, minDropPt: 0 });
+      expect(driftConfig({ EVAL_DRIFT_RUNS: "4", EVAL_DRIFT_MIN_DROP_PT: "1.5" })).toEqual({
+        runs: 4,
+        minDropPt: 1.5,
+      });
+      // Garbage / negative falls back to defaults.
+      expect(driftConfig({ EVAL_DRIFT_RUNS: "nope", EVAL_DRIFT_MIN_DROP_PT: "-2" })).toEqual({
+        runs: 3,
+        minDropPt: 0,
+      });
+    });
+
+    it("flags a suite that fell for 3 consecutive runs", () => {
+      // history scores 0.95, 0.93, 0.91 + this run 0.89 ⇒ last 4 strictly down.
+      const drift = detectDownwardDrift(driftSuite([0.95, 0.93, 0.91]), { "detector-phi": 0.89 }, {});
+      expect(drift).toHaveLength(1);
+      expect(drift[0]).toMatchObject({ suite: "detector-phi", runs: 3 });
+      expect(drift[0].fromPct).toBeCloseTo(95, 1);
+      expect(drift[0].toPct).toBeCloseTo(89, 1);
+      expect(drift[0].dropPt).toBeCloseTo(6, 1);
+    });
+
+    it("does NOT flag a non-monotonic series (one up-tick breaks the streak)", () => {
+      const drift = detectDownwardDrift(driftSuite([0.95, 0.96, 0.91]), { "detector-phi": 0.89 }, {});
+      expect(drift).toEqual([]);
+    });
+
+    it("respects EVAL_DRIFT_MIN_DROP_PT (tiny sustained slide below the floor is ignored)", () => {
+      const hist = driftSuite([0.901, 0.9005, 0.9002]);
+      const cur = { "detector-phi": 0.9 };
+      expect(detectDownwardDrift(hist, cur, {})).toHaveLength(1); // floor 0 ⇒ flagged
+      expect(detectDownwardDrift(hist, cur, { EVAL_DRIFT_MIN_DROP_PT: "1" })).toEqual([]); // <1pt drop
+    });
+
+    it("is disabled when EVAL_DRIFT_RUNS < 2", () => {
+      expect(detectDownwardDrift(driftSuite([0.95, 0.93, 0.91]), { "detector-phi": 0.89 }, { EVAL_DRIFT_RUNS: "1" })).toEqual([]);
+    });
+
+    it("fmtDriftWarning renders a single human line", () => {
+      const line = fmtDriftWarning({ suite: "detector-phi", runs: 3, fromPct: 95, toPct: 89, dropPt: 6 });
+      expect(line).toBe("downward drift: detector-phi fell 3 run(s) in a row (95.0% → 89.0%, -6.0pt)");
+    });
+
+    it("promotes an otherwise-clean run to 'warned' and posts the drift line (warn trigger)", async () => {
+      const { fetchImpl, calls } = makeFetch();
+      const CLEAN = {
+        ok: true,
+        failures: [],
+        warnings: [],
+        suites: { "detector-phi": { score: 0.89, baseline: 0.85, status: "ok" } },
+      };
+      const res = await notifyEvalGate({
+        // Drift is a warning, so it surfaces under the warn-level trigger (the
+        // realistic config for an on-call who wants early erosion signals). The
+        // value-add over the stock warning path: this run is otherwise CLEAN —
+        // without drift detection it would classify "clean" and never post even
+        // at warn level.
+        env: { CHANNEL_SLACK_WEBHOOK_URL: "https://hooks.slack.test/abc", EVAL_NOTIFY_ON: "warn" },
+        summary: CLEAN,
+        history: driftSuite([0.95, 0.93, 0.91]),
+        fetchImpl,
+        exitCode: 0,
+      });
+      expect(res.outcome).toBe("warned");
+      expect(res.skipped).toBe(false);
+      expect(calls).toHaveLength(1);
+      const body = JSON.parse(calls[0].init.body as string);
+      expect(JSON.stringify(body)).toContain("downward drift: detector-phi");
+    });
+
+    it("does NOT post a drift-only run under the default fail-only trigger", async () => {
+      const { fetchImpl, calls } = makeFetch();
+      const CLEAN = {
+        ok: true,
+        failures: [],
+        warnings: [],
+        suites: { "detector-phi": { score: 0.89, baseline: 0.85, status: "ok" } },
+      };
+      const res = await notifyEvalGate({
+        env: { CHANNEL_SLACK_WEBHOOK_URL: "https://hooks.slack.test/abc" }, // default EVAL_NOTIFY_ON=fail
+        summary: CLEAN,
+        history: driftSuite([0.95, 0.93, 0.91]),
+        fetchImpl,
+        exitCode: 0,
+      });
+      expect(res.outcome).toBe("warned");
+      // warned < fail trigger ⇒ no post (drift respects the operator's trigger).
+      expect(res.skipped).toBe(true);
+      expect(calls).toHaveLength(0);
+    });
   });
 
   describe("score-history trend indicator", () => {

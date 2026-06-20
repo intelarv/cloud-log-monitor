@@ -35,8 +35,12 @@ export const SUPERVISOR_CALLER_ID = "supervisor";
  *  minted for one agent cannot be replayed against another. */
 export const TRIAGE_AUDIENCE = "a2a:triage";
 export const VERIFY_AUDIENCE = "a2a:verify";
+export const CONTEXT_AUDIENCE = "a2a:context";
+export const NOTIFY_AUDIENCE = "a2a:notify";
 export const TRIAGE_SKILL = "triage_finding";
 export const VERIFY_SKILL = "verify_finding";
+export const CONTEXT_SKILL = "context_finding";
+export const NOTIFY_SKILL = "notify_finding";
 
 const ISSUER = "phi-audit/supervisor";
 const TOKEN_TTL_SECONDS = 60; // short-lived: minted per call over loopback.

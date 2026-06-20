@@ -30,6 +30,7 @@ import {
 import {
   embedAndStoreChatMessage,
   semanticRecallMessageIds,
+  hybridRecallMessageIds,
 } from "../lib/chat-recall";
 import { resolveLlmForDecisionPoint } from "../lib/llm-decision-points";
 import { CHAT_AGENT_MODEL } from "../lib/prompts";
@@ -264,12 +265,21 @@ router.post(
     let replayWindow = window;
     if (memCfg.semanticRecallEnabled && priorCandidates.length > 0) {
       try {
-        const relevantIds = await semanticRecallMessageIds({
-          tenantId,
-          sessionId,
-          query: parsed.data.content,
-          k: memCfg.semanticRecallK,
-        });
+        // M-hybrid (opt-in CHAT_MEMORY_HYBRID_RECALL): fuse a lexical (BM25) leg
+        // with the vector leg via RRF; off ⇒ vector-only (M19, byte-identical).
+        const relevantIds = memCfg.hybridRecallEnabled
+          ? await hybridRecallMessageIds({
+              tenantId,
+              sessionId,
+              query: parsed.data.content,
+              k: memCfg.semanticRecallK,
+            })
+          : await semanticRecallMessageIds({
+              tenantId,
+              sessionId,
+              query: parsed.data.content,
+              k: memCfg.semanticRecallK,
+            });
         if (relevantIds.length > 0) {
           replayWindow = assembleRecallWindow(
             priorCandidates,

@@ -73,6 +73,46 @@ describe("temporal integration-gate notifier", () => {
     });
     expect(res.skipped).toBe(true);
     expect(res.sent).toHaveLength(0);
+    // Slack/webhook have no resolve concept, so a green run posts nothing there.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("#90: a passing run (exit 0) auto-resolves the PagerDuty incident on the temporal dedup key", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const res = await notifyTemporalGate({
+      env: { CHANNEL_PAGERDUTY_ROUTING_KEY: "R0UT1NGK3Y0000000000000000000000" },
+      exitCode: 0,
+      fetchImpl,
+      now: NOW,
+    });
+    // One resolve was dispatched, so this run is not "skipped".
+    expect(res.skipped).toBe(false);
+    expect(res.sent).toHaveLength(1);
+    expect(res.sent[0]).toMatchObject({ channel: "pagerduty", ok: true, action: "resolve" });
+    expect(calls).toHaveLength(1);
+
+    const event = JSON.parse(calls[0].init.body as string);
+    expect(event.event_action).toBe("resolve");
+    expect(event.routing_key).toBe("R0UT1NGK3Y0000000000000000000000");
+    // The resolve MUST target the SAME stable key the failing run's trigger uses,
+    // or a recovering run would fail to clear the page it raised. The Temporal
+    // gate trigger keys on defaultTemporalDedupKey(), NOT a per-run/date key.
+    expect(event.dedup_key).toBe(defaultTemporalDedupKey());
+    expect(event.dedup_key).toBe("temporal-integration-nightly");
+    // A stable key carries no date component (so it can't drift run-to-run).
+    expect(event.dedup_key).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+  });
+
+  it("#90: a passing run stays inert (skipped) when no PagerDuty channel is configured", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const res = await notifyTemporalGate({
+      env: { CHANNEL_WEBHOOK_URL: "https://hook.test/ci" },
+      exitCode: 0,
+      fetchImpl,
+      now: NOW,
+    });
+    expect(res.skipped).toBe(true);
+    expect(res.sent).toHaveLength(0);
     expect(calls).toHaveLength(0);
   });
 

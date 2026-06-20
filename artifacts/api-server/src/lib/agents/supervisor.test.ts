@@ -151,6 +151,20 @@ const HAPPY_VERIFIER = JSON.stringify({
   prompt_injection_suspected: false,
   agrees_with_triage: true,
 });
+const HAPPY_CONTEXT = JSON.stringify({
+  owner: "billing-team",
+  recent_change: "deploy abc123 enabled verbose request logging",
+  blast_radius: "medium",
+  summary: "Verbose logging in billing-svc began emitting applicant SSNs.",
+  confidence: 0.8,
+});
+const HAPPY_NOTIFIER = JSON.stringify({
+  channel: "pagerduty",
+  urgency: "page",
+  subject: "Critical PHI exposure in billing-svc logs",
+  body: "A critical PHI finding requires on-call review. See finding reference.",
+  confidence: 0.85,
+});
 
 describe("supervisor.parseStrictJson", () => {
   const schema = z.object({ ok: z.boolean() });
@@ -214,6 +228,85 @@ describe("supervisor orchestration", () => {
       agent: "triage",
       model_id: "gemini-2.5-flash",
     });
+  });
+
+  it("default (AGENT_PIPELINE_EXTENDED off): NO context/notify steps run or ledger", async () => {
+    const id = `F-SUP-NOEXT-${uniq()}`;
+    // Extra responses are present but must NOT be consumed when the flag is off.
+    const { runtime, calls } = makeFakeRuntime([
+      HAPPY_TRIAGE,
+      HAPPY_VERIFIER,
+      HAPPY_CONTEXT,
+      HAPPY_NOTIFIER,
+    ]);
+    __setLlmRuntimeForTest(runtime);
+    await seedFinding(id);
+    const headBefore = await currentHeadSeq();
+
+    delete process.env["AGENT_PIPELINE_EXTENDED"];
+    enqueueReview(id, TENANT);
+    await __drainSupervisorForTest();
+
+    // Only triage + verifier ran — context/notifier responses untouched.
+    expect(calls).toHaveLength(2);
+    const types = (await ledgerSince(headBefore, id)).map((e) => e.eventType);
+    expect(types).toContain("agent.triage_complete");
+    expect(types).toContain("agent.verifier_complete");
+    expect(types).not.toContain("agent.context_complete");
+    expect(types).not.toContain("agent.notify_drafted");
+  });
+
+  it("AGENT_PIPELINE_EXTENDED on: context+notify run AFTER verifier, draft only, ledgered", async () => {
+    const id = `F-SUP-EXT-${uniq()}`;
+    const { runtime, calls } = makeFakeRuntime([
+      HAPPY_TRIAGE,
+      HAPPY_VERIFIER,
+      HAPPY_CONTEXT,
+      HAPPY_NOTIFIER,
+    ]);
+    __setLlmRuntimeForTest(runtime);
+    await seedFinding(id);
+    const headBefore = await currentHeadSeq();
+
+    process.env["AGENT_PIPELINE_EXTENDED"] = "1";
+    try {
+      enqueueReview(id, TENANT);
+      await __drainSupervisorForTest();
+    } finally {
+      delete process.env["AGENT_PIPELINE_EXTENDED"];
+    }
+
+    // All four agents ran, in order.
+    expect(calls).toHaveLength(4);
+    // Context prompt carries the FINDING; Notifier prompt carries the verdicts.
+    expect(calls[2]!.userPrompt).toContain("<FINDING");
+    expect(calls[3]!.userPrompt).toContain("<FINDING");
+
+    const row = await fetchFinding(id);
+    // persistCompleted still records ONLY triage+verifier (schema unchanged).
+    expect(row?.agentReviewStatus).toBe("completed");
+    expect(row?.triageVerdict).toBeTruthy();
+    expect(row?.verifierVerdict).toBeTruthy();
+
+    const entries = await ledgerSince(headBefore, id);
+    const types = entries.map((e) => e.eventType);
+    expect(types).toContain("agent.context_complete");
+    expect(types).toContain("agent.notify_drafted");
+    // Ordering: context_complete and notify_drafted come AFTER verifier_complete.
+    const idxV = types.indexOf("agent.verifier_complete");
+    const idxC = types.indexOf("agent.context_complete");
+    const idxN = types.indexOf("agent.notify_drafted");
+    expect(idxC).toBeGreaterThan(idxV);
+    expect(idxN).toBeGreaterThan(idxC);
+
+    // Notifier DRAFTS only — no channel.send_* event was emitted.
+    expect(types).not.toContain("channel.send_succeeded");
+
+    // agent_identity stamped; draft verdict round-trips in the ledger payload.
+    const notifyEntry = entries.find((e) => e.eventType === "agent.notify_drafted");
+    const np = notifyEntry?.payload as Record<string, unknown>;
+    expect(np?.["agent_identity"]).toMatchObject({ agent: "notifier" });
+    expect((np?.["verdict"] as Record<string, unknown>)?.["channel"]).toBe("pagerduty");
   });
 
   it("CAS idempotency: re-enqueue of an already-completed finding is a no-op", async () => {

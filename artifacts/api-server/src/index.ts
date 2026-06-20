@@ -11,6 +11,8 @@ import { initNerProviderFromEnv } from "./lib/ner-config";
 import {
   initEmbeddingsPartitioningFromEnv,
   reconcileEmbeddingsPartitioningFromDb,
+  initChatEmbeddingsPartitioningFromEnv,
+  reconcileChatEmbeddingsPartitioningFromDb,
 } from "./lib/embeddings-partition-config";
 import { initLlmRuntimeFromEnv } from "./lib/llm-runtime-config";
 import { hasDedicatedNotarizationSecret } from "./lib/notarization";
@@ -25,6 +27,8 @@ import { buildLogSourceFromEnv } from "./lib/log-source-config";
 import type { LogRecord } from "./lib/log-source";
 import { startAgentSupervisor } from "./lib/agents/supervisor";
 import { getWorkflowEngine } from "./lib/agents/workflow-engine";
+import { startRemediationWorker } from "./lib/remediation-worker";
+import { buildRemediationExecutorFromEnv } from "./lib/remediation-executor";
 import { buildChannelsFromEnv, initChannels } from "./lib/channels";
 
 const rawPort = process.env["PORT"];
@@ -67,8 +71,9 @@ async function main(): Promise<void> {
 
   // Step 0.9: resolve the optional Stage-2 NER provider from env. Default is
   // `none` (NoopNerProvider) so detection runs Stage-1 only and the offline
-  // eval gate is byte-identical. NER_PROVIDER=aws-comprehend|gcp-dlp|
-  // azure-language augments ingest detection with cloud NER (un-anchored names
+  // eval gate is byte-identical. NER_PROVIDER=presidio (self-hosted, no cloud
+  // account) | aws-comprehend|gcp-dlp|
+  // azure-language augments ingest detection with NER (un-anchored names
   // / free-form addresses) — no DEPLOYMENT_TARGET shortcut, always explicit.
   // No DB access here. See ner-config.ts.
   initNerProviderFromEnv();
@@ -81,6 +86,14 @@ async function main(): Promise<void> {
   // CONFLICT arbiter to the composite PK. See embeddings-partition-config.ts.
   const embeddingsPartitioned = initEmbeddingsPartitioningFromEnv();
 
+  // Step 0.96: resolve the per-tenant pgvector partitioning switch for
+  // chat_message_embeddings (mirrors Step 0.95 for finding_embeddings). Default
+  // off ⇒ single-table chat embeddings, byte-identical to M19. When
+  // CHAT_EMBEDDINGS_TENANT_PARTITIONING is on, bootstrap recreates the table as
+  // LIST-partitioned by tenant_id and the chat-embedding upsert switches its ON
+  // CONFLICT arbiter to the composite PK. See embeddings-partition-config.ts.
+  const chatEmbeddingsPartitioned = initChatEmbeddingsPartitioningFromEnv();
+
   // Step 1: idempotent DB setup (RLS policies + findings_redacted view).
   // Safe to run every boot; CREATE OR REPLACE / DROP IF EXISTS make it so.
   // The embedding-column dim is passed through; if a pre-existing column has
@@ -89,6 +102,7 @@ async function main(): Promise<void> {
   const boot = await bootstrap({
     embeddingDim: embedderConfig.dim,
     tenantPartitioning: embeddingsPartitioned,
+    chatTenantPartitioning: chatEmbeddingsPartitioned,
   });
   logger.info(boot, "DB bootstrap complete");
 
@@ -101,6 +115,17 @@ async function main(): Promise<void> {
   logger.info(
     { embeddingsPartitioned: actuallyPartitioned },
     "finding_embeddings layout reconciled",
+  );
+
+  // Step 1.06: reconcile the chat_message_embeddings partitioning switch with
+  // its ACTUAL table layout (mirrors Step 1.05). Keeps the chat-embedding
+  // upsert's ON CONFLICT arbiter consistent with the table. No-op when they
+  // already agree.
+  const actuallyChatPartitioned =
+    await reconcileChatEmbeddingsPartitioningFromDb();
+  logger.info(
+    { chatEmbeddingsPartitioned: actuallyChatPartitioned },
+    "chat_message_embeddings layout reconciled",
   );
 
   // Step 1.1 (M12.1): load the per-tenant KMS key registry into the in-memory
@@ -125,7 +150,16 @@ async function main(): Promise<void> {
   // until the backend recovers, and the next restart reconciles. The Postgres
   // no-op cannot fail here, so this only shields external providers.
   try {
-    const recon = await reconcileSearchIndex();
+    // Routed through the WorkflowEngine seam: in-process runs reconcileSearchIndex
+    // inline (byte-identical); under WORKFLOW_ENGINE=temporal it becomes a durable
+    // one-shot workflow. At boot the engine isn't selected/started yet (that
+    // happens inside startAgentSupervisor below), so the temporal backend takes
+    // its logged inline fallback here too — the reconcile is idempotent.
+    const recon = await getWorkflowEngine().executeOneShot({
+      name: "search-reindex",
+      workflowType: "searchReindexWorkflow",
+      run: () => reconcileSearchIndex(),
+    });
     logger.info(recon, "Search index reconcile complete");
   } catch (err) {
     logger.warn(
@@ -152,12 +186,15 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  // Step 3 (M1.8): start the periodic chain verifier — hourly 24h-window
-  // walk + weekly full walk. On mismatch it appends `ledger.chain_invalid`
-  // whose post-commit alert hook routes via §25. See ARCHITECTURE.md §23.2.
-  // M2 notarization checkpoint create+verify is no longer driven here — it now
-  // runs through the WorkflowEngine seam (`startNotarizer`, step 5.5) so it can
-  // be made durable under WORKFLOW_ENGINE=temporal.
+  // Step 3 (M1.8): the periodic chain verifier (hourly 24h-window walk + weekly
+  // full walk; on mismatch it appends `ledger.chain_invalid` whose post-commit
+  // alert hook routes via §25 — see ARCHITECTURE.md §23.2) is no longer driven
+  // here. Both it AND the M2 notarization checkpoint create+verify cycle now run
+  // through the WorkflowEngine seam (`startChainVerifier` / `startNotarizer`,
+  // step 5.5) so they can be made durable under WORKFLOW_ENGINE=temporal. They
+  // are scheduled after `startAgentSupervisor` selects the engine. The boot-time
+  // full chain verify above already ran (and exits on mismatch), so deferring
+  // the *periodic* scheduling a few steps changes nothing operationally.
   if (!hasDedicatedNotarizationSecret()) {
     logger.warn(
       "NOTARIZATION_SECRET is not set; falling back to SESSION_SECRET-derived dev key. " +
@@ -166,7 +203,6 @@ async function main(): Promise<void> {
         "secrets defeats the second-half tamper-evidence guarantee.",
     );
   }
-  startChainVerifier();
 
   // Step 4 (M3): wire the ingest pipeline to the process-wide log bus.
   // Source adapters publish `LogRecord`s; the pipeline runs Stage-1
@@ -217,7 +253,7 @@ async function main(): Promise<void> {
   // configured the checkpoint table is empty anyway — dev boot + the offline
   // eval gate are byte-identical. Edge-triggered + leader-locked. See
   // log-source-reaper.ts.
-  startLogSourceReaper();
+  startLogSourceReaper(getWorkflowEngine());
 
   // Step 4.5 (M8): real cloud log source, env-driven. Inert by default — an
   // operator opts in with `LOG_SOURCE=cloudwatch|cloud_logging|azure_monitor`
@@ -254,6 +290,26 @@ async function main(): Promise<void> {
   // startAgentSupervisor so the engine is selected (and, for temporal, started
   // — schedulePeriodic buffers until the worker is up).
   startNotarizer(getWorkflowEngine());
+
+  // Step 5.6 (M1.8 chain verifier through the WorkflowEngine seam): schedule the
+  // rolling 24h-window + full-chain integrity walks on the active workflow
+  // engine. In-process these are two leader-locked setIntervals, byte-identical
+  // to the pre-seam chain-verifier timers they replace. Under
+  // WORKFLOW_ENGINE=temporal they become durable cron workflows
+  // (`chainVerifyRollingWorkflow` / `chainVerifyFullWorkflow`) with the same
+  // single-execution + crash-resume guarantees as the review + notarizer paths.
+  // Wired after startAgentSupervisor so the engine is selected/started.
+  startChainVerifier(getWorkflowEngine());
+
+  // Step 5.7: executing remediation worker through the same WorkflowEngine seam.
+  // Default-inert: `buildRemediationExecutorFromEnv()` returns null unless an
+  // operator sets REMEDIATION_EXECUTOR, in which case `startRemediationWorker`
+  // does NOT schedule anything and confirmed proposals stay confirmed (exactly
+  // as before this seam existed) — so the credential-free eval gate is unchanged.
+  // When an executor IS selected, it polls CONFIRMED proposals and drives them
+  // confirmed→executing→executed|execution_failed (in-process a leader-locked
+  // setInterval; under WORKFLOW_ENGINE=temporal a durable cron workflow).
+  startRemediationWorker(getWorkflowEngine(), buildRemediationExecutorFromEnv());
 
   // Step 6 (M6): wire notification channels (Slack incoming-webhook +
   // generic HMAC-signed webhook). Adapter env is read here and validated

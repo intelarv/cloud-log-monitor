@@ -26,4 +26,12 @@ export interface RemediationProposal {
   decided_at: Date | null;
   /** @nullable */
   decision_note: string | null;
+  /** @nullable */
+  executed_at: Date | null;
+  /** @nullable */
+  external_ref: string | null;
+  /** @nullable */
+  execution_error: string | null;
+  /** @nullable */
+  executor_kind: string | null;
 }

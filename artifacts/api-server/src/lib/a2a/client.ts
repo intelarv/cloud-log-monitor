@@ -15,15 +15,25 @@ import type { DataPart, Message, Part, SendMessageResponse, Task } from "@a2a-js
 import type { FindingSafe } from "@workspace/db";
 import { runTriageAgent } from "../agents/triage";
 import { runVerifierAgent } from "../agents/verifier";
+import { runContextAgent } from "../agents/context";
+import { runNotifierAgent } from "../agents/notifier";
 import type { TriageVerdict } from "../agents/triage";
+import type { VerifierVerdict } from "../agents/verifier";
+import type { ContextVerdict } from "../agents/context";
 import {
   triageResponseSchema,
   verifyResponseSchema,
+  contextResponseSchema,
+  notifyResponseSchema,
   type AgentInvoker,
   type TriageInvokeResult,
   type VerifierInvokeResult,
+  type ContextInvokeResult,
+  type NotifierInvokeResult,
   TRIAGE_AGENT_PATH,
   VERIFY_AGENT_PATH,
+  CONTEXT_AGENT_PATH,
+  NOTIFY_AGENT_PATH,
   A2A_CARD_SUFFIX,
 } from "./protocol";
 import { buildA2AClientFetch, getA2ABaseUrl } from "./auth";
@@ -32,8 +42,12 @@ import {
   SUPERVISOR_CALLER_ID,
   TRIAGE_AUDIENCE,
   VERIFY_AUDIENCE,
+  CONTEXT_AUDIENCE,
+  NOTIFY_AUDIENCE,
   TRIAGE_SKILL,
   VERIFY_SKILL,
+  CONTEXT_SKILL,
+  NOTIFY_SKILL,
 } from "./caller-identity";
 
 function userDataMessage(data: Record<string, unknown>): Message {
@@ -92,6 +106,8 @@ export class A2AAgentInvoker implements AgentInvoker {
   private readonly baseUrl: string;
   private triageClient?: Promise<A2AClient>;
   private verifierClient?: Promise<A2AClient>;
+  private contextClient?: Promise<A2AClient>;
+  private notifierClient?: Promise<A2AClient>;
 
   constructor(baseUrl: string = getA2ABaseUrl()) {
     this.baseUrl = baseUrl;
@@ -152,6 +168,73 @@ export class A2AAgentInvoker implements AgentInvoker {
       modelId: parsed.modelId,
     };
   }
+
+  private context_(): Promise<A2AClient> {
+    return (this.contextClient ??= A2AClient.fromCardUrl(
+      `${this.baseUrl}${CONTEXT_AGENT_PATH}${A2A_CARD_SUFFIX}`,
+      {
+        fetchImpl: buildA2AClientFetch(() =>
+          mintCallerToken({
+            subject: SUPERVISOR_CALLER_ID,
+            audience: CONTEXT_AUDIENCE,
+            scope: [CONTEXT_SKILL],
+          }),
+        ),
+      },
+    ));
+  }
+
+  private notify_(): Promise<A2AClient> {
+    return (this.notifierClient ??= A2AClient.fromCardUrl(
+      `${this.baseUrl}${NOTIFY_AGENT_PATH}${A2A_CARD_SUFFIX}`,
+      {
+        fetchImpl: buildA2AClientFetch(() =>
+          mintCallerToken({
+            subject: SUPERVISOR_CALLER_ID,
+            audience: NOTIFY_AUDIENCE,
+            scope: [NOTIFY_SKILL],
+          }),
+        ),
+      },
+    ));
+  }
+
+  async context(finding: FindingSafe): Promise<ContextInvokeResult> {
+    const client = await this.context_();
+    const res = await client.sendMessage({
+      message: userDataMessage({ kind: "context_request", finding }),
+    });
+    const parsed = contextResponseSchema.parse(extractResponseData(res, "context"));
+    return {
+      verdict: parsed.verdict,
+      approxOutputTokens: parsed.approxOutputTokens,
+      modelId: parsed.modelId,
+    };
+  }
+
+  async notify(
+    finding: FindingSafe,
+    triage: TriageVerdict,
+    verifier: VerifierVerdict,
+    context: ContextVerdict,
+  ): Promise<NotifierInvokeResult> {
+    const client = await this.notify_();
+    const res = await client.sendMessage({
+      message: userDataMessage({
+        kind: "notify_request",
+        finding,
+        triage,
+        verifier,
+        context,
+      }),
+    });
+    const parsed = notifyResponseSchema.parse(extractResponseData(res, "notify"));
+    return {
+      verdict: parsed.verdict,
+      approxOutputTokens: parsed.approxOutputTokens,
+      modelId: parsed.modelId,
+    };
+  }
 }
 
 /** Direct in-process invoker (no HTTP) — for hermetic offline tests. */
@@ -161,6 +244,12 @@ export const inProcessAgentInvoker: AgentInvoker = {
   },
   verify(finding, triage) {
     return runVerifierAgent(finding, triage);
+  },
+  context(finding) {
+    return runContextAgent(finding);
+  },
+  notify(finding, triage, verifier, context) {
+    return runNotifierAgent(finding, triage, verifier, context);
   },
 };
 

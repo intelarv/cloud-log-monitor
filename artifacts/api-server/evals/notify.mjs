@@ -225,6 +225,130 @@ export function fmtTrend(trend) {
   return ` ${TREND_GLYPH[trend.direction]} ${signed}pt`;
 }
 
+// --- #23 per-suite score sparkline. A single night's ▲/▼ delta shows direction
+// but not shape; a compact sparkline over the last N runs lets on-call see at a
+// glance whether a suite is steadily eroding, recovering, or just noisy. The
+// glyphs are scaled across the window's own min..max so small movements stay
+// visible rather than collapsing to a flat line.
+const SPARK_TICKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/** Render an array of [0..1] scores as a unicode block sparkline, scaled across
+ *  the window's own min..max (so a perfectly flat window renders as a full bar,
+ *  never all-min). Non-finite entries are dropped. "" for an empty window. Pure. */
+export function sparkline(scores = []) {
+  const nums = (Array.isArray(scores) ? scores : []).filter(
+    (n) => typeof n === "number" && Number.isFinite(n),
+  );
+  if (nums.length === 0) return "";
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  const span = max - min;
+  return nums
+    .map((n) => {
+      if (span === 0) return SPARK_TICKS[SPARK_TICKS.length - 1];
+      const idx = Math.round(((n - min) / span) * (SPARK_TICKS.length - 1));
+      return SPARK_TICKS[idx];
+    })
+    .join("");
+}
+
+/** Per-suite sparkline of the last `maxPoints` runs (history, chronological)
+ *  PLUS this run's score appended last. Only suites that scored this run get a
+ *  sparkline, and only when there are at least two points to draw a shape from.
+ *  Returns `{ suite: "▁▃▅█" }`. Pure. */
+export function computeSparklines(history = [], currentSuites = {}, maxPoints = 12) {
+  const out = {};
+  const runs = Array.isArray(history) ? history : [];
+  for (const [name, s] of Object.entries(currentSuites)) {
+    if (typeof s?.score !== "number") continue;
+    const series = [];
+    for (const run of runs) {
+      const v = run?.scores?.[name];
+      if (typeof v === "number") series.push(v);
+    }
+    series.push(s.score);
+    const window = series.slice(-Math.max(2, maxPoints));
+    if (window.length >= 2) out[name] = sparkline(window);
+  }
+  return out;
+}
+
+/** Render a suite's sparkline as a compact suffix, e.g. "  ▁▃▅█". "" when there
+ *  is no sparkline for the suite. Pure. */
+export function fmtSparkline(spark) {
+  return spark ? `  ${spark}` : "";
+}
+
+// --- #24 multi-night downward-drift warning. Slow erosion that stays inside the
+// per-run regression tolerance is invisible night-to-night but is a real quality
+// regression over a week. When a suite's score drops for EVAL_DRIFT_RUNS
+// consecutive runs (default 3) AND the cumulative drop clears
+// EVAL_DRIFT_MIN_DROP_PT points (default 0 = any sustained slide), surface it as
+// a warning so on-call is told before the slide finally trips the gate.
+const DEFAULT_DRIFT_RUNS = 3;
+const DEFAULT_DRIFT_MIN_DROP_PT = 0;
+
+/** Resolve drift config from env. EVAL_DRIFT_RUNS = consecutive drops required
+ *  (default 3; a value < 2 disables drift detection). EVAL_DRIFT_MIN_DROP_PT =
+ *  cumulative point-drop floor over that span (default 0). */
+export function driftConfig(env = process.env) {
+  const rawRuns = env.EVAL_DRIFT_RUNS;
+  const runs = rawRuns !== undefined && rawRuns.trim() !== "" ? Number(rawRuns) : NaN;
+  const rawDrop = env.EVAL_DRIFT_MIN_DROP_PT;
+  const minDropPt = rawDrop !== undefined && rawDrop.trim() !== "" ? Number(rawDrop) : NaN;
+  return {
+    runs: Number.isInteger(runs) && runs >= 0 ? runs : DEFAULT_DRIFT_RUNS,
+    minDropPt: Number.isFinite(minDropPt) && minDropPt >= 0 ? minDropPt : DEFAULT_DRIFT_MIN_DROP_PT,
+  };
+}
+
+/** Detect per-suite sustained downward drift. For each suite that scored this
+ *  run, build its chronological score series (history + this run) and check
+ *  whether the last (runs+1) points are strictly decreasing (i.e. `runs`
+ *  consecutive drops) and the cumulative drop over that span clears minDropPt.
+ *  Returns `[{ suite, runs, fromPct, toPct, dropPt }]` sorted by suite. A
+ *  configured `runs` < 2 disables detection (returns []). Pure. */
+export function detectDownwardDrift(history = [], currentScores = {}, env = process.env) {
+  const { runs: k, minDropPt } = driftConfig(env);
+  if (k < 2) return [];
+  const hist = Array.isArray(history) ? history : [];
+  const out = [];
+  for (const [name, score] of Object.entries(currentScores)) {
+    if (typeof score !== "number") continue;
+    const series = [];
+    for (const run of hist) {
+      const v = run?.scores?.[name];
+      if (typeof v === "number") series.push(v);
+    }
+    series.push(score);
+    if (series.length < k + 1) continue;
+    const span = series.slice(-(k + 1));
+    let strictlyDown = true;
+    for (let i = 1; i < span.length; i++) {
+      if (!(span[i] < span[i - 1])) {
+        strictlyDown = false;
+        break;
+      }
+    }
+    if (!strictlyDown) continue;
+    const dropPt = round1((span[0] - span[span.length - 1]) * 100);
+    if (dropPt < minDropPt) continue;
+    out.push({
+      suite: name,
+      runs: k,
+      fromPct: round1(span[0] * 100),
+      toPct: round1(span[span.length - 1] * 100),
+      dropPt,
+    });
+  }
+  return out.sort((a, b) => a.suite.localeCompare(b.suite));
+}
+
+/** Format a drift record as a single warning line. Pure. */
+export function fmtDriftWarning(d) {
+  return `downward drift: ${d.suite} fell ${d.runs} run(s) in a row (${d.fromPct.toFixed(1)}% → ${d.toPct.toFixed(1)}%, -${d.dropPt.toFixed(1)}pt)`;
+}
+
 /** Append this run's per-suite scores to the rolling history file, trimmed to
  *  the most recent `maxEntries`. Best-effort: a write failure must never change
  *  the job's exit code (the gate owns that), so this only logs on error. Returns
@@ -597,7 +721,7 @@ function fmtPct(n) {
 /** Build the concise human-readable alert body. Scores + suite names +
  *  which check tripped — never any content beyond gate-derived literals.
  *  The header + severity reflect the run outcome (failed | warned | clean). */
-export function buildSummaryText(summary, { exitCode, outcome, severity, trends } = {}) {
+export function buildSummaryText(summary, { exitCode, outcome, severity, trends, sparks } = {}) {
   const o = outcome ?? classifyOutcome(summary);
   const sev = severity ?? SEVERITY_BY_OUTCOME[o];
   const lines = [];
@@ -617,7 +741,7 @@ export function buildSummaryText(summary, { exitCode, outcome, severity, trends 
       let extra = "";
       if (s.baseline != null) extra = ` (baseline ${fmtPct(s.baseline)})`;
       else if (s.floor != null) extra = ` (floor ${fmtPct(s.floor)})`;
-      lines.push(`  ${name}: ${fmtPct(s.score)}${extra}${fmtTrend(trends?.[name])} [${s.status ?? "?"}]`);
+      lines.push(`  ${name}: ${fmtPct(s.score)}${extra}${fmtTrend(trends?.[name])}${fmtSparkline(sparks?.[name])} [${s.status ?? "?"}]`);
     }
   }
   if (summary.floor?.active) {
@@ -633,10 +757,10 @@ export function buildSummaryText(summary, { exitCode, outcome, severity, trends 
  *  into a code block so they stay scannable. `text` is kept as the notification
  *  fallback (and what shows in push notifications). Like buildSummaryText, the
  *  body carries only gate-derived literals (scores + suite names) — no PHI. */
-export function buildSlackMessage(summary, { exitCode, outcome, severity, trends } = {}) {
+export function buildSlackMessage(summary, { exitCode, outcome, severity, trends, sparks } = {}) {
   const o = outcome ?? classifyOutcome(summary);
   const sev = severity ?? SEVERITY_BY_OUTCOME[o];
-  const fallback = buildSummaryText(summary, { exitCode, outcome: o, severity: sev, trends });
+  const fallback = buildSummaryText(summary, { exitCode, outcome: o, severity: sev, trends, sparks });
 
   const blocks = [
     {
@@ -686,11 +810,11 @@ export function buildSlackMessage(summary, { exitCode, outcome, severity, trends
       let extra = "";
       if (s.baseline != null) extra = ` (baseline ${fmtPct(s.baseline)})`;
       else if (s.floor != null) extra = ` (floor ${fmtPct(s.floor)})`;
-      return `${name}: ${fmtPct(s.score)}${extra}${fmtTrend(trends?.[name])} [${s.status ?? "?"}]`;
+      return `${name}: ${fmtPct(s.score)}${extra}${fmtTrend(trends?.[name])}${fmtSparkline(sparks?.[name])} [${s.status ?? "?"}]`;
     });
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: "*suite scores* (▲▼▬ vs previous run)\n```" + scoreLines.join("\n") + "```" },
+      text: { type: "mrkdwn", text: "*suite scores* (▲▼▬ vs previous run · sparkline = last runs)\n```" + scoreLines.join("\n") + "```" },
     });
   }
 
@@ -827,6 +951,57 @@ export async function resolveHeartbeat({ env = process.env, fetchImpl = fetch } 
   return { sent };
 }
 
+/** Send a PagerDuty Events API v2 `resolve` to clear an open nightly-Temporal-
+ *  gate incident. Keyed on the SAME stable dedup_key the Temporal trigger path
+ *  uses (defaultTemporalDedupKey — note the trigger passes this explicitly,
+ *  NOT channel.dedupKey, so the resolve must too, or a recovering run would fail
+ *  to clear the page it raised). A resolve needs only routing key + dedup_key +
+ *  action; resolving a key with no open incident is a harmless no-op.
+ *  `redirect: "error"` blocks redirect-based SSRF. */
+async function sendTemporalPagerDutyResolve(channel, fetchImpl) {
+  const dedupKey = defaultTemporalDedupKey();
+  const event = {
+    routing_key: channel.routingKey,
+    event_action: "resolve",
+    dedup_key: dedupKey,
+  };
+  const res = await fetchImpl(channel.eventsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(event),
+    redirect: "error",
+  });
+  return { channel: "pagerduty", ok: !!res.ok, statusCode: res.status, dedupKey, action: "resolve" };
+}
+
+/** #90: clear any open nightly-Temporal-gate page when the live-cluster gate
+ *  recovers (a passing run). Iterates the configured PagerDuty channels and
+ *  sends a `resolve` on the stable Temporal dedup key — the Temporal parallel of
+ *  the eval-gate run notifier's auto-resolve. Intentionally NOT subject to the
+ *  per-channel severity gate (a resolve carries no severity; gating it would
+ *  only leave a stale page lingering). Slack and generic webhooks have no resolve
+ *  concept, so only PagerDuty gets the signal. Inert (empty `sent`) when nothing
+ *  is configured. Never throws — each send error is captured per-channel so the
+ *  job's exit code is unaffected. */
+export async function resolveTemporalGate({ env = process.env, fetchImpl = fetch } = {}) {
+  const channels = parseChannels(env);
+  const sent = [];
+  for (const channel of channels) {
+    if (channel.kind !== "pagerduty") continue;
+    try {
+      const result = await sendTemporalPagerDutyResolve(channel, fetchImpl);
+      sent.push(result);
+      console.log(
+        `[temporal-notify] pagerduty: temporal resolve ${result.ok ? "ok" : "FAILED"} (status ${result.statusCode ?? "n/a"}, dedup_key ${result.dedupKey})`,
+      );
+    } catch (err) {
+      sent.push({ channel: "pagerduty", ok: false, action: "resolve", err: err?.message ?? String(err) });
+      console.error(`[temporal-notify] pagerduty: temporal resolve error: ${err?.message ?? err}`);
+    }
+  }
+  return { sent };
+}
+
 /** Send a PagerDuty Events API v2 `resolve` to clear the incident a matching
  *  failing run would have opened. Keyed on the SAME dedup_key the trigger path
  *  computes (`channel.dedupKey || defaultPagerDutyDedupKey()`), so a passing
@@ -893,9 +1068,9 @@ async function sendRecoveryNote(channel, text, summary, recovered, fetchImpl, { 
   return { channel: "webhook", ok: !!res.ok, statusCode: res.status, action: "recovery" };
 }
 
-async function sendToChannel(channel, text, summary, fetchImpl, { outcome, severity, exitCode, trends }) {
+async function sendToChannel(channel, text, summary, fetchImpl, { outcome, severity, exitCode, trends, sparks }) {
   if (channel.kind === "slack") {
-    const message = buildSlackMessage(summary, { exitCode, outcome, severity, trends });
+    const message = buildSlackMessage(summary, { exitCode, outcome, severity, trends, sparks });
     const res = await fetchImpl(channel.url, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1091,15 +1266,29 @@ export async function notifyEvalGate({
   exitCode,
   now = Date.now(),
 } = {}) {
-  const verdict = summary ?? loadSummary(evalsDir);
-  const outcome = classifyOutcome(verdict);
-  const severity = SEVERITY_BY_OUTCOME[outcome];
+  const baseVerdict = summary ?? loadSummary(evalsDir);
   const notifyOn = parseNotifyOn(env);
   // Trend vs. the previous nightly run, read from the rolling history (read-only
   // here — the run is appended separately after dispatch so the comparison is
   // always against prior runs, never against itself).
   const runs = history ?? loadHistory(evalsDir);
+  // #24 multi-night downward-drift: a sustained slide that stays inside the
+  // per-run regression tolerance never trips the gate, so surface it as a
+  // (non-fatal) warning. Merge it into a dispatch-only copy of the verdict so the
+  // run *history* still records the raw gate outcome (drift is a notify-time
+  // signal, not a gate verdict) — but the dispatched alert is promoted to
+  // "warned" so on-call actually hears about the erosion under the default
+  // fail-only trigger.
+  const drift = detectDownwardDrift(runs, extractScores(baseVerdict), env);
+  const verdict =
+    drift.length > 0
+      ? { ...baseVerdict, warnings: [...(baseVerdict.warnings ?? []), ...drift.map(fmtDriftWarning)] }
+      : baseVerdict;
+  const outcome = classifyOutcome(verdict);
+  const severity = SEVERITY_BY_OUTCOME[outcome];
   const trends = computeTrends(verdict.suites ?? {}, previousScores(runs));
+  // #23 per-suite sparkline of the last N runs + this run.
+  const sparks = computeSparklines(runs, verdict.suites ?? {});
   const isPassing = outcome !== "failed";
 
   const channels = parseChannels(env);
@@ -1198,10 +1387,10 @@ export async function notifyEvalGate({
     return { skipped: sent.length === 0, sent, outcome, severity };
   }
 
-  const text = buildSummaryText(verdict, { exitCode, outcome, severity, trends });
+  const text = buildSummaryText(verdict, { exitCode, outcome, severity, trends, sparks });
   for (const channel of notifyChannels) {
     try {
-      const result = await sendToChannel(channel, text, verdict, fetchImpl, { outcome, severity, exitCode, trends });
+      const result = await sendToChannel(channel, text, verdict, fetchImpl, { outcome, severity, exitCode, trends, sparks });
       sent.push(result);
       console.log(
         `[eval-notify] ${result.channel}: ${result.ok ? "ok" : "FAILED"} (status ${result.statusCode ?? "n/a"})`,

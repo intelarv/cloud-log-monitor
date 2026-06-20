@@ -19,7 +19,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, RefreshCw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle, X } from "lucide-react";
+import { ArrowLeft, ShieldAlert, Lock, Unlock, AlertTriangle, ExternalLink, Bot, CheckCircle2, XCircle, Clock, HelpCircle, CheckCheck, RotateCcw, RefreshCw, History, KeyRound, Eye, Ban, ShieldQuestion, PlusCircle, X, Loader2 } from "lucide-react";
 import { safeTimestamp, compactRelativeTime } from "../lib/format";
 import BreakGlassModal from "../components/break-glass-modal";
 import ResolveFindingModal from "../components/resolve-finding-modal";
@@ -270,6 +270,11 @@ export default function FindingDetail() {
       queryKey: getGetFindingQueryKey(id!),
       refetchInterval: (query) =>
         isReviewActive(query.state.data?.agent_review_status) ? REVIEW_POLL_INTERVAL_MS : false,
+      // Stop the poll while the tab is hidden: an analyst who has tabbed away
+      // isn't watching the live review, and a backgrounded finding-detail page
+      // should not keep hitting the API every few seconds. react-query resumes
+      // the interval (and fires an immediate catch-up refetch) on refocus.
+      refetchIntervalInBackground: false,
     },
   });
 
@@ -313,6 +318,8 @@ export default function FindingDetail() {
         const status = grantStatus(latestGrantRef.current);
         return status === "pending" || status === "active" ? BREAK_GLASS_POLL_INTERVAL_MS : false;
       },
+      // Don't poll grant state while the tab is hidden — resumes on refocus.
+      refetchIntervalInBackground: false,
     },
   });
 
@@ -676,7 +683,7 @@ function statusBadge(status: string | undefined) {
   }
 }
 
-function AgentReviewCard({ finding }: AgentReviewCardProps) {
+export function AgentReviewCard({ finding }: AgentReviewCardProps) {
   const triage = finding.triage_verdict as null | {
     recommended_severity: string;
     recommended_action: string;
@@ -691,6 +698,24 @@ function AgentReviewCard({ finding }: AgentReviewCardProps) {
     prompt_injection_suspected: boolean;
     agrees_with_triage: boolean;
   };
+
+  // While a review is in flight (pending / in_progress) show a live "reviewing…"
+  // skeleton in place of the empty "No … verdict yet." copy, so the analyst sees
+  // the agents are actively working rather than a card that looks finished-but-
+  // empty. The parent page polls the finding on this same status (REVIEW_POLL),
+  // so the verdicts swap in automatically once the supervisor persists them.
+  const reviewing = isReviewActive(finding.agent_review_status);
+
+  const reviewingPlaceholder = (which: string) => (
+    <div
+      className="flex items-center gap-2 text-xs text-muted-foreground"
+      role="status"
+      aria-live="polite"
+    >
+      <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+      <span>Agents reviewing… waiting for {which} verdict</span>
+    </div>
+  );
 
   return (
     <Card>
@@ -719,6 +744,8 @@ function AgentReviewCard({ finding }: AgentReviewCardProps) {
               <Badge variant="destructive" className="text-xs"><ShieldAlert className="h-3 w-3 mr-1" /> Prompt injection suspected</Badge>
             )}
           </div>
+        ) : reviewing ? (
+          reviewingPlaceholder("triage")
         ) : (
           <p className="text-xs text-muted-foreground">No triage verdict yet.</p>
         )}
@@ -738,6 +765,8 @@ function AgentReviewCard({ finding }: AgentReviewCardProps) {
               <Badge variant="destructive" className="text-xs"><ShieldAlert className="h-3 w-3 mr-1" /> Prompt injection suspected</Badge>
             )}
           </div>
+        ) : reviewing ? (
+          reviewingPlaceholder("verifier")
         ) : (
           <p className="text-xs text-muted-foreground">No verifier verdict yet.</p>
         )}
@@ -918,6 +947,8 @@ export function ReviewHistoryCard({ findingId, reviewStatus }: { findingId: stri
     query: {
       queryKey: getGetFindingReviewHistoryQueryKey(findingId),
       refetchInterval: isReviewActive(reviewStatus) ? REVIEW_POLL_INTERVAL_MS : false,
+      // Don't poll review history while the tab is hidden — resumes on refocus.
+      refetchIntervalInBackground: false,
     },
   });
   const attempts = data?.attempts ?? [];

@@ -37,7 +37,7 @@
 // configured. Never throws and never changes the job's exit code — the workflow
 // step's own status is the source of truth for the run result.
 
-import { defaultTemporalDedupKey, postToChannels } from "./notify.mjs";
+import { defaultTemporalDedupKey, postToChannels, resolveTemporalGate } from "./notify.mjs";
 
 // A failed live-cluster gate is page-worthy but not a data-integrity incident,
 // so it maps to "high" — the same mapping the eval-gate notifier uses for a
@@ -106,8 +106,16 @@ export async function notifyTemporalGate({
   now = Date.now(),
 } = {}) {
   if (exitCode === 0) {
-    console.log(`[temporal-notify] gate '${name}' passed (exit 0); no alert`);
-    return { skipped: true, sent: [], severity: TEMPORAL_SEVERITY, exitCode };
+    // #90 recovery: a passing run clears any open Temporal-gate page on the SAME
+    // stable dedup key the failing run would have raised — the Temporal parallel
+    // of the eval-gate run notifier's auto-resolve. No trigger is ever posted on
+    // a green run; only PagerDuty has a resolve concept, so Slack/webhook stay
+    // untouched and this is inert when no PagerDuty channel is configured.
+    const { sent } = await resolveTemporalGate({ env, fetchImpl });
+    console.log(
+      `[temporal-notify] gate '${name}' passed (exit 0); no alert (cleared ${sent.length} pagerduty incident(s))`,
+    );
+    return { skipped: sent.length === 0, sent, severity: TEMPORAL_SEVERITY, exitCode };
   }
 
   console.warn(

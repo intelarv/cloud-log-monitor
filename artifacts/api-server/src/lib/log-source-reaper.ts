@@ -33,6 +33,13 @@ import { sql } from "drizzle-orm";
 import { db, pool } from "@workspace/db";
 import { appendLedger } from "./ledger";
 import { logger } from "./logger";
+import type { WorkflowEngine } from "./agents/workflow-engine";
+
+// Temporal cron cadence for the reaper (5-field cron). Only consulted on the
+// WORKFLOW_ENGINE=temporal path — the in-process path honors the env-configured
+// `intervalMs` instead (see startLogSourceReaper). Every 5 minutes mirrors the
+// notarizer cron; under Temporal the cron IS the production cadence knob.
+const LOG_SOURCE_REAPER_CRON = "*/5 * * * *";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -243,12 +250,35 @@ async function runReapOnce(config: ReaperConfig): Promise<void> {
   });
 }
 
-/** Start the periodic stuck-cursor reaper. Returns a stop() handle.
+/** Env-driven reaper cycle bound as the Temporal `runCycle` activity (see
+ *  log-source-reaper-steps.ts). The Temporal worker runs in its own process and
+ *  re-reads the opt-in config itself; this no-ops when the reaper is disabled,
+ *  so registering the workflow on the cluster is harmless when
+ *  `INGEST_SOURCE_STALL_AFTER_MS` is unset — same default-inert posture the
+ *  remediation-executor activity uses. The in-process path does NOT call this;
+ *  it runs `runReapOnce(config)` directly with the config captured in
+ *  startLogSourceReaper's closure. */
+export async function runReapCycleFromEnv(): Promise<void> {
+  const config = getReaperConfigFromEnv();
+  if (!config) return;
+  await runReapOnce(config);
+}
+
+/** Schedule the periodic stuck-cursor reaper through the WorkflowEngine seam,
+ *  mirroring `startNotarizer`. Returns a stop() handle.
  *
  *  Default-INERT: returns a no-op stop() (and schedules nothing) unless the
  *  opt-in `INGEST_SOURCE_STALL_AFTER_MS` is set. `cfgOverride` is for tests;
- *  `undefined` reads env, explicit `null` forces disabled. */
+ *  `undefined` reads env, explicit `null` forces disabled.
+ *
+ *  In-process: a leader-locked setInterval, byte-identical to the pre-seam timer
+ *  this replaces (the `run` callback is the same `runReapOnce(config)`). Under
+ *  WORKFLOW_ENGINE=temporal: a durable cron workflow (`logSourceReaperWorkflow`),
+ *  so the reaper gains the same single-execution + crash-resume guarantees as
+ *  the notarizer + review paths. The `cfgOverride` only affects the in-process
+ *  cadence (tests); the Temporal cadence is LOG_SOURCE_REAPER_CRON. */
 export function startLogSourceReaper(
+  engine: WorkflowEngine,
   cfgOverride?: ReaperConfig | null,
 ): () => void {
   const config =
@@ -260,13 +290,22 @@ export function startLogSourceReaper(
     return () => {};
   }
 
-  const timer = setInterval(() => void runReapOnce(config), config.intervalMs);
-  timer.unref?.();
+  const stop = engine.schedulePeriodic({
+    name: "log-source-reaper",
+    intervalMs: config.intervalMs,
+    cronSchedule: LOG_SOURCE_REAPER_CRON,
+    workflowType: "logSourceReaperWorkflow",
+    run: () => runReapOnce(config),
+  });
   logger.info(
-    { staleAfterMs: config.staleAfterMs, intervalMs: config.intervalMs },
-    "log-source reaper scheduled",
+    {
+      engine: engine.kind,
+      staleAfterMs: config.staleAfterMs,
+      intervalMs: config.intervalMs,
+    },
+    "log-source reaper scheduled via workflow engine",
   );
-  return () => clearInterval(timer);
+  return stop;
 }
 
 // Exported for direct testing without spinning up setInterval.

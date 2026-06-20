@@ -196,7 +196,7 @@ function scanIdentifyingUrls(
 //   - Tokens that collide with ordinary English words (e.g. Tang, Dang, Sun,
 //     Park, An, Li, Le) are deliberately omitted; recall on those few is a
 //     known, documented limitation that the production NER path closes.
-const GIVEN_NAMES = new Set<string>(
+export const GIVEN_NAMES = new Set<string>(
   (
     "james john robert michael david richard joseph thomas charles christopher " +
     "daniel matthew anthony donald steven andrew joshua kenneth kevin brian " +
@@ -230,7 +230,7 @@ const GIVEN_NAMES = new Set<string>(
     "ivan dmitri natasha olga vladimir anastasia yuri sergei nikolai tatiana"
   ).split(/\s+/),
 );
-const SURNAMES = new Set<string>(
+export const SURNAMES = new Set<string>(
   (
     "smith johnson williams brown jones garcia miller davis rodriguez martinez " +
     "hernandez lopez gonzalez wilson anderson thomas taylor moore jackson " +
@@ -309,7 +309,7 @@ const NAME_CONTEXT = new Set<string>([
 // regressing precision and stays deferred to the production NER path (M13.3 /
 // ARCHITECTURE.md §11). "An" is intentionally excluded even here — it is too
 // common a word for a context anchor alone to disambiguate safely.
-const COLLISION_SURNAMES = new Set<string>(
+export const COLLISION_SURNAMES = new Set<string>(
   "park sun tang dang li le song moon long".split(/\s+/),
 );
 const isCapitalizedName = (w: string): boolean => /^[A-Z][a-z]+$/.test(w);

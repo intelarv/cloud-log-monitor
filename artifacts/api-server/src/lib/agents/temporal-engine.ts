@@ -29,7 +29,12 @@ import { appendLedger, type LedgerWriteInput } from "../ledger";
 import { inProcessReviewActivities } from "./review-steps";
 import { workflowIdFor } from "./workflow-id";
 import type { ReviewActivities } from "./review-orchestration";
-import type { PeriodicJob, WorkflowEngine } from "./workflow-engine";
+import {
+  isExtendedPipelineEnabled,
+  type OneShotJob,
+  type PeriodicJob,
+  type WorkflowEngine,
+} from "./workflow-engine";
 
 // Re-exported from its own module so the review activities can derive their
 // per-step idempotency keys from the same value without importing this engine
@@ -63,6 +68,11 @@ export interface StartWorkflowArgs {
  *  wraps `@temporalio/client` + `@temporalio/worker`; tests inject a fake. */
 export interface TemporalRuntime {
   startWorkflow(args: StartWorkflowArgs): Promise<void>;
+  /** Start a one-shot workflow and AWAIT its result (no cron). Used by
+   *  `executeOneShot` for the reconcile + replay one-shots, which — unlike the
+   *  fire-and-forget review/periodic dispatches — need the workflow's return
+   *  value back at the call site. */
+  executeWorkflow(args: StartWorkflowArgs): Promise<unknown>;
   /** Run the worker; resolves only when the worker terminates. */
   runWorker(): Promise<void>;
   shutdown(): Promise<void>;
@@ -143,18 +153,45 @@ const defaultRuntimeFactory: TemporalRuntimeFactory = async (cfg, activities) =>
     ...tlsOpt,
     ...apiKeyOpt,
   });
-  // Register the notarizer activity set alongside review so the cron-driven
-  // notarizationWorkflow can resolve `runCycle` on the worker. Imported lazily
-  // (a local dynamic import) purely to keep this side-effecting impl off
-  // temporal-engine's top-level module graph; esbuild still bundles it.
+  // Register the notarizer + chain-verifier activity sets alongside review so the
+  // cron-driven notarizationWorkflow / chainVerify*Workflow can resolve their
+  // activities on the worker. Imported lazily (local dynamic imports) purely to
+  // keep these side-effecting impls off temporal-engine's top-level module
+  // graph; esbuild still bundles them.
   const { inProcessNotarizerActivities } = await import("./notarizer-steps");
+  const { inProcessChainVerifierActivities } = await import(
+    "./chain-verifier-steps"
+  );
+  const { inProcessRemediationExecutionActivities } = await import(
+    "./remediation-execution-steps"
+  );
+  const { inProcessLogSourceReaperActivities } = await import(
+    "./log-source-reaper-steps"
+  );
+  // One-shot job activity sets (search-index reconcile + fixture ingest replay),
+  // so executeOneShot's searchReindexWorkflow / ingestReplayWorkflow can resolve
+  // their activities on the worker.
+  const { inProcessSearchReindexActivities } = await import(
+    "./search-reindex-steps"
+  );
+  const { inProcessIngestReplayActivities } = await import(
+    "./ingest-replay-steps"
+  );
 
   const worker = await Worker.create({
     connection: workerConnection,
     namespace: cfg.namespace,
     taskQueue: cfg.taskQueue,
     workflowsPath: resolveWorkflowsPath(cfg),
-    activities: { ...activities, ...inProcessNotarizerActivities },
+    activities: {
+      ...activities,
+      ...inProcessNotarizerActivities,
+      ...inProcessChainVerifierActivities,
+      ...inProcessRemediationExecutionActivities,
+      ...inProcessLogSourceReaperActivities,
+      ...inProcessSearchReindexActivities,
+      ...inProcessIngestReplayActivities,
+    },
   });
 
   return {
@@ -164,6 +201,15 @@ const defaultRuntimeFactory: TemporalRuntimeFactory = async (cfg, activities) =>
         taskQueue,
         args,
         ...(cronSchedule ? { cronSchedule } : {}),
+      });
+    },
+    async executeWorkflow({ workflowId, workflowType, taskQueue, args }) {
+      // start + await result in one call; the one-shot caller needs the return
+      // value (reconcile/replay counts) back.
+      return client.workflow.execute(workflowType, {
+        workflowId,
+        taskQueue,
+        args,
       });
     },
     runWorker: () => worker.run(),
@@ -184,9 +230,46 @@ const defaultRuntimeFactory: TemporalRuntimeFactory = async (cfg, activities) =>
  *  the DB; an overflow drops only the *enqueue* of the agent review, loudly. */
 const MAX_PENDING_SUBMITS = 10_000;
 
+/** Cadence for the operator-visible counter heartbeat log. A structured line is
+ *  emitted every interval so operators can watch the pre-start buffer filling up
+ *  and dispatch failures trending *before* either becomes a flood — overridable
+ *  via TEMPORAL_METRICS_LOG_INTERVAL_MS (0 disables the heartbeat; the counters
+ *  are still maintained + queryable via `metrics()`). Default 60s. */
+const DEFAULT_METRICS_LOG_INTERVAL_MS = 60_000;
+
+function metricsLogIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env["TEMPORAL_METRICS_LOG_INTERVAL_MS"]?.trim();
+  if (raw === undefined || raw === "") return DEFAULT_METRICS_LOG_INTERVAL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_METRICS_LOG_INTERVAL_MS;
+}
+
+/** Operator-visible health counters for the durable engine. `buffered` is the
+ *  running total enqueued during the async start() window (cumulative, not the
+ *  live queue depth — see `pendingDepth`); `dispatched` is reviews handed to a
+ *  Temporal workflow start (incl. AlreadyStarted dedupes, which still mean the
+ *  review is covered); `dropped` is reviews that will never run, broken down by
+ *  reason so a buffer-overflow flood is distinguishable from start failures. */
+export interface TemporalEngineMetrics {
+  buffered: number;
+  dispatched: number;
+  dropped: number;
+  droppedByReason: Record<string, number>;
+  /** Live pre-start buffer depth (reviews waiting for the worker to come up). */
+  pendingDepth: number;
+}
+
 export class TemporalWorkflowEngine implements WorkflowEngine {
   readonly kind = "temporal" as const;
   private runtime: TemporalRuntime | null = null;
+  /** Cumulative health counters — see TemporalEngineMetrics. */
+  private readonly counters = {
+    buffered: 0,
+    dispatched: 0,
+    dropped: 0,
+    droppedByReason: Object.create(null) as Record<string, number>,
+  };
+  private metricsTimer: ReturnType<typeof setInterval> | null = null;
   /** idle -> starting -> running -> stopped. submitReview buffers while
    *  idle/starting (the async start() window), dispatches while running, and
    *  drops while stopped (shutdown in progress). */
@@ -229,6 +312,9 @@ export class TemporalWorkflowEngine implements WorkflowEngine {
     reason: string,
     extra: Record<string, unknown> = {},
   ): void {
+    this.counters.dropped += 1;
+    this.counters.droppedByReason[reason] =
+      (this.counters.droppedByReason[reason] ?? 0) + 1;
     void this.ledgerWrite({
       tenantId,
       actor: { kind: "system", id: "temporal_engine" },
@@ -261,6 +347,7 @@ export class TemporalWorkflowEngine implements WorkflowEngine {
       { namespace: this.cfg.namespace, taskQueue: this.cfg.taskQueue },
       "temporal workflow engine started",
     );
+    this.startMetricsHeartbeat();
     // Flush anything enqueued during the async startup window so a
     // finding.created that arrived before the worker was up is not lost.
     const buffered = this.pending.splice(0, this.pending.length);
@@ -275,9 +362,30 @@ export class TemporalWorkflowEngine implements WorkflowEngine {
     this.phase = "stopped";
     this.pending.length = 0;
     this.pendingPeriodic.length = 0;
+    if (this.metricsTimer) {
+      clearInterval(this.metricsTimer);
+      this.metricsTimer = null;
+    }
     if (!wasRunning || !this.runtime) return;
     await this.runtime.shutdown();
     this.runtime = null;
+  }
+
+  /** Emit the operator-visible counter snapshot on a cadence so the
+   *  buffered-vs-dispatched ratio + dispatch-failure trend are observable in the
+   *  log stream (and scrapeable) without a metrics backend. Disabled when the
+   *  interval is 0; `.unref()` so it never keeps the process alive on its own. */
+  private startMetricsHeartbeat(): void {
+    const intervalMs = metricsLogIntervalMs();
+    if (intervalMs <= 0) return;
+    const timer = setInterval(() => {
+      logger.info(
+        { engine: "temporal", ...this.metrics() },
+        "temporal engine counters",
+      );
+    }, intervalMs);
+    timer.unref?.();
+    this.metricsTimer = timer;
   }
 
   submitReview(findingId: string, tenantId: string): void {
@@ -286,7 +394,12 @@ export class TemporalWorkflowEngine implements WorkflowEngine {
       return;
     }
     if (this.phase === "stopped") {
+      // Shutdown is in progress: the worker is gone, so this finding will never
+      // get its Triage->Verifier verdict. Don't lose that silently in a log
+      // line — ledger it (high) so the gap is on the tamper-evident record and
+      // operators are paged, exactly like the pre-start buffer-overflow drop.
       logger.warn({ findingId }, "temporal engine stopped; dropping submitReview");
+      this.ledgerReviewDropped(findingId, tenantId, "engine_stopped");
       return;
     }
     // idle/starting: buffer until the worker is up so the async startup window
@@ -301,7 +414,50 @@ export class TemporalWorkflowEngine implements WorkflowEngine {
       });
       return;
     }
+    this.counters.buffered += 1;
     this.pending.push({ findingId, tenantId });
+  }
+
+  /** Operator-visible snapshot of the engine's health counters. Returned as a
+   *  defensive copy so callers (a metrics endpoint, a test) can't mutate the
+   *  live counters. */
+  metrics(): TemporalEngineMetrics {
+    return {
+      buffered: this.counters.buffered,
+      dispatched: this.counters.dispatched,
+      dropped: this.counters.dropped,
+      droppedByReason: { ...this.counters.droppedByReason },
+      pendingDepth: this.pending.length,
+    };
+  }
+
+  async executeOneShot<T>(job: OneShotJob<T>): Promise<T> {
+    if (this.phase === "running" && this.runtime) {
+      // Unique id per execution: one-shots are NOT deduped like reviews (each
+      // operator replay / boot reconcile is a distinct run), so a fixed id would
+      // hit AlreadyStarted on the second call.
+      const workflowId = `oneshot-${job.name}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      return (await this.runtime.executeWorkflow({
+        workflowId,
+        workflowType: job.workflowType,
+        taskQueue: this.cfg.taskQueue,
+        args: job.args ?? [],
+      })) as T;
+    }
+    // idle/starting/stopped: the worker isn't available to run the durable
+    // workflow, but a one-shot's result is still needed by its caller (boot
+    // reconcile logs it; the replay route returns it). Run inline as a
+    // best-effort fallback rather than buffering an AWAITED result across the
+    // async start boundary. The work is idempotent (reconcile) or dev-only
+    // (replay), so an inline run is safe. The boot reconcile legitimately hits
+    // this path: it runs before startAgentSupervisor selects+starts the engine.
+    logger.warn(
+      { job: job.name, phase: this.phase },
+      "temporal engine not running; executing one-shot inline",
+    );
+    return job.run();
   }
 
   schedulePeriodic(job: PeriodicJob): () => void {
@@ -343,17 +499,33 @@ export class TemporalWorkflowEngine implements WorkflowEngine {
     const runtime = this.runtime;
     if (!runtime) return;
     const workflowId = workflowIdFor(tenantId, findingId);
+    // M23: read the extended-pipeline flag client-side at dispatch and freeze it
+    // into the workflow args so the workflow body stays deterministic (a workflow
+    // must never read process.env on the cluster). Default off ⇒ args identical
+    // to the pre-M23 shape barring the explicit false, and the workflow takes the
+    // byte-identical two-agent path.
+    const extendedPipeline = isExtendedPipelineEnabled();
     void runtime
       .startWorkflow({
         workflowId,
         workflowType: "reviewFindingWorkflow",
         taskQueue: this.cfg.taskQueue,
-        args: [{ findingId, tenantId }],
+        args: [{ findingId, tenantId, extendedPipeline }],
+      })
+      .then(() => {
+        // A fresh start, or a no-op confirmed by AlreadyStarted below — either
+        // way the review is covered by a live workflow, so count it dispatched.
+        this.counters.dispatched += 1;
       })
       .catch((err) => {
         // Duplicate emit for the same finding -> Temporal refuses the second
-        // start. That IS the idempotency guarantee; swallow it quietly.
-        if (isAlreadyStartedError(err)) return;
+        // start. That IS the idempotency guarantee; swallow it quietly. The
+        // review is still covered by the existing workflow, so it counts as
+        // dispatched (not dropped).
+        if (isAlreadyStartedError(err)) {
+          this.counters.dispatched += 1;
+          return;
+        }
         logger.error({ err, findingId }, "temporal startWorkflow failed");
         // A non-idempotency start failure means this finding's review was never
         // dispatched (dispatch is fire-and-forget with no retry). Surface it so

@@ -30,6 +30,8 @@ import { getAgentInvoker } from "../a2a";
 import { workflowIdFor } from "./workflow-id";
 import { triageAgentIdentity, type TriageVerdict } from "./triage";
 import { verifierAgentIdentity, type VerifierVerdict } from "./verifier";
+import { contextAgentIdentity, type ContextVerdict } from "./context";
+import { notifierAgentIdentity, type NotifierDraft } from "./notifier";
 import {
   budgetExceeded,
   chargeBudget,
@@ -42,6 +44,8 @@ import type {
   ReviewJob,
   TriageStepResult,
   VerifierStepResult,
+  ContextStepResult,
+  NotifierStepResult,
 } from "./review-orchestration";
 
 const REDACTED_RATIONALE = "<REDACTED: agent output contained PHI/secrets>";
@@ -112,8 +116,8 @@ async function persistStatus(
 
 async function checkBudgetPre(job: ReviewJob): Promise<BudgetCheck> {
   return {
-    exceeded: budgetExceeded(job.tenantId),
-    tokensUsedToday: tokensUsedToday(job.tenantId),
+    exceeded: await budgetExceeded(job.tenantId),
+    tokensUsedToday: await tokensUsedToday(job.tenantId),
   };
 }
 
@@ -159,8 +163,8 @@ async function triageStep(
     const triage = (existing.payload as { verdict: TriageVerdict }).verdict;
     return {
       triage,
-      budgetExceededAfter: budgetExceeded(tenantId),
-      tokensUsedToday: tokensUsedToday(tenantId),
+      budgetExceededAfter: await budgetExceeded(tenantId),
+      tokensUsedToday: await tokensUsedToday(tenantId),
     };
   }
 
@@ -214,12 +218,12 @@ async function triageStep(
   // only residual is a rare single-step undercount if the activity crashes in
   // the narrow window between the write and this line — acceptable for the
   // per-process best-effort budget; it is never a double-charge.
-  if (!deduped) chargeBudget(tenantId, t.approxOutputTokens);
+  if (!deduped) await chargeBudget(tenantId, t.approxOutputTokens);
 
   return {
     triage,
-    budgetExceededAfter: budgetExceeded(tenantId),
-    tokensUsedToday: tokensUsedToday(tenantId),
+    budgetExceededAfter: await budgetExceeded(tenantId),
+    tokensUsedToday: await tokensUsedToday(tenantId),
   };
 }
 
@@ -305,9 +309,138 @@ async function verifierStep(
 
   // Charge after, and only if, this call performed the dedupe-gate INSERT — see
   // triageStep for the exactly-once-under-concurrency reasoning.
-  if (!deduped) chargeBudget(tenantId, v.approxOutputTokens);
+  if (!deduped) await chargeBudget(tenantId, v.approxOutputTokens);
 
   return { verifier };
+}
+
+// M23 (extended pipeline only). Same shape as triageStep/verifierStep: idempotency
+// gate → invoke → PHI-scan rationale BEFORE the ledger → dedupe-gated charge. The
+// Context verdict's free-text `summary` is the only field that could echo PHI, so
+// it is the scanned/redacted surface.
+async function contextStep(
+  job: ReviewJob,
+  finding: FindingSafe,
+): Promise<ContextStepResult> {
+  const { tenantId, findingId } = job;
+  const attempt = finding.agentReviewAttempt;
+  const completeKey = stepKey(job, "context", attempt);
+
+  const existing = await getLedgerEntryByIdempotencyKey(completeKey);
+  if (existing) {
+    const context = (existing.payload as { verdict: ContextVerdict }).verdict;
+    return { context };
+  }
+
+  const invoker = getAgentInvoker();
+  const c = await invoker.context(finding);
+  let context = c.verdict;
+
+  const hits = scanForPhi(context.summary);
+  if (hits.length > 0) {
+    await appendLedger({
+      tenantId,
+      actor: { kind: "system", id: "supervisor" },
+      eventType: "agent.output_phi_detected",
+      subjectType: "finding",
+      subjectId: findingId,
+      payload: {
+        finding_id: findingId,
+        stage: "context",
+        detectors: Array.from(new Set(hits.map((h) => h.detector))),
+        agent_identity: contextAgentIdentity(c.modelId),
+      },
+      idempotencyKey: stepKey(job, "context:phi", attempt),
+    });
+    context = { ...context, summary: REDACTED_RATIONALE };
+  }
+
+  const { deduped } = await appendLedgerWithStatus({
+    tenantId,
+    actor: { kind: "system", id: "supervisor" },
+    eventType: "agent.context_complete",
+    subjectType: "finding",
+    subjectId: findingId,
+    payload: {
+      finding_id: findingId,
+      agent_identity: contextAgentIdentity(c.modelId),
+      verdict: context,
+      approx_output_tokens: c.approxOutputTokens,
+    },
+    idempotencyKey: completeKey,
+  });
+
+  if (!deduped) await chargeBudget(tenantId, c.approxOutputTokens);
+
+  return { context };
+}
+
+// M23 (extended pipeline only). DRAFTS a notification; NEVER sends — HITL is
+// preserved (real dispatch stays behind the channel router). The draft's
+// free-text `subject`+`body` are PHI-scanned before the ledger; on a hit BOTH
+// are redacted so no PHI can land in the immutable audit row.
+async function notifierStep(
+  job: ReviewJob,
+  finding: FindingSafe,
+  triage: TriageVerdict,
+  verifier: VerifierVerdict,
+  context: ContextVerdict,
+): Promise<NotifierStepResult> {
+  const { tenantId, findingId } = job;
+  const attempt = finding.agentReviewAttempt;
+  const completeKey = stepKey(job, "notifier", attempt);
+
+  const existing = await getLedgerEntryByIdempotencyKey(completeKey);
+  if (existing) {
+    const notifier = (existing.payload as { verdict: NotifierDraft }).verdict;
+    return { notifier };
+  }
+
+  const invoker = getAgentInvoker();
+  const n = await invoker.notify(finding, triage, verifier, context);
+  let notifier = n.verdict;
+
+  const hits = scanForPhi(`${notifier.subject}\n${notifier.body}`);
+  if (hits.length > 0) {
+    await appendLedger({
+      tenantId,
+      actor: { kind: "system", id: "supervisor" },
+      eventType: "agent.output_phi_detected",
+      subjectType: "finding",
+      subjectId: findingId,
+      payload: {
+        finding_id: findingId,
+        stage: "notifier",
+        detectors: Array.from(new Set(hits.map((h) => h.detector))),
+        agent_identity: notifierAgentIdentity(n.modelId),
+      },
+      idempotencyKey: stepKey(job, "notifier:phi", attempt),
+    });
+    notifier = {
+      ...notifier,
+      subject: REDACTED_RATIONALE,
+      body: REDACTED_RATIONALE,
+    };
+  }
+
+  const { deduped } = await appendLedgerWithStatus({
+    tenantId,
+    actor: { kind: "system", id: "supervisor" },
+    eventType: "agent.notify_drafted",
+    subjectType: "finding",
+    subjectId: findingId,
+    payload: {
+      finding_id: findingId,
+      agent_identity: notifierAgentIdentity(n.modelId),
+      verdict: notifier,
+      approx_output_tokens: n.approxOutputTokens,
+    },
+    idempotencyKey: completeKey,
+  });
+
+  if (!deduped) await chargeBudget(tenantId, n.approxOutputTokens);
+
+  return { notifier };
 }
 
 async function persistCompleted(
@@ -352,6 +485,8 @@ export const inProcessReviewActivities: ReviewActivities = {
   triageStep,
   persistSkippedAfterTriage,
   verifierStep,
+  contextStep,
+  notifierStep,
   persistCompleted,
   persistFailed,
 };

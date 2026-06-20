@@ -8,6 +8,7 @@ export {
 export {
   initChannels,
   dispatchAlertFromLedger,
+  hasConfiguredChannels,
   __setChannelsForTest,
   __resetChannelsForTest,
   __drainChannelsForTest,

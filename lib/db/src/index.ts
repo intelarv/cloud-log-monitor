@@ -11,5 +11,7 @@ export { SETUP_SQL, buildSetupSql, type SetupSqlOptions } from "./setup-sql";
 export {
   provisionTenantEmbeddingPartition,
   isFindingEmbeddingsPartitionedInDb,
+  provisionTenantChatEmbeddingPartition,
+  isChatEmbeddingsPartitionedInDb,
   type ProvisionPartitionResult,
 } from "./tenant-partition";

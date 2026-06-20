@@ -61,6 +61,18 @@ export const ALERT_RULES: Record<string, AlertSeverity> = {
   // so it belongs in the alert stream as an audit signal ("who authorized what
   // remediation in the last 24h") without needing SQL access.
   "remediation.confirmed": "warning",
+  // The channel-send remediation executor acted on a CONFIRMED `notify_owner`
+  // (or routed) proposal by emitting this PHI-safe event, which the post-commit
+  // dispatch hook fans out to the configured channels. Warning — it carries
+  // only ids + the categorical action_type (no free text), and it IS the
+  // notification action itself, so it must be in the alert stream to route.
+  "remediation.notify_dispatched": "warning",
+  // The executing worker tried to act on a CONFIRMED proposal and the executor
+  // failed (or threw). High — an authorized remediation did NOT happen, so the
+  // exposure the proposal was meant to close is still open and a human needs to
+  // look. The PHI-safe failure reason is in the row's execution_error column;
+  // the ledger payload carries only ids + a static reason.
+  "remediation.execution_failed": "high",
   // M0: ledger chain mismatch detected at boot. Critical — the integrity
   // claim is dead until resolved. (The boot path already logger.error's
   // and refuses to listen; this rule covers the case where a future
@@ -278,6 +290,13 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   "auth.step_up_granted",
   // Single step-up failure — alerted only on threshold (rolling 3/5min).
   "auth.step_up_failed",
+  // TOTP second-factor enrollment lifecycle (STEP_UP_PROVIDER=totp). Starting
+  // and confirming an authenticator enrollment are legitimate self-service
+  // actions; a single enroll-verify failure is a typo (same posture as a single
+  // step_up_failed). All auditable in the ledger; none page on-call.
+  "auth.step_up_enroll_started",
+  "auth.step_up_enrolled",
+  "auth.step_up_enroll_failed",
   // Legitimate break-glass flow events. The `break_glass.raw_phi_accessed`
   // event IS the security-relevant one (warning-level above); grant +
   // approval are gated by step-up + the two-person rule.
@@ -296,6 +315,13 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // lifecycle.
   "remediation.proposed",
   "remediation.rejected",
+  // The executing worker successfully acted on a CONFIRMED proposal. The
+  // alertable moment in this lifecycle is `remediation.confirmed` (warning —
+  // when a proposal becomes authorized to act) and `remediation.execution_failed`
+  // (high — when an authorized action did NOT happen). A successful execution is
+  // the expected outcome and *reduces* exposure; it stays auditable in the
+  // ledger like the rest of the lifecycle without paging.
+  "remediation.executed",
   // Finding lifecycle — the notifier handles severity-based routing per
   // §291; not in scope of the alert hook.
   "finding.created",
@@ -329,6 +355,12 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   // event (`agent.review_failed`, warning above) is the alertable one.
   "agent.triage_complete",
   "agent.verifier_complete",
+  // M23: extended-pipeline (AGENT_PIPELINE_EXTENDED) Context + Notifier steps.
+  // Same posture as triage/verifier completes — high-volume per-finding audit
+  // rows, not page-worthy. The Notifier only DRAFTS (never sends); the actual
+  // outbound dispatch (`channel.send_*`) is what carries alert semantics.
+  "agent.context_complete",
+  "agent.notify_drafted",
   // M6: every successful channel send is ledgered (per-access audit
   // trail per threat_model §Repudiation), but high-volume — one row per
   // outbound alert per channel. The failure / blocked / throttled

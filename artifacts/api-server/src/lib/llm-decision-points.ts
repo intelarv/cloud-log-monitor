@@ -17,8 +17,11 @@
 // byte-identical to the pre-M17 single-runtime behavior. The credential-free
 // eval gate sets none of these vars, so it stays byte-identical.
 //
-// The input-based LLM *router* (pick a model per request from the input) is a
-// deferred future milestone (see docs/MILESTONES.md) — this module only does
+// The DYNAMIC, input-based LLM *router* (pick a model per REQUEST from the
+// input's content + risk) is layered ON TOP of this module in `llm-router.ts`:
+// it classifies a request into a tier and, when that tier is configured, builds
+// a runtime via the same factory below; otherwise it falls back to this module's
+// static per-point selection (so the two compose). This module remains purely
 // static per-point selection.
 
 import {
@@ -32,20 +35,31 @@ import {
 } from "./llm-runtime";
 import { logger } from "./logger";
 
-export type LlmDecisionPoint = "chat" | "triage" | "verifier" | "summary";
+export type LlmDecisionPoint =
+  | "chat"
+  | "triage"
+  | "verifier"
+  | "summary"
+  | "context"
+  | "notifier";
 
 export const ALL_LLM_DECISION_POINTS: readonly LlmDecisionPoint[] = [
   "chat",
   "triage",
   "verifier",
   "summary",
+  "context",
+  "notifier",
 ];
 
 // Maps a global config env var (read by loadLlmRuntimeConfigFromEnv /
 // createLlmRuntime) to its per-point suffix. A per-point var
 // `LLM_<POINT>_<suffix>` overlays the corresponding global var when set.
 // `LLM_DEFAULT_MODEL` is surfaced as the friendlier `..._MODEL`.
-const OVERLAY_KEYS: Readonly<Record<string, string>> = {
+// Exported so the input-based router (`llm-router.ts`) can reuse the EXACT same
+// global-key ⇄ suffix mapping for its per-tier overlay (`LLM_ROUTER_<TIER>_*`),
+// keeping a single source of truth (no drift if a new credential key is added).
+export const OVERLAY_KEYS: Readonly<Record<string, string>> = {
   LLM_PROVIDER: "PROVIDER",
   LLM_DEFAULT_MODEL: "MODEL",
   AWS_REGION: "AWS_REGION",

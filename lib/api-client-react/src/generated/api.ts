@@ -55,8 +55,12 @@ import type {
   ResolveFindingResult,
   ReviewHistory,
   Session,
+  StepUpEnrollResult,
+  StepUpEnrollVerifyInput,
+  StepUpEnrollVerifyResult,
   StepUpInput,
   StepUpResult,
+  StepUpStatus,
   ToolGetFindingInput
 } from './api.schemas';
 
@@ -1416,6 +1420,230 @@ export const useStepUp = <TError = ErrorType<ErrorResponse>,
         TContext
       > => {
       return useMutation(getStepUpMutationOptions(options));
+    }
+
+export const getStepUpStatusUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/status`
+}
+
+/**
+ * @summary Active step-up provider and (for TOTP) the caller's factor status.
+ */
+export const stepUpStatus = async ( options?: RequestInit): Promise<StepUpStatus> => {
+
+  return customFetch<StepUpStatus>(getStepUpStatusUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getStepUpStatusQueryKey = () => {
+    return [
+    `/api/auth/step-up/status`
+    ] as const;
+    }
+
+
+export const getStepUpStatusQueryOptions = <TData = Awaited<ReturnType<typeof stepUpStatus>>, TError = ErrorType<unknown>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof stepUpStatus>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getStepUpStatusQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof stepUpStatus>>> = ({ signal }) => stepUpStatus({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof stepUpStatus>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type StepUpStatusQueryResult = NonNullable<Awaited<ReturnType<typeof stepUpStatus>>>
+export type StepUpStatusQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary Active step-up provider and (for TOTP) the caller's factor status.
+ */
+
+export function useStepUpStatus<TData = Awaited<ReturnType<typeof stepUpStatus>>, TError = ErrorType<unknown>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof stepUpStatus>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getStepUpStatusQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getStepUpEnrollUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/enroll`
+}
+
+/**
+ * @summary Provision a fresh TOTP secret (STEP_UP_PROVIDER=totp only). Returns the
+otpauth URI + base32 secret to display once; the factor is UNVERIFIED
+until confirmed.
+
+ */
+export const stepUpEnroll = async ( options?: RequestInit): Promise<StepUpEnrollResult> => {
+
+  return customFetch<StepUpEnrollResult>(getStepUpEnrollUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpEnrollMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpEnroll>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpEnroll>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpEnroll'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpEnroll>>, void> = () => {
+
+
+          return  stepUpEnroll(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpEnrollMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpEnroll>>>
+
+    export type StepUpEnrollMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Provision a fresh TOTP secret (STEP_UP_PROVIDER=totp only). Returns the
+otpauth URI + base32 secret to display once; the factor is UNVERIFIED
+until confirmed.
+
+ */
+export const useStepUpEnroll = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpEnroll>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpEnroll>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpEnrollMutationOptions(options));
+    }
+
+export const getStepUpEnrollVerifyUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/enroll/verify`
+}
+
+/**
+ * @summary Confirm a pending TOTP enrollment with a live 6-digit code.
+ */
+export const stepUpEnrollVerify = async (stepUpEnrollVerifyInput: StepUpEnrollVerifyInput, options?: RequestInit): Promise<StepUpEnrollVerifyResult> => {
+
+  return customFetch<StepUpEnrollVerifyResult>(getStepUpEnrollVerifyUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      stepUpEnrollVerifyInput,)
+  }
+);}
+
+
+
+
+export const getStepUpEnrollVerifyMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpEnrollVerify>>, TError,{data: BodyType<StepUpEnrollVerifyInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpEnrollVerify>>, TError,{data: BodyType<StepUpEnrollVerifyInput>}, TContext> => {
+
+const mutationKey = ['stepUpEnrollVerify'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpEnrollVerify>>, {data: BodyType<StepUpEnrollVerifyInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  stepUpEnrollVerify(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpEnrollVerifyMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpEnrollVerify>>>
+    export type StepUpEnrollVerifyMutationBody = BodyType<StepUpEnrollVerifyInput>
+    export type StepUpEnrollVerifyMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Confirm a pending TOTP enrollment with a live 6-digit code.
+ */
+export const useStepUpEnrollVerify = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpEnrollVerify>>, TError,{data: BodyType<StepUpEnrollVerifyInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpEnrollVerify>>,
+        TError,
+        {data: BodyType<StepUpEnrollVerifyInput>},
+        TContext
+      > => {
+      return useMutation(getStepUpEnrollVerifyMutationOptions(options));
     }
 
 export const getListBreakGlassGrantsUrl = () => {

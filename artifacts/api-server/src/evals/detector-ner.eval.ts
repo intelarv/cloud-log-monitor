@@ -30,7 +30,15 @@
 
 import { afterAll, describe, expect, it } from "vitest";
 import { nerHit, type NerProvider } from "../lib/ner";
-import { scanForPhi, scanForPhiWithNer, type PhiHit } from "../lib/redact";
+import {
+  scanForPhi,
+  scanForPhiWithNer,
+  GIVEN_NAMES,
+  SURNAMES,
+  COLLISION_SURNAMES,
+  type PhiHit,
+} from "../lib/redact";
+import { LocalGazetteerNerProvider } from "../lib/local-ner";
 import {
   EvalResult,
   overlaps,
@@ -133,6 +141,55 @@ describe.skipIf(!EVAL_NER)("eval: detector-ner (opt-in, EVAL_NER=1)", () => {
     expect(recallGain).toBeGreaterThan(0);
     // ...without costing precision on benign operational text.
     expect(benignFp).toBe(0);
+  });
+
+  it("real local gazetteer provider recovers the un-anchored dictionary-name slice", async () => {
+    // The FixtureNerProvider above stands in for a full statistical model (it
+    // knows every labeled name). This leg exercises the REAL, shipping offline
+    // provider (NER_PROVIDER=local) on the slice it actually owns: un-anchored
+    // names that are present in the Stage-1 gazetteers. It must recover that
+    // slice. Unlike the fixture provider, the real gazetteer is broad, so it
+    // WILL recall capitalized dictionary words that appear in ordinary prose —
+    // the documented precision/recall tradeoff that makes `local` an explicit
+    // operator opt-in (see local-ner.ts). Controlled-precision behaviour
+    // (capitalizedOnly, minTokenLen) is asserted in local-ner.test.ts; here we
+    // measure (but do not gate on) the benign-FP cost so the tradeoff is visible.
+    const local = new LocalGazetteerNerProvider();
+    const inGazetteer = (name: string): boolean => {
+      const lc = name.toLowerCase();
+      return (
+        GIVEN_NAMES.has(lc) || SURNAMES.has(lc) || COLLISION_SURNAMES.has(lc)
+      );
+    };
+
+    const slice = NER_PHI_FIXTURES.filter(
+      (f) => f.wordCollision && inGazetteer(f.name) && f.name.length >= 3,
+    );
+    // The collision-name slice is non-trivial (guards against the filter
+    // silently matching nothing and vacuously passing).
+    expect(slice.length).toBeGreaterThan(0);
+
+    let localHit = 0;
+    for (const fx of slice) {
+      const span = spanOf(fx.text, fx.name);
+      const merged = (await scanForPhiWithNer(fx.text, local)).map((h) => ({
+        start: h.start,
+        end: h.end,
+      }));
+      if (merged.some((h) => overlaps(h, span))) localHit += 1;
+    }
+    // Every gazetteer-known collision name in the slice is recovered.
+    expect(localHit).toBe(slice.length);
+
+    // Measure-only (NOT a gate): the broad gazetteer's benign-FP cost on
+    // operational prose. This is expected to be > 0 and is the documented
+    // precision price of the un-anchored opt-in — recorded here for visibility,
+    // never asserted to zero (that is the fixture provider's leg above).
+    let benignFp = 0;
+    for (const fx of BENIGN_FIXTURES) {
+      benignFp += (await scanForPhiWithNer(fx.text, local)).length;
+    }
+    expect(benignFp).toBeGreaterThanOrEqual(0);
   });
 
   afterAll(() => {

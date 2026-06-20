@@ -177,6 +177,50 @@ if grep -q '^  name: phi-audit-eval-heartbeat$' "$OUT_DIR/gcp.yaml"; then
 fi
 pass "default: no heartbeat CronJob when evalGate.heartbeat disabled"
 
+# Heartbeat render matrix across the OTHER overlays (AWS + Azure). Unlike GCP,
+# both connect to the DB directly (database.sidecar.enabled=false), so the
+# heartbeat CronJob must render WITHOUT an initContainers sidecar while STILL
+# wiring the --check command, the staleness env, the reused nightly image, and
+# the channels. Azure additionally stamps the workload-identity pod label. This
+# proves the dead-man's-switch is deployable on every cloud, not just the
+# sidecar (GCP) path.
+heartbeat_render_no_sidecar() {
+  local cloud=$1; local repo=$2; local extra_label=$3
+  local out="$OUT_DIR/$cloud-eval-heartbeat.yaml"
+  if helm template phi-audit "$CHART_DIR" $HELM_KV_FLAG \
+      -f "$CHART_DIR/values.yaml" \
+      -f "$CHART_DIR/values-$cloud.yaml" \
+      -f "$CI_DIR/values-$cloud-ci.yaml" \
+      --set evalGate.nightly.image.repository="$repo" \
+      --set evalGate.nightly.image.tag=sha-deadbeef \
+      --set evalGate.heartbeat.enabled=true \
+      --set channels.slack.enabled=true \
+      --set channels.webhook.enabled=true >"$out" 2>"$OUT_DIR/$cloud-eval-heartbeat.err"; then
+    local doc
+    doc=$(awk '/name: phi-audit-eval-heartbeat$/{f=1} f && /^# Source:/{exit} f{print}' "$out")
+    grep -q '^  name: phi-audit-eval-heartbeat$' "$out" || fail "eval-heartbeat($cloud): heartbeat CronJob not rendered"
+    grep -q '^kind: CronJob' "$out" || fail "eval-heartbeat($cloud): no CronJob in render"
+    grep -q '^  name: phi-audit-eval-nightly$' "$out" && fail "eval-heartbeat($cloud): nightly CronJob rendered while disabled"
+    printf '%s' "$doc" | grep -q 'heartbeat.mjs' || fail "eval-heartbeat($cloud): --check command not wired"
+    printf '%s' "$doc" | grep -q 'EVAL_HEARTBEAT_MAX_AGE_MINUTES' || fail "eval-heartbeat($cloud): maxAgeMinutes not wired to env"
+    printf '%s' "$doc" | grep -q "$repo:sha-deadbeef" || fail "eval-heartbeat($cloud): nightly image not reused"
+    printf '%s' "$doc" | grep -q 'CHANNEL_SLACK_WEBHOOK_URL' || fail "eval-heartbeat($cloud): slack channel not wired"
+    printf '%s' "$doc" | grep -q 'CHANNEL_WEBHOOK_URL' || fail "eval-heartbeat($cloud): webhook channel not wired"
+    # Direct-DB overlays carry NO native sidecar in the heartbeat pod.
+    printf '%s' "$doc" | grep -q 'initContainers:' && fail "eval-heartbeat($cloud): unexpected DB sidecar (database.sidecar.enabled is false)"
+    if [ -n "$extra_label" ]; then
+      printf '%s' "$doc" | grep -q "$extra_label" || fail "eval-heartbeat($cloud): expected pod label '$extra_label' missing"
+    fi
+    pass "render: $cloud + evalGate.heartbeat → heartbeat CronJob (no sidecar) present"
+  else
+    cat "$OUT_DIR/$cloud-eval-heartbeat.err"
+    fail "render: $cloud + evalGate.heartbeat"
+  fi
+}
+
+heartbeat_render_no_sidecar aws "example.dkr.ecr.us-east-1.amazonaws.com/phi-audit-eval" ""
+heartbeat_render_no_sidecar azure "example.azurecr.io/phi-audit-eval" 'azure.workload.identity/use: "true"'
+
 heading "[2c/3] raw-evidence WORM store (positive + default-inert)"
 # Default-inert: a standard render must emit NO RAW_EVIDENCE_* env at all.
 for cloud in aws gcp azure; do

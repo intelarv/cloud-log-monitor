@@ -34,8 +34,18 @@ import {
   jsonRpcHandler,
   UserBuilder,
 } from "@a2a-js/sdk/server/express";
-import { TriageExecutor, VerifierExecutor } from "./executors";
-import { buildTriageCard, buildVerifierCard } from "./cards";
+import {
+  TriageExecutor,
+  VerifierExecutor,
+  ContextExecutor,
+  NotifierExecutor,
+} from "./executors";
+import {
+  buildTriageCard,
+  buildVerifierCard,
+  buildContextCard,
+  buildNotifierCard,
+} from "./cards";
 import { a2aAuthMiddleware, getA2ABaseUrl } from "./auth";
 import { a2aMtlsMiddleware } from "./transport";
 import { a2aPeerBindingMiddleware } from "./peer-identity";
@@ -43,13 +53,19 @@ import {
   a2aScopeMiddleware,
   TRIAGE_AUDIENCE,
   VERIFY_AUDIENCE,
+  CONTEXT_AUDIENCE,
+  NOTIFY_AUDIENCE,
   TRIAGE_SKILL,
   VERIFY_SKILL,
+  CONTEXT_SKILL,
+  NOTIFY_SKILL,
 } from "./caller-identity";
 import {
   A2A_CARD_SUFFIX,
   TRIAGE_AGENT_PATH,
   VERIFY_AGENT_PATH,
+  CONTEXT_AGENT_PATH,
+  NOTIFY_AGENT_PATH,
 } from "./protocol";
 
 export function mountA2AAgents(app: Express): void {
@@ -101,6 +117,60 @@ export function mountA2AAgents(app: Express): void {
     a2aPeerBindingMiddleware,
     jsonRpcHandler({
       requestHandler: verifierHandler,
+      userBuilder: UserBuilder.noAuthentication,
+    }),
+  );
+
+  // M23: Context + Notifier extended-pipeline agents. Mounted unconditionally
+  // (same as Triage/Verifier) — they are only INVOKED when AGENT_PIPELINE_EXTENDED
+  // is on, so default boot is byte-identical in behavior. Same defense-in-depth
+  // ladder; redacted-only payloads.
+  const contextHandler = new DefaultRequestHandler(
+    buildContextCard(baseUrl),
+    new InMemoryTaskStore(),
+    new ContextExecutor(),
+  );
+  app.use(
+    `${CONTEXT_AGENT_PATH}${A2A_CARD_SUFFIX}`,
+    a2aMtlsMiddleware,
+    a2aAuthMiddleware,
+    agentCardHandler({
+      agentCardProvider: () => Promise.resolve(buildContextCard(getA2ABaseUrl())),
+    }),
+  );
+  app.use(
+    CONTEXT_AGENT_PATH,
+    a2aMtlsMiddleware,
+    a2aAuthMiddleware,
+    a2aScopeMiddleware({ audience: CONTEXT_AUDIENCE, requiredSkill: CONTEXT_SKILL }),
+    a2aPeerBindingMiddleware,
+    jsonRpcHandler({
+      requestHandler: contextHandler,
+      userBuilder: UserBuilder.noAuthentication,
+    }),
+  );
+
+  const notifierHandler = new DefaultRequestHandler(
+    buildNotifierCard(baseUrl),
+    new InMemoryTaskStore(),
+    new NotifierExecutor(),
+  );
+  app.use(
+    `${NOTIFY_AGENT_PATH}${A2A_CARD_SUFFIX}`,
+    a2aMtlsMiddleware,
+    a2aAuthMiddleware,
+    agentCardHandler({
+      agentCardProvider: () => Promise.resolve(buildNotifierCard(getA2ABaseUrl())),
+    }),
+  );
+  app.use(
+    NOTIFY_AGENT_PATH,
+    a2aMtlsMiddleware,
+    a2aAuthMiddleware,
+    a2aScopeMiddleware({ audience: NOTIFY_AUDIENCE, requiredSkill: NOTIFY_SKILL }),
+    a2aPeerBindingMiddleware,
+    jsonRpcHandler({
+      requestHandler: notifierHandler,
       userBuilder: UserBuilder.noAuthentication,
     }),
   );

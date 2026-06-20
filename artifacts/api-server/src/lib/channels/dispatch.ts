@@ -97,6 +97,14 @@ export function initChannels(configured: ReadonlyArray<ChannelConfig>): void {
   );
 }
 
+/** True when at least one channel is configured. The channel-send remediation
+ *  executor uses this to fail-closed (execution_failed, operator-visible) when
+ *  an operator selects channel-send but has wired no `CHANNEL_*` destinations,
+ *  rather than silently "succeeding" a notify that reached zero channels. */
+export function hasConfiguredChannels(): boolean {
+  return channels.length > 0;
+}
+
 export function __setChannelsForTest(c: ReadonlyArray<ChannelConfig>): void {
   channels = c;
   sendTimes.clear();

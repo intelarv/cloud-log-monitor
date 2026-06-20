@@ -58,6 +58,12 @@ const DEFAULT_NOTARIZER_INTERVAL_MS = 5 * 60 * 1000;
  *  tune it on the cluster). Kept aligned with the in-process default (5min). */
 const NOTARIZER_CRON = "*/5 * * * *";
 
+/** Temporal crons for the chain-verifier walks — the production cadence knobs
+ *  (operators tune them on the cluster). Kept aligned with the in-process
+ *  defaults: hourly rolling-window walk, weekly full-chain walk. */
+const CHAIN_VERIFIER_ROLLING_CRON = "0 * * * *";
+const CHAIN_VERIFIER_FULL_CRON = "0 0 * * 0";
+
 // Per-scope advisory-lock keys. Distinct from LEDGER_LOCK_KEY in ledger.ts
 // and from each other so the rolling + full walks can run concurrently if
 // their cadences ever align. Single 64-bit keyspace; arbitrary fixed values.
@@ -344,40 +350,74 @@ export async function runCheckpointOnce(): Promise<void> {
   });
 }
 
-/** Start the periodic chain verifier. Returns a stop() handle for tests. */
+/** One rolling 24h-window chain walk. Exported as the Temporal chain-verifier
+ *  activity (`runRollingWalk`) — bound in chain-verifier-steps.ts and registered
+ *  by the worker. Uses the production default lookback window; the in-process
+ *  path keeps using the (possibly test-overridden) schedule value via the
+ *  closure in `startChainVerifier`. Leader-locked + dedupe-guarded, so safe to
+ *  re-run every cadence. */
+export async function runRollingWalkOnce(): Promise<void> {
+  await runOnce("rolling_24h", () =>
+    verifyChainSince(new Date(Date.now() - DEFAULT_SCHEDULE.lookbackMs)),
+  );
+}
+
+/** One full-chain walk. Exported as the Temporal chain-verifier activity
+ *  (`runFullWalk`); same posture as `runRollingWalkOnce`. */
+export async function runFullWalkOnce(): Promise<void> {
+  await runOnce("full", () => verifyChain());
+}
+
+/** Schedule the periodic chain verifier (rolling 24h-window + full-chain walks)
+ *  through the WorkflowEngine seam, mirroring `startNotarizer`. In-process: two
+ *  leader-locked setIntervals, byte-identical to the pre-seam timers this
+ *  replaces. Under WORKFLOW_ENGINE=temporal: two durable cron workflows
+ *  (`chainVerifyRollingWorkflow` / `chainVerifyFullWorkflow`), so the integrity
+ *  walks gain the same single-execution + crash-resume guarantees as the
+ *  supervisor review + notarizer paths. Returns a combined stop handle (a no-op
+ *  for the durable crons, which live on the cluster by design). The optional
+ *  `schedule` override only affects the in-process cadence/lookback (tests); the
+ *  Temporal cadence is the cron above. */
 export function startChainVerifier(
+  engine: WorkflowEngine,
   schedule: Partial<ChainVerifierSchedule> = {},
 ): () => void {
   const s = { ...DEFAULT_SCHEDULE, ...schedule };
-  const intervals: ReturnType<typeof setInterval>[] = [];
 
-  const windowTimer = setInterval(
-    () =>
-      void runOnce("rolling_24h", () =>
+  const stopRolling = engine.schedulePeriodic({
+    name: "chain-verifier-rolling",
+    intervalMs: s.windowMs,
+    cronSchedule: CHAIN_VERIFIER_ROLLING_CRON,
+    workflowType: "chainVerifyRollingWorkflow",
+    // In-process tick honors the (possibly overridden) lookback window; the
+    // Temporal activity (runRollingWalkOnce) uses the production default.
+    run: () =>
+      runOnce("rolling_24h", () =>
         verifyChainSince(new Date(Date.now() - s.lookbackMs)),
       ),
-    s.windowMs,
-  );
-  const fullTimer = setInterval(
-    () => void runOnce("full", () => verifyChain()),
-    s.fullMs,
-  );
-  intervals.push(windowTimer, fullTimer);
+  });
 
-  // Never keep the process alive on shutdown.
-  for (const t of intervals) t.unref?.();
+  const stopFull = engine.schedulePeriodic({
+    name: "chain-verifier-full",
+    intervalMs: s.fullMs,
+    cronSchedule: CHAIN_VERIFIER_FULL_CRON,
+    workflowType: "chainVerifyFullWorkflow",
+    run: () => runOnce("full", () => verifyChain()),
+  });
 
   logger.info(
     {
+      engine: engine.kind,
       windowMs: s.windowMs,
       fullMs: s.fullMs,
       lookbackMs: s.lookbackMs,
     },
-    "chain verifier scheduled",
+    "chain verifier scheduled via workflow engine",
   );
 
   return () => {
-    for (const t of intervals) clearInterval(t);
+    stopRolling();
+    stopFull();
   };
 }
 

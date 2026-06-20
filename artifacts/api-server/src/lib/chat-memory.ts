@@ -53,6 +53,10 @@ export interface ChatMemoryConfig {
   /** Opt-in: replay the most-RELEVANT prior turns (pgvector cosine over
    *  per-message embeddings) instead of only the most-recent ones. */
   semanticRecallEnabled: boolean;
+  /** Opt-in upgrade to semantic recall: also run a lexical (BM25/FTS) leg over
+   *  the conversation and fuse it with the vector leg via RRF. Only takes effect
+   *  when `semanticRecallEnabled` is also on; off ⇒ vector-only (M19). */
+  hybridRecallEnabled: boolean;
   /** How many semantically-closest prior messages to retrieve. */
   semanticRecallK: number;
   /** Always also include this many of the most-recent messages, regardless of
@@ -114,6 +118,7 @@ export function getChatMemoryConfigFromEnv(
     ),
     summaryModel: env["CHAT_MEMORY_SUMMARY_MODEL"]?.trim() || undefined,
     semanticRecallEnabled: isTruthyFlag(env["CHAT_MEMORY_SEMANTIC_RECALL"]),
+    hybridRecallEnabled: isTruthyFlag(env["CHAT_MEMORY_HYBRID_RECALL"]),
     semanticRecallK: parsePositiveInt(
       env["CHAT_MEMORY_SEMANTIC_RECALL_K"],
       8,

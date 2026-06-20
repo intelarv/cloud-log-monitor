@@ -2,7 +2,7 @@ import React from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useStepUp } from "@workspace/api-client-react";
+import { useStepUp, useStepUpStatus } from "@workspace/api-client-react";
 import {
   Dialog,
   DialogContent,
@@ -40,6 +40,8 @@ interface StepUpModalProps {
 export default function StepUpModal({ open, onOpenChange, onSuccess, reason = "Elevated access required" }: StepUpModalProps) {
   const { toast } = useToast();
   const stepUp = useStepUp();
+  const { data: status } = useStepUpStatus();
+  const isTotp = status?.provider === "totp";
 
   const form = useForm<StepUpForm>({
     resolver: zodResolver(stepUpSchema),
@@ -93,11 +95,26 @@ export default function StepUpModal({ open, onOpenChange, onSuccess, reason = "E
               name="token"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>MFA Token</FormLabel>
+                  <FormLabel>{isTotp ? "Authenticator code" : "MFA Token"}</FormLabel>
                   <FormControl>
-                    <Input placeholder="Enter token..." type="password" {...field} autoFocus />
+                    {isTotp ? (
+                      <Input
+                        placeholder="123456"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        maxLength={6}
+                        {...field}
+                        autoFocus
+                      />
+                    ) : (
+                      <Input placeholder="Enter token..." type="password" {...field} autoFocus />
+                    )}
                   </FormControl>
-                  <p className="text-[10px] text-muted-foreground mt-1">Dev hint: use <code className="bg-muted px-1">dev-stepup</code></p>
+                  {isTotp ? (
+                    <p className="text-[10px] text-muted-foreground mt-1">Enter the 6-digit code from your authenticator app.</p>
+                  ) : (
+                    <p className="text-[10px] text-muted-foreground mt-1">Dev hint: use <code className="bg-muted px-1">dev-stepup</code></p>
+                  )}
                   <FormMessage />
                 </FormItem>
               )}

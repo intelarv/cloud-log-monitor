@@ -12,9 +12,8 @@
 
 import { Router, type IRouter } from "express";
 import { requireSession } from "../lib/auth";
-import { type PublishResult } from "../lib/log-bus";
-import { getLogBus } from "../lib/log-bus-config";
-import { StaticFixtureLogSource } from "../lib/log-source";
+import { replayFixtureOnce } from "../lib/ingest-replay";
+import { getWorkflowEngine } from "../lib/agents/workflow-engine";
 
 const router: IRouter = Router();
 
@@ -23,23 +22,16 @@ router.post(
   requireSession,
   async (_req, res, next) => {
     try {
-      // Collect per-record delivery results so the caller can see if any
-      // ingest handler failed (architect-flagged: previous version returned
-      // success even if every handler threw).
-      const results: PublishResult[] = [];
-      const bus = getLogBus();
-      const src = new StaticFixtureLogSource(async (r) => {
-        const out = await bus.publish("raw.logs", r);
-        results.push(out);
+      // Routed through the WorkflowEngine seam: in-process runs replayFixtureOnce
+      // inline (byte-identical response shape {replayed,delivered,errors}); under
+      // WORKFLOW_ENGINE=temporal this becomes a durable one-shot workflow whose
+      // result is awaited and returned to the caller.
+      const out = await getWorkflowEngine().executeOneShot({
+        name: "ingest-replay",
+        workflowType: "ingestReplayWorkflow",
+        run: () => replayFixtureOnce(),
       });
-      const out = await src.replayOnce();
-      const totalErrors = results.reduce((n, r) => n + r.errors.length, 0);
-      const totalDelivered = results.reduce((n, r) => n + r.delivered, 0);
-      res.json({
-        replayed: out.published,
-        delivered: totalDelivered,
-        errors: totalErrors,
-      });
+      res.json(out);
     } catch (err) {
       next(err);
     }

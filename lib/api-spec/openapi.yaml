@@ -370,6 +370,65 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /auth/step-up/status:
+    get:
+      operationId: stepUpStatus
+      tags: [auth]
+      summary: Active step-up provider and (for TOTP) the caller's factor status.
+      responses:
+        "200":
+          description: Step-up status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpStatus" }
+
+  /auth/step-up/enroll:
+    post:
+      operationId: stepUpEnroll
+      tags: [auth]
+      summary: |
+        Provision a fresh TOTP secret (STEP_UP_PROVIDER=totp only). Returns the
+        otpauth URI + base32 secret to display once; the factor is UNVERIFIED
+        until confirmed.
+      responses:
+        "200":
+          description: Enrollment provisioned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpEnrollResult" }
+        "404":
+          description: TOTP step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/enroll/verify:
+    post:
+      operationId: stepUpEnrollVerify
+      tags: [auth]
+      summary: Confirm a pending TOTP enrollment with a live 6-digit code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StepUpEnrollVerifyInput" }
+      responses:
+        "200":
+          description: Enrollment confirmed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpEnrollVerifyResult" }
+        "400":
+          description: Invalid or non-matching code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: TOTP step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /admin/break-glass/grants:
     get:
       operationId: listBreakGlassGrants
@@ -737,7 +796,7 @@ paths:
           required: false
           schema:
             type: string
-            enum: [pending, confirmed, rejected]
+            enum: [pending, confirmed, rejected, executing, executed, execution_failed]
       responses:
         "200":
           description: Proposals
@@ -1211,6 +1270,33 @@ components:
         expires_at: { type: string, format: date-time }
         ttl_seconds: { type: integer }
 
+    StepUpStatus:
+      type: object
+      required: [provider, enrolled, verified]
+      properties:
+        provider: { type: string, enum: [dev, totp] }
+        enrolled: { type: boolean }
+        verified: { type: boolean }
+
+    StepUpEnrollResult:
+      type: object
+      required: [otpauth_uri, secret]
+      properties:
+        otpauth_uri: { type: string }
+        secret: { type: string }
+
+    StepUpEnrollVerifyInput:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, pattern: "^[0-9]{6}$" }
+
+    StepUpEnrollVerifyResult:
+      type: object
+      required: [verified]
+      properties:
+        verified: { type: boolean }
+
     BreakGlassGrantInput:
       type: object
       required: [finding_id, justification]
@@ -1409,6 +1495,10 @@ components:
         - decided_by_user_id
         - decided_at
         - decision_note
+        - executed_at
+        - external_ref
+        - execution_error
+        - executor_kind
       properties:
         id: { type: string }
         tenant_id: { type: string }
@@ -1420,8 +1510,12 @@ components:
         proposed_by_user_id: { type: string }
         status:
           type: string
-          enum: [pending, confirmed, rejected]
+          enum: [pending, confirmed, rejected, executing, executed, execution_failed]
         created_at: { type: string, format: date-time }
         decided_by_user_id: { type: ["string", "null"] }
         decided_at: { type: ["string", "null"], format: date-time }
         decision_note: { type: ["string", "null"] }
+        executed_at: { type: ["string", "null"], format: date-time }
+        external_ref: { type: ["string", "null"] }
+        execution_error: { type: ["string", "null"] }
+        executor_kind: { type: ["string", "null"] }

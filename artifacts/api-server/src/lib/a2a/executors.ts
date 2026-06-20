@@ -21,11 +21,17 @@ import type { FindingSafe } from "@workspace/db";
 import { logger } from "../logger";
 import { runTriageAgent } from "../agents/triage";
 import { runVerifierAgent } from "../agents/verifier";
+import { runContextAgent } from "../agents/context";
+import { runNotifierAgent } from "../agents/notifier";
 import {
   triageRequestSchema,
   verifyRequestSchema,
+  contextRequestSchema,
+  notifyRequestSchema,
   type TriageInvokeResult,
   type VerifierInvokeResult,
+  type ContextInvokeResult,
+  type NotifierInvokeResult,
 } from "./protocol";
 
 function firstDataPart(parts: Part[]): DataPart | undefined {
@@ -95,5 +101,59 @@ export class VerifierExecutor implements AgentExecutor {
 
   async cancelTask(taskId: string, _bus: ExecutionEventBus): Promise<void> {
     logger.debug({ taskId }, "verifier agent: cancelTask is a no-op");
+  }
+}
+
+export class ContextExecutor implements AgentExecutor {
+  async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
+    const part = firstDataPart(ctx.userMessage.parts);
+    if (part === undefined) {
+      throw new Error("context agent: request message has no data part");
+    }
+    // Parse + STRIP (see TriageExecutor): forward only the validated, redacted
+    // finding projection — unexpected keys (incl. rawEvidence) are dropped.
+    const req = contextRequestSchema.parse(part.data);
+    const finding = req.finding as unknown as FindingSafe;
+
+    const out = await runContextAgent(finding);
+    const payload: ContextInvokeResult & { kind: "context_response" } = {
+      kind: "context_response",
+      verdict: out.verdict,
+      approxOutputTokens: out.approxOutputTokens,
+      modelId: out.modelId,
+    };
+    bus.publish(makeResponseMessage(payload));
+    bus.finished();
+  }
+
+  async cancelTask(taskId: string, _bus: ExecutionEventBus): Promise<void> {
+    logger.debug({ taskId }, "context agent: cancelTask is a no-op");
+  }
+}
+
+export class NotifierExecutor implements AgentExecutor {
+  async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
+    const part = firstDataPart(ctx.userMessage.parts);
+    if (part === undefined) {
+      throw new Error("notifier agent: request message has no data part");
+    }
+    // Parse + STRIP (see TriageExecutor): forward only the validated, redacted
+    // finding projection — unexpected keys (incl. rawEvidence) are dropped.
+    const req = notifyRequestSchema.parse(part.data);
+    const finding = req.finding as unknown as FindingSafe;
+
+    const out = await runNotifierAgent(finding, req.triage, req.verifier, req.context);
+    const payload: NotifierInvokeResult & { kind: "notify_response" } = {
+      kind: "notify_response",
+      verdict: out.verdict,
+      approxOutputTokens: out.approxOutputTokens,
+      modelId: out.modelId,
+    };
+    bus.publish(makeResponseMessage(payload));
+    bus.finished();
+  }
+
+  async cancelTask(taskId: string, _bus: ExecutionEventBus): Promise<void> {
+    logger.debug({ taskId }, "notifier agent: cancelTask is a no-op");
   }
 }

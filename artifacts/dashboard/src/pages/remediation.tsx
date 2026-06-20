@@ -16,12 +16,18 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Wrench, CheckCircle2, XCircle, Bot } from "lucide-react";
+import { Wrench, CheckCircle2, XCircle, Bot, Loader2 } from "lucide-react";
 import { safeRelativeTime } from "../lib/format";
 import { useToast } from "@/hooks/use-toast";
 import StepUpModal from "../components/step-up-modal";
 
-type StatusFilter = "pending" | "confirmed" | "rejected";
+type StatusFilter =
+  | "pending"
+  | "confirmed"
+  | "rejected"
+  | "executing"
+  | "executed"
+  | "execution_failed";
 
 function StatusBadge({ status }: { status: RemediationProposal["status"] }) {
   if (status === "confirmed") {
@@ -35,6 +41,27 @@ function StatusBadge({ status }: { status: RemediationProposal["status"] }) {
     return (
       <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20 flex items-center w-fit gap-1">
         <XCircle className="h-3 w-3" /> Rejected
+      </Badge>
+    );
+  }
+  if (status === "executing") {
+    return (
+      <Badge variant="outline" className="bg-sky-500/10 text-sky-500 border-sky-500/20 flex items-center w-fit gap-1">
+        <Loader2 className="h-3 w-3 animate-spin" /> Executing
+      </Badge>
+    );
+  }
+  if (status === "executed") {
+    return (
+      <Badge variant="outline" className="bg-emerald-600/10 text-emerald-600 border-emerald-600/20 flex items-center w-fit gap-1">
+        <CheckCircle2 className="h-3 w-3" /> Executed
+      </Badge>
+    );
+  }
+  if (status === "execution_failed") {
+    return (
+      <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20 flex items-center w-fit gap-1">
+        <XCircle className="h-3 w-3" /> Execution failed
       </Badge>
     );
   }
@@ -60,6 +87,9 @@ export default function Remediation() {
     queryClient.invalidateQueries({ queryKey: getListRemediationProposalsQueryKey({ status: "pending" }) });
     queryClient.invalidateQueries({ queryKey: getListRemediationProposalsQueryKey({ status: "confirmed" }) });
     queryClient.invalidateQueries({ queryKey: getListRemediationProposalsQueryKey({ status: "rejected" }) });
+    queryClient.invalidateQueries({ queryKey: getListRemediationProposalsQueryKey({ status: "executing" }) });
+    queryClient.invalidateQueries({ queryKey: getListRemediationProposalsQueryKey({ status: "executed" }) });
+    queryClient.invalidateQueries({ queryKey: getListRemediationProposalsQueryKey({ status: "execution_failed" }) });
     queryClient.invalidateQueries({ queryKey: getListLedgerQueryKey() });
   };
 
@@ -159,6 +189,9 @@ export default function Remediation() {
             <TabsTrigger value="pending">Pending</TabsTrigger>
             <TabsTrigger value="confirmed">Confirmed</TabsTrigger>
             <TabsTrigger value="rejected">Rejected</TabsTrigger>
+            <TabsTrigger value="executing">Executing</TabsTrigger>
+            <TabsTrigger value="executed">Executed</TabsTrigger>
+            <TabsTrigger value="execution_failed">Failed</TabsTrigger>
           </TabsList>
         </Tabs>
 
@@ -203,6 +236,16 @@ export default function Remediation() {
                         {p.decision_note ? (
                           <div className="text-[11px] text-muted-foreground mt-1 italic truncate" title={p.decision_note}>
                             Note: {p.decision_note}
+                          </div>
+                        ) : null}
+                        {p.execution_error ? (
+                          <div className="text-[11px] text-destructive mt-1 truncate" title={p.execution_error}>
+                            Error: {p.execution_error}
+                          </div>
+                        ) : null}
+                        {p.external_ref ? (
+                          <div className="text-[11px] text-muted-foreground mt-1 font-mono truncate" title={p.external_ref}>
+                            Ref: {p.external_ref}
                           </div>
                         ) : null}
                       </TableCell>

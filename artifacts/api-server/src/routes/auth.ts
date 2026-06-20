@@ -7,8 +7,14 @@ import {
   issueStepUpCookie,
   requireSession,
   STEP_UP_TTL_SECONDS,
-  verifyStepUpToken,
 } from "../lib/auth";
+import {
+  confirmTotpEnrollment,
+  getFactorStatus,
+  getStepUpVerifier,
+  provisionTotpSecret,
+  stepUpProvider,
+} from "../lib/step-up-verifier";
 import { appendLedger } from "../lib/ledger";
 import { validateLedgerSafeText } from "../lib/text-policy";
 
@@ -86,7 +92,12 @@ router.post(
       });
       return;
     }
-    if (!verifyStepUpToken(parsed.data.token)) {
+    const ok = await getStepUpVerifier().verify({
+      tenantId: req.session!.tenant_id,
+      sub: req.session!.sub,
+      token: parsed.data.token,
+    });
+    if (!ok) {
       // Log the failure ledger entry but DO NOT include the supplied token
       // value — only the fact + the reason. Brute-force attempts must be
       // forensically reconstructable but must not themselves leak secrets.
@@ -122,6 +133,112 @@ router.post(
       expires_at: new Date(step.exp * 1000).toISOString(),
       ttl_seconds: STEP_UP_TTL_SECONDS,
     });
+  },
+);
+
+// --- TOTP enrollment (STEP_UP_PROVIDER=totp only) --------------------------
+//
+// These endpoints provision + confirm a user's authenticator-app second
+// factor. They are session-gated (the analyst is already logged in) but do NOT
+// require an existing step-up — enrollment is how a user *obtains* the ability
+// to step up. When the dev provider is active they 404 (there is nothing to
+// enroll: the dev path uses a shared token), keeping the dev/eval-gate surface
+// unchanged.
+
+function totpEnabledOr404(res: import("express").Response): boolean {
+  if (stepUpProvider() !== "totp") {
+    res.status(404).json({ error: "TOTP step-up is not enabled" });
+    return false;
+  }
+  return true;
+}
+
+// Status for the dashboard: which provider is active and, for TOTP, whether the
+// caller has a verified factor. Always available (also under the dev provider)
+// so the UI can decide whether to show the authenticator-setup panel and which
+// step-up prompt to render.
+router.get(
+  "/auth/step-up/status",
+  requireSession,
+  async (req, res): Promise<void> => {
+    const provider = stepUpProvider();
+    if (provider !== "totp") {
+      res.json({ provider, enrolled: false, verified: false });
+      return;
+    }
+    const status = await getFactorStatus(
+      req.session!.tenant_id,
+      req.session!.sub,
+    );
+    res.json({ provider, ...status });
+  },
+);
+
+// Begin (or restart) enrollment: provisions a fresh secret and returns the
+// otpauth URI + base32 secret for the QR / manual entry. The secret is the
+// user's own factor, returned once over the authenticated TLS channel; it is
+// stored encrypted at rest and never logged. The factor is UNVERIFIED until
+// confirmed below.
+router.post(
+  "/auth/step-up/enroll",
+  requireSession,
+  async (req, res): Promise<void> => {
+    if (!totpEnabledOr404(res)) return;
+    const result = await provisionTotpSecret(
+      req.session!.tenant_id,
+      req.session!.sub,
+    );
+    await appendLedger({
+      tenantId: req.session!.tenant_id,
+      actor: { kind: "human", id: req.session!.sub },
+      eventType: "auth.step_up_enroll_started",
+      payload: { factor: "totp" },
+    });
+    req.log.info({ sub: req.session!.sub }, "step-up TOTP enrollment started");
+    res.json({ otpauth_uri: result.otpauthUri, secret: result.secret });
+  },
+);
+
+const EnrollVerifyBody = z.object({
+  code: z.string().regex(/^\d{6}$/),
+});
+
+// Confirm enrollment with a live code. On success the factor becomes usable for
+// step-up and the used step is recorded (the enrollment code cannot be replayed
+// as a step-up).
+router.post(
+  "/auth/step-up/enroll/verify",
+  requireSession,
+  async (req, res): Promise<void> => {
+    if (!totpEnabledOr404(res)) return;
+    const parsed = EnrollVerifyBody.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.message });
+      return;
+    }
+    const verified = await confirmTotpEnrollment(
+      req.session!.tenant_id,
+      req.session!.sub,
+      parsed.data.code,
+    );
+    if (!verified) {
+      await appendLedger({
+        tenantId: req.session!.tenant_id,
+        actor: { kind: "human", id: req.session!.sub },
+        eventType: "auth.step_up_enroll_failed",
+        payload: { factor: "totp" },
+      });
+      res.status(400).json({ error: "invalid code" });
+      return;
+    }
+    await appendLedger({
+      tenantId: req.session!.tenant_id,
+      actor: { kind: "human", id: req.session!.sub },
+      eventType: "auth.step_up_enrolled",
+      payload: { factor: "totp" },
+    });
+    req.log.info({ sub: req.session!.sub }, "step-up TOTP enrollment confirmed");
+    res.json({ verified: true });
   },
 );
 

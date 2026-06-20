@@ -22,6 +22,8 @@ history in `docs/MILESTONES.md`; optional-env reference in `docs/CONFIGURATION.m
 - Embedder interface + dev embedder: `artifacts/api-server/src/lib/embeddings.ts`
 - Cloud embedders (Bedrock/Vertex/Azure/TEI, lazy-loaded): `artifacts/api-server/src/lib/cloud-embedders.ts`
 - Embedder factory + env config + registry: `artifacts/api-server/src/lib/embedder-config.ts`
+- Chat memory window assembly (M18 recency + M19 semantic + M21 hybrid): `artifacts/api-server/src/lib/chat-memory.ts` (`assembleRecallWindow`, token+turn budgets) + `artifacts/api-server/src/lib/chat-recall.ts` (`chat_message_embeddings` upsert, vector cosine recall, M21 BM25 lexical leg + RRF fuse `k=60` behind `CHAT_MEMORY_HYBRID_RECALL`; falls back to recency on any failure).
+- Chat-embeddings tenant-partition switch (M22, independent of the finding-embeddings switch): `artifacts/api-server/src/lib/embeddings-partition-config.ts` (`CHAT_EMBEDDINGS_TENANT_PARTITIONING` reader, conflict-target selection, `reconcileChatEmbeddingsPartitioningFromDb` boot reconcile trusting the live catalog).
 
 ## Raw-evidence storage & lifecycle
 
@@ -34,6 +36,8 @@ history in `docs/MILESTONES.md`; optional-env reference in `docs/CONFIGURATION.m
 
 - Cloud LLM runtimes + PHI guard wrapper (Bedrock Converse / Vertex generateContent / Azure OpenAI Chat, lazy-loaded): `artifacts/api-server/src/lib/cloud-llm-runtimes.ts`; env factory: `artifacts/api-server/src/lib/llm-runtime-config.ts`
 - Chat agent + LLM runtime seam (M9.5): `artifacts/api-server/src/lib/chat-agent.ts` (`runChatTurn` calls `streamFromRuntime(getLlmRuntime(), ...)`); runtime adapter + `streamFromRuntime` helper in `cloud-llm-runtimes.ts` / `llm-runtime-config.ts`.
+- Per-decision-point LLM selection (M17): `artifacts/api-server/src/lib/llm-decision-points.ts` (`resolveLlmForDecisionPoint(point, defaultModelId, env?)`, scoped `LLM_<POINT>_*` overlay).
+- Input-based LLM router (M20): `artifacts/api-server/src/lib/llm-router.ts` (`classifyTier` cheap/standard/strong from input length/risk, `isRouterEnabled`/`loadRouterPolicyFromEnv`, `resolveLlmForRequest` with per-tier `LLM_ROUTER_<TIER>_*` overlay layered in front of the M17 resolver).
 
 ## Ingestion & log sources
 
@@ -44,7 +48,8 @@ history in `docs/MILESTONES.md`; optional-env reference in `docs/CONFIGURATION.m
 ## Detection & redaction
 
 - Inline redaction helper (`redactInline`) + Stage-1 `scanForPhi` + async `scanForPhiWithNer` (Stage-1 ∪ NER): `artifacts/api-server/src/lib/redact.ts`
-- Optional Stage-2 NER detector seam (M13.3 production path; mirrors embedder/search/raw-evidence factories): `artifacts/api-server/src/lib/ner.ts` (`NerProvider` interface + default `NoopNerProvider` + `nerHit`), `artifacts/api-server/src/lib/ner-config.ts` (`NER_PROVIDER` env factory/registry/`initNerProviderFromEnv`/`getNerProviderOrNull`), `artifacts/api-server/src/lib/cloud-ner.ts` (lazy AWS Comprehend / GCP DLP / Azure Language providers). Default-inert; wired into the async ingest detection path only.
+- Optional Stage-2 NER detector seam (M13.3 production path; mirrors embedder/search/raw-evidence factories): `artifacts/api-server/src/lib/ner.ts` (`NerProvider` interface + default `NoopNerProvider` + `nerHit`), `artifacts/api-server/src/lib/ner-config.ts` (`NER_PROVIDER` env factory/registry/`initNerProviderFromEnv`/`getNerProviderOrNull`), `artifacts/api-server/src/lib/local-ner.ts` (M23 — self-contained in-process gazetteer NER, no SDK/network; `NER_LOCAL_MIN_TOKEN_LEN`/`NER_LOCAL_CAPITALIZED_ONLY`, reuses `redact.ts` name dictionaries), `artifacts/api-server/src/lib/presidio-ner.ts` (self-hosted Microsoft Presidio Analyzer over HTTP — no cloud account/BAA, no SDK; `${endpoint}/analyze` → PERSON/LOCATION, codepoint→UTF-16 offset conversion, injectable `fetchImpl`), `artifacts/api-server/src/lib/cloud-ner.ts` (lazy AWS Comprehend / GCP DLP / Azure Language providers). Default-inert; wired into the async ingest detection path only.
+- Specialist review agents (Triage, Verifier, and M23 Context + Notifier): `artifacts/api-server/src/lib/agents/context.ts` (`runContextAgent` + default-inert `ContextEnrichmentProvider` seam), `artifacts/api-server/src/lib/agents/notifier.ts` (`runNotifierAgent` — drafts only, never auto-sends), orchestrated by `artifacts/api-server/src/lib/agents/review-orchestration.ts` + `review-steps.ts` (Context/Notifier steps gated on `AGENT_PIPELINE_EXTENDED`). A2A wiring for all specialists lives under `artifacts/api-server/src/lib/a2a/` (`protocol.ts`, `cards.ts`, `executors.ts`, `server.ts`, `client.ts`, `caller-identity.ts`).
 
 ## Policy & prompts
 
@@ -67,11 +72,13 @@ history in `docs/MILESTONES.md`; optional-env reference in `docs/CONFIGURATION.m
 - Step-up + break-glass admin routes: `artifacts/api-server/src/routes/admin.ts`, `artifacts/api-server/src/routes/auth.ts`
 - Ledger admin route (incl. `GET /api/admin/ledger/checkpoints?verify=1`): `artifacts/api-server/src/routes/ledger.ts`
 - Per-user rate limiters (chat, tools, break-glass, step-up): `artifacts/api-server/src/app.ts`
+- HITL remediation plane: proposal routes (`GET /api/admin/remediation/proposals`, `…/:id/confirm`, `…/:id/reject`, CAS-guarded) in `artifacts/api-server/src/routes/admin.ts`; dashboard inbox UI `artifacts/dashboard/src/pages/remediation.tsx`. Opt-in executing worker (`REMEDIATION_EXECUTOR`, default-inert): `artifacts/api-server/src/lib/remediation-executor.ts` (`RemediationExecutor` seam + `DevNoopExecutor`) + `artifacts/api-server/src/lib/remediation-worker.ts` (leader-locked `confirmed→executing→executed|execution_failed`, CAS each step, idempotency via `executed_at`+`external_ref`; ledgers `remediation.executed`/`remediation.execution_failed`). Agent plane still never executes.
 
 ## Database
 
 - DB schema (source of truth): `lib/db/src/schema/*.ts` — `findingSafeColumns` / `FindingSafe` in `findings.ts` is the compile-time gate that keeps `raw_evidence` out of non-break-glass reads.
-- DB setup SQL (RLS, pgvector, FTS, triggers, break-glass grants table, `ledger_checkpoints` + ENABLE ALWAYS triggers, F-CANARY raw backfill): `lib/db/src/setup-sql.ts`
+- DB setup SQL (RLS, pgvector, FTS, triggers, break-glass grants table, `ledger_checkpoints` + ENABLE ALWAYS triggers, F-CANARY raw backfill): `lib/db/src/setup-sql.ts` — opt-in tenant-partitioned layouts for both `finding_embeddings` (`tenantPartitioning?`) and `chat_message_embeddings` (`chatTenantPartitioning?`: `singleChatEmbeddingsDdl` vs `partitionedChatEmbeddingsDdl(dim)`, composite PK `(message_id, tenant_id)`, `PARTITION BY LIST` + DEFAULT partition).
+- Per-tenant partition provisioning + live-catalog probes: `lib/db/src/tenant-partition.ts` — `provisionTenantEmbeddingPartition`/`isEmbeddingsPartitionedInDb` (findings) + `provisionTenantChatEmbeddingPartition`/`isChatEmbeddingsPartitionedInDb` (chat, prefix `chat_message_embeddings_t_`).
 - Seed (10 findings + canary w/ raw payload + genesis): `lib/db/src/seed.ts`
 
 ## Security

@@ -152,6 +152,39 @@ export function computeTrends(
 
 export function fmtTrend(trend?: Trend): string;
 
+export function sparkline(scores?: number[]): string;
+
+export function computeSparklines(
+  history?: HistoryRun[],
+  currentSuites?: Record<string, SuiteSummary>,
+  maxPoints?: number,
+): Record<string, string>;
+
+export function fmtSparkline(spark?: string): string;
+
+export interface DriftConfig {
+  runs: number;
+  minDropPt: number;
+}
+
+export function driftConfig(env?: Record<string, string | undefined>): DriftConfig;
+
+export interface DriftRecord {
+  suite: string;
+  runs: number;
+  fromPct: number;
+  toPct: number;
+  dropPt: number;
+}
+
+export function detectDownwardDrift(
+  history?: HistoryRun[],
+  currentScores?: Record<string, number>,
+  env?: Record<string, string | undefined>,
+): DriftRecord[];
+
+export function fmtDriftWarning(d: DriftRecord): string;
+
 export function recordRunHistory(opts?: {
   evalsDir?: string;
   summary?: GateSummary;
@@ -161,7 +194,13 @@ export function recordRunHistory(opts?: {
 
 export function buildSummaryText(
   summary: GateSummary,
-  opts?: { exitCode?: number; outcome?: Outcome; severity?: Severity; trends?: Trends },
+  opts?: {
+    exitCode?: number;
+    outcome?: Outcome;
+    severity?: Severity;
+    trends?: Trends;
+    sparks?: Record<string, string>;
+  },
 ): string;
 
 export interface SlackMessage {
@@ -171,7 +210,13 @@ export interface SlackMessage {
 
 export function buildSlackMessage(
   summary: GateSummary,
-  opts?: { exitCode?: number; outcome?: Outcome; severity?: Severity; trends?: Trends },
+  opts?: {
+    exitCode?: number;
+    outcome?: Outcome;
+    severity?: Severity;
+    trends?: Trends;
+    sparks?: Record<string, string>;
+  },
 ): SlackMessage;
 
 export function signWebhookBody(secret: string, timestampSec: number, body: string): string;
@@ -183,6 +228,11 @@ export function defaultHeartbeatDedupKey(): string;
 export function defaultTemporalDedupKey(): string;
 
 export function resolveHeartbeat(opts?: {
+  env?: Record<string, string | undefined>;
+  fetchImpl?: typeof fetch;
+}): Promise<{ sent: SendResult[] }>;
+
+export function resolveTemporalGate(opts?: {
   env?: Record<string, string | undefined>;
   fetchImpl?: typeof fetch;
 }): Promise<{ sent: SendResult[] }>;

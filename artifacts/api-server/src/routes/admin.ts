@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { Router, type IRouter } from "express";
+import { Router, type IRouter, type Request } from "express";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { z } from "zod";
 import { and, desc, eq, gt, isNull, ne, sql } from "drizzle-orm";
 import {
@@ -697,9 +698,31 @@ router.post(
 // status reset is a compare-and-swap on `status != 'in_progress'` so a review
 // that a concurrent supervisor worker picked up between our read and write is
 // not stomped. Ledgered `agent.re_review_requested` (who + optional why).
+// #97: per-user + per-finding rate limit on re-review. Each replay re-runs the
+// Triage->Verifier LLM pipeline, so it costs real tokens; the per-tenant budget
+// breaker is the cost backstop, but this limiter blocks a *single analyst*
+// hammering replay on *one finding* (a cheap way to burn tenant budget or storm
+// the supervisor queue) before it ever reaches the budget gate. Keyed by
+// user+finding so a burst on finding A never throttles a legitimate replay of
+// finding B, and an IP fallback (IPv6-safe via ipKeyGenerator) covers the
+// pre-session edge. 5/min is generous for honest "it's still wrong, try again"
+// clicks but punishing for automation.
+const reReviewLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 5,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const who = req.session?.sub
+      ? `u:${req.session.sub}`
+      : `ip:${ipKeyGenerator(req.ip ?? "0.0.0.0")}`;
+    return `${who}:f:${String(req.params.id)}`;
+  },
+});
 router.post(
   "/admin/findings/:id/re-review",
   requireSession,
+  reReviewLimiter,
   async (req, res): Promise<void> => {
     const parsed = ReReviewFindingBody.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -1078,7 +1101,14 @@ const RemediationDecisionBody = z.object({
   note: z.string().min(1).max(2000).optional(),
 });
 
-const REMEDIATION_LIST_STATUSES = ["pending", "confirmed", "rejected"] as const;
+const REMEDIATION_LIST_STATUSES = [
+  "pending",
+  "confirmed",
+  "rejected",
+  "executing",
+  "executed",
+  "execution_failed",
+] as const;
 const RemediationListQuery = z.object({
   status: z.enum(REMEDIATION_LIST_STATUSES).optional(),
 });
@@ -1098,6 +1128,10 @@ function proposalToApi(p: RemediationProposal): unknown {
     decided_by_user_id: p.decidedByUserId,
     decided_at: p.decidedAt?.toISOString() ?? null,
     decision_note: p.decisionNote,
+    executed_at: p.executedAt?.toISOString() ?? null,
+    external_ref: p.externalRef,
+    execution_error: p.executionError,
+    executor_kind: p.executorKind,
   };
 }
 

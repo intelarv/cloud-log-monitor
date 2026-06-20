@@ -23,6 +23,7 @@ const cfg = (over: Partial<ChatMemoryConfig> = {}): ChatMemoryConfig => ({
   summaryEnabled: false,
   summaryMaxMessages: 40,
   semanticRecallEnabled: false,
+  hybridRecallEnabled: false,
   semanticRecallK: 8,
   semanticRecallRecencyTail: 2,
   ...over,
@@ -70,6 +71,7 @@ describe("getChatMemoryConfigFromEnv", () => {
       summaryMaxMessages: 10,
       summaryModel: "some-model",
       semanticRecallEnabled: false,
+      hybridRecallEnabled: false,
       semanticRecallK: 8,
       semanticRecallRecencyTail: 2,
     });

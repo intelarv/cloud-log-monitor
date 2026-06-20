@@ -24,10 +24,16 @@
 import type { FindingSafe } from "@workspace/db";
 import type { TriageVerdict } from "./triage";
 import type { VerifierVerdict } from "./verifier";
+import type { ContextVerdict } from "./context";
+import type { NotifierDraft } from "./notifier";
 
 export interface ReviewJob {
   findingId: string;
   tenantId: string;
+  /** M23: when true (AGENT_PIPELINE_EXTENDED), run Context + Notifier after the
+   *  Triage→Verifier core. Undefined/false ⇒ orchestration byte-identical to the
+   *  default two-agent path; the extra steps are never invoked. */
+  extendedPipeline?: boolean;
 }
 
 export interface BudgetCheck {
@@ -46,6 +52,16 @@ export interface TriageStepResult {
 export interface VerifierStepResult {
   /** PHI-sanitized verifier verdict. */
   verifier: VerifierVerdict;
+}
+
+export interface ContextStepResult {
+  /** PHI-sanitized context verdict. */
+  context: ContextVerdict;
+}
+
+export interface NotifierStepResult {
+  /** PHI-sanitized notification draft. */
+  notifier: NotifierDraft;
 }
 
 /** The replayable units the orchestration depends on. Both engines provide an
@@ -88,6 +104,22 @@ export interface ReviewActivities {
     triage: TriageVerdict,
     verifier: VerifierVerdict,
   ): Promise<void>;
+  /** M23 (extended pipeline only): Context LLM call + charge + PHI-scan + ledger
+   *  agent.context_complete. Optional on the seam so the default two-agent path
+   *  needs no implementation; present only via inProcessReviewActivities. */
+  contextStep?(
+    job: ReviewJob,
+    finding: FindingSafe,
+  ): Promise<ContextStepResult>;
+  /** M23 (extended pipeline only): Notifier LLM call + charge + PHI-scan + ledger
+   *  agent.notify_drafted. DRAFTS only — never sends. */
+  notifierStep?(
+    job: ReviewJob,
+    finding: FindingSafe,
+    triage: TriageVerdict,
+    verifier: VerifierVerdict,
+    context: ContextVerdict,
+  ): Promise<NotifierStepResult>;
   /** Persist status='failed' with partial verdicts + ledger review_failed. */
   persistFailed(
     job: ReviewJob,
@@ -182,6 +214,22 @@ export async function runReviewOrchestration(
 
     const v = await act.verifierStep(job, finding, triage);
     verifier = v.verifier;
+
+    // M23 extended pipeline (AGENT_PIPELINE_EXTENDED only): Context then Notifier
+    // run AFTER the core Triage→Verifier verdicts are settled. Guarded so the
+    // default path is byte-identical — when the flag is off (or the activities
+    // are absent on the seam) this whole block is skipped and we fall straight
+    // through to persistCompleted with the two core verdicts. The Notifier only
+    // DRAFTS (never sends); HITL is preserved. A throw here routes to the same
+    // catch→persistFailed as the core steps, persisting partial verdicts.
+    if (job.extendedPipeline && act.contextStep && act.notifierStep) {
+      const c = await act.contextStep(job, finding);
+      const n = await act.notifierStep(job, finding, triage, verifier, c.context);
+      // The Context/Notifier verdicts are recorded via their own ledger events
+      // inside the steps; the finding row persists only triage+verifier (the
+      // schema's verdict columns), so persistCompleted is unchanged.
+      void n;
+    }
 
     await act.persistCompleted(job, triage, verifier);
   } catch (err) {

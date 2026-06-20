@@ -8,6 +8,8 @@ import {
   A2A_PROTOCOL_VERSION,
   TRIAGE_AGENT_PATH,
   VERIFY_AGENT_PATH,
+  CONTEXT_AGENT_PATH,
+  NOTIFY_AGENT_PATH,
 } from "./protocol";
 
 const COMMON = {
@@ -58,6 +60,44 @@ export function buildVerifierCard(baseUrl: string): AgentCard {
         description:
           "Given a redacted finding and a triage verdict, return verdict, rationale, confidence, agreement, and a prompt-injection flag.",
         tags: ["verify", "phi", "compliance"],
+      },
+    ],
+  };
+}
+
+export function buildContextCard(baseUrl: string): AgentCard {
+  return {
+    ...COMMON,
+    name: "Context Agent",
+    description:
+      "Enriches a redacted finding with operational context (owner, recent change, blast radius) for the extended review pipeline. Operates on the redacted finding projection only.",
+    url: `${baseUrl}${CONTEXT_AGENT_PATH}`,
+    skills: [
+      {
+        id: "context_finding",
+        name: "Context-enrich finding",
+        description:
+          "Given a redacted finding, return owner, recent_change, blast_radius, summary, and confidence. Drafts context only; never acts.",
+        tags: ["context", "phi", "compliance"],
+      },
+    ],
+  };
+}
+
+export function buildNotifierCard(baseUrl: string): AgentCard {
+  return {
+    ...COMMON,
+    name: "Notifier Agent",
+    description:
+      "Drafts a PHI-free notification (channel, urgency, subject, body) from a finding plus its triage/verifier/context verdicts. DRAFTS only — never sends; human review and dispatch are required.",
+    url: `${baseUrl}${NOTIFY_AGENT_PATH}`,
+    skills: [
+      {
+        id: "notify_finding",
+        name: "Draft notification",
+        description:
+          "Given a redacted finding and its triage/verifier/context verdicts, return a channel, urgency, subject, body, and confidence for a human to review. Never auto-sends.",
+        tags: ["notify", "phi", "compliance"],
       },
     ],
   };

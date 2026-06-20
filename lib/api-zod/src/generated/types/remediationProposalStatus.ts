@@ -15,4 +15,7 @@ export const RemediationProposalStatus = {
   pending: 'pending',
   confirmed: 'confirmed',
   rejected: 'rejected',
+  executing: 'executing',
+  executed: 'executed',
+  execution_failed: 'execution_failed',
 } as const;

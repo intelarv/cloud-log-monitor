@@ -9,10 +9,12 @@ import {
 import {
   getReaperConfigFromEnv,
   reapStalledSourcesOnce,
+  runReapCycleFromEnv,
   startLogSourceReaper,
   stalledSourceLatch,
   type ReaperConfig,
 } from "./log-source-reaper";
+import { InProcessWorkflowEngine } from "./agents/workflow-engine";
 import { appendLedger as realAppendLedger } from "./ledger";
 import { uniq, uniqueTenant, ledgerHeadSeq } from "../test-support/ledger-harness";
 
@@ -131,10 +133,53 @@ describe("getReaperConfigFromEnv", () => {
 
 describe("startLogSourceReaper (default-inert)", () => {
   it("schedules nothing and returns a no-op stop when config is null", () => {
-    const stop = startLogSourceReaper(null);
+    const engine = new InProcessWorkflowEngine();
+    let scheduled = 0;
+    const orig = engine.schedulePeriodic.bind(engine);
+    engine.schedulePeriodic = (job) => {
+      scheduled++;
+      return orig(job);
+    };
+    const stop = startLogSourceReaper(engine, null);
+    expect(scheduled).toBe(0);
     expect(typeof stop).toBe("function");
     // No throw on stop().
     stop();
+  });
+
+  it("schedules a periodic job through the engine seam when config is set", () => {
+    const engine = new InProcessWorkflowEngine();
+    const jobs: { name: string; workflowType: string; cronSchedule: string }[] =
+      [];
+    engine.schedulePeriodic = (job) => {
+      jobs.push({
+        name: job.name,
+        workflowType: job.workflowType,
+        cronSchedule: job.cronSchedule,
+      });
+      return () => {};
+    };
+    const stop = startLogSourceReaper(engine, {
+      staleAfterMs: 5 * MIN,
+      intervalMs: 5 * MIN,
+    });
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.name).toBe("log-source-reaper");
+    expect(jobs[0]?.workflowType).toBe("logSourceReaperWorkflow");
+    stop();
+  });
+});
+
+describe("runReapCycleFromEnv (default-inert)", () => {
+  it("no-ops when INGEST_SOURCE_STALL_AFTER_MS is unset", async () => {
+    const saved = process.env["INGEST_SOURCE_STALL_AFTER_MS"];
+    delete process.env["INGEST_SOURCE_STALL_AFTER_MS"];
+    try {
+      await expect(runReapCycleFromEnv()).resolves.toBeUndefined();
+    } finally {
+      if (saved !== undefined)
+        process.env["INGEST_SOURCE_STALL_AFTER_MS"] = saved;
+    }
   });
 });
 

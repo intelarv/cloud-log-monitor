@@ -9,8 +9,12 @@ export {
   type AgentInvoker,
   type TriageInvokeResult,
   type VerifierInvokeResult,
+  type ContextInvokeResult,
+  type NotifierInvokeResult,
   TRIAGE_AGENT_PATH,
   VERIFY_AGENT_PATH,
+  CONTEXT_AGENT_PATH,
+  NOTIFY_AGENT_PATH,
 } from "./protocol";
 export {
   A2AAgentInvoker,
@@ -32,7 +36,12 @@ export {
   getA2ASharedSecret,
   __resetA2ASecretForTest,
 } from "./auth";
-export { buildTriageCard, buildVerifierCard } from "./cards";
+export {
+  buildTriageCard,
+  buildVerifierCard,
+  buildContextCard,
+  buildNotifierCard,
+} from "./cards";
 export {
   mintCallerToken,
   verifyCallerToken,
@@ -42,7 +51,11 @@ export {
   SUPERVISOR_CALLER_ID,
   TRIAGE_AUDIENCE,
   VERIFY_AUDIENCE,
+  CONTEXT_AUDIENCE,
+  NOTIFY_AUDIENCE,
   TRIAGE_SKILL,
   VERIFY_SKILL,
+  CONTEXT_SKILL,
+  NOTIFY_SKILL,
   __resetCallerIdentityForTest,
 } from "./caller-identity";

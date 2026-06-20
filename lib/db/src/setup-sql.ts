@@ -41,6 +41,14 @@ export interface SetupSqlOptions {
    * EMBEDDINGS_TENANT_PARTITIONING; see embeddings-partition-config.ts.
    */
   tenantPartitioning?: boolean;
+  /**
+   * Opt-in: when true, chat_message_embeddings is LIST-partitioned by tenant_id
+   * with a DEFAULT partition (per-tenant pgvector namespaces for chat recall,
+   * mirroring `tenantPartitioning` for finding_embeddings). Default false ⇒ the
+   * single-table layout, byte-identical to M19 (default-inert). Opt-in via
+   * CHAT_EMBEDDINGS_TENANT_PARTITIONING; see embeddings-partition-config.ts.
+   */
+  chatTenantPartitioning?: boolean;
 }
 
 // M12.2: the finding_embeddings DDL, single-table variant. KEEP byte-identical
@@ -155,9 +163,10 @@ ALTER TABLE finding_embeddings_default FORCE ROW LEVEL SECURITY;`;
 // embedder is PHI-guarded (PhiGuardEmbedder), so no raw PHI reaches this tier.
 // Default-inert: the table is created but only written/read when the switch is
 // on; off ⇒ byte-identical to M18. Vector dim matches EMBEDDING_DIM (same as
-// finding_embeddings). LIST-by-tenant partitioning is deferred (chat embeddings
-// are session-scoped and TTL-able); the single-table layout matches M18 posture.
-function chatEmbeddingsDdl(dim: number): string {
+// finding_embeddings). Opt-in LIST-by-tenant partitioning mirrors
+// finding_embeddings (see partitionedChatEmbeddingsDdl); the single-table layout
+// below is the default and matches the M18/M19 posture byte-for-byte.
+function singleChatEmbeddingsDdl(dim: number): string {
   return `CREATE TABLE IF NOT EXISTS chat_message_embeddings (
   message_id text PRIMARY KEY REFERENCES chat_messages(id) ON DELETE CASCADE,
   session_id text NOT NULL,
@@ -187,6 +196,90 @@ CREATE POLICY tenant_isolation ON chat_message_embeddings
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));`;
 }
 
+// Opt-in (CHAT_EMBEDDINGS_TENANT_PARTITIONING): chat_message_embeddings is
+// LIST-partitioned by tenant_id (per-tenant pgvector namespaces for chat recall),
+// mirroring partitionedEmbeddingsDdl for finding_embeddings. A DEFAULT partition
+// catches every tenant without a dedicated partition, so recall is identical to
+// the single-table layout until an operator provisions a per-tenant partition
+// (provisionTenantChatEmbeddingPartition). chat_message_embeddings is a DERIVED
+// cache (rebuilt from chat_messages), so the one-time conversion from the old
+// single table just drops + recreates it. Idempotent: skipped once already
+// partitioned. The PK is composite (message_id, tenant_id) because a partition
+// key column must be part of every unique constraint.
+function partitionedChatEmbeddingsDdl(dim: number): string {
+  return `DO $$
+DECLARE
+  tbl_exists boolean;
+  is_partitioned boolean;
+BEGIN
+  SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'chat_message_embeddings')
+    INTO tbl_exists;
+  SELECT EXISTS (
+    SELECT 1 FROM pg_partitioned_table pt
+    JOIN pg_class c ON c.oid = pt.partrelid
+    WHERE c.relname = 'chat_message_embeddings'
+  ) INTO is_partitioned;
+  IF tbl_exists AND NOT is_partitioned THEN
+    DROP TABLE chat_message_embeddings CASCADE;
+    tbl_exists := false;
+  END IF;
+  IF NOT tbl_exists THEN
+    CREATE TABLE chat_message_embeddings (
+      message_id text NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+      session_id text NOT NULL,
+      tenant_id text NOT NULL,
+      embedding vector(${dim}) NOT NULL,
+      embedder_version text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (message_id, tenant_id)
+    ) PARTITION BY LIST (tenant_id);
+    CREATE TABLE chat_message_embeddings_default PARTITION OF chat_message_embeddings DEFAULT;
+  END IF;
+END $$;
+
+-- btree on the parent propagates to every partition automatically.
+CREATE INDEX IF NOT EXISTS chat_message_embeddings_session_idx
+  ON chat_message_embeddings (tenant_id, session_id);
+
+-- ivfflat is created per-PARTITION: pgvector cannot build an ivfflat/hnsw index
+-- on a partitioned PARENT. The DEFAULT partition gets one here;
+-- provisionTenantChatEmbeddingPartition() adds one to each dedicated partition.
+CREATE INDEX IF NOT EXISTS chat_message_embeddings_default_vec_idx
+  ON chat_message_embeddings_default USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
+
+-- RLS on the parent governs every parent-routed query (all application access
+-- goes through chat_message_embeddings, never a partition directly). The DEFAULT
+-- partition additionally gets ENABLE/FORCE so any direct access is deny-by-
+-- default (no policy = no rows visible).
+ALTER TABLE chat_message_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_message_embeddings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON chat_message_embeddings;
+CREATE POLICY tenant_isolation ON chat_message_embeddings
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+ALTER TABLE chat_message_embeddings_default ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_message_embeddings_default FORCE ROW LEVEL SECURITY;`;
+}
+
+// Hybrid chat recall (opt-in CHAT_MEMORY_HYBRID_RECALL): a lexical (BM25/FTS)
+// leg over a session's conversation, fused with the M19 vector recall via RRF.
+// Mirrors the findings FTS column: a generated tsvector over chat_messages
+// content + a GIN index. The content is already PHI-safe (user input refused /
+// assistant output scanned before persistence, see routes/chat.ts), so this
+// index — like finding_embeddings/search_tsv — is computed from redacted-safe
+// text only (threat model §Info Disclosure). Idempotent (ADD COLUMN IF NOT
+// EXISTS / CREATE INDEX IF NOT EXISTS). Default-inert: the column is always
+// maintained by Postgres but only QUERIED when the switch is on; off ⇒ the
+// lexical leg never runs and recall is byte-identical to M19.
+function chatMessagesFtsDdl(): string {
+  return `ALTER TABLE chat_messages
+  ADD COLUMN IF NOT EXISTS search_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED;
+
+CREATE INDEX IF NOT EXISTS chat_messages_search_tsv_idx
+  ON chat_messages USING GIN (search_tsv);`;
+}
+
 export function buildSetupSql(opts: SetupSqlOptions = {}): string {
   const dim = opts.embeddingDim ?? DEFAULT_EMBEDDING_DIM;
   if (!Number.isInteger(dim) || dim <= 0 || dim > 16000) {
@@ -197,6 +290,9 @@ export function buildSetupSql(opts: SetupSqlOptions = {}): string {
   const embeddingsBlock = opts.tenantPartitioning
     ? partitionedEmbeddingsDdl(dim)
     : singleEmbeddingsDdl(dim);
+  const chatEmbeddingsBlock = opts.chatTenantPartitioning
+    ? partitionedChatEmbeddingsDdl(dim)
+    : singleChatEmbeddingsDdl(dim);
   return `
 -- M1: pgvector for semantic retrieval. Embeddings of redacted finding evidence
 -- live in finding_embeddings; the embedder used in dev is a deterministic
@@ -314,6 +410,28 @@ CREATE INDEX IF NOT EXISTS bg_grants_tenant_user_idx
 CREATE INDEX IF NOT EXISTS bg_grants_lookup_idx
   ON break_glass_grants (tenant_id, user_id, finding_id, expires_at);
 
+-- Production step-up second factor (TOTP) enrollment store. Tenant-scoped,
+-- RLS-isolated. Backs STEP_UP_PROVIDER=totp; with the default dev provider this
+-- table is simply never read or written (the dev shared-token path is
+-- byte-identical to before). The TOTP shared secret is stored ENCRYPTED at rest
+-- in secret_enc (AES-256-GCM, per-tenant key); the plaintext is never persisted.
+-- verified_at is NULL until the analyst confirms enrollment with a live code;
+-- last_used_step is the per-step replay guard. See
+-- lib/db/src/schema/step-up-factors.ts + lib/step-up-verifier.ts.
+CREATE TABLE IF NOT EXISTS step_up_factors (
+  tenant_id text NOT NULL,
+  user_id text NOT NULL,
+  type text NOT NULL DEFAULT 'totp',
+  secret_enc text NOT NULL,
+  verified_at timestamptz,
+  last_used_step bigint,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS step_up_factors_tenant_user_idx
+  ON step_up_factors (tenant_id, user_id);
+
 -- HITL remediation proposals. Tenant-scoped, RLS-isolated. UPDATE is permitted
 -- (the pending -> confirmed/rejected decision transition); DELETE is not enforced
 -- at the DB level because every proposal's creation is *already* in the
@@ -340,6 +458,51 @@ CREATE INDEX IF NOT EXISTS remediation_tenant_status_idx
   ON remediation_proposals (tenant_id, status);
 CREATE INDEX IF NOT EXISTS remediation_tenant_finding_idx
   ON remediation_proposals (tenant_id, finding_id);
+-- Execution-outcome columns set by the opt-in executing worker (idempotent
+-- ADD COLUMN so an existing populated table is upgraded in place; the status
+-- column already exists, the new states executing|executed|execution_failed
+-- are plain text values, no enum to alter). executed_at + external_ref are the
+-- idempotency cache per ARCHITECTURE.md §23.22.
+ALTER TABLE remediation_proposals ADD COLUMN IF NOT EXISTS executed_at timestamptz;
+ALTER TABLE remediation_proposals ADD COLUMN IF NOT EXISTS external_ref text;
+ALTER TABLE remediation_proposals ADD COLUMN IF NOT EXISTS execution_error text;
+ALTER TABLE remediation_proposals ADD COLUMN IF NOT EXISTS executor_kind text;
+
+-- Redaction request queue (out-of-band operator sink for the redact-at-source
+-- remediation action). Tenant-scoped, RLS-isolated. The agent plane never
+-- mutates the cloud source directly; the RedactionQueueExecutor enqueues here
+-- and a separate operator process drains it. One row per proposal (idempotent
+-- enqueue). See lib/db/src/schema/redaction-requests.ts + threat_model EoP
+-- "HITL gates on write actions".
+CREATE TABLE IF NOT EXISTS redaction_requests (
+  id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  finding_id text NOT NULL,
+  proposal_id text NOT NULL,
+  action_type text NOT NULL,
+  summary text NOT NULL,
+  rationale text NOT NULL,
+  status text NOT NULL DEFAULT 'queued',
+  requested_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS redaction_requests_tenant_proposal_idx
+  ON redaction_requests (tenant_id, proposal_id);
+CREATE INDEX IF NOT EXISTS redaction_requests_tenant_status_idx
+  ON redaction_requests (tenant_id, status);
+
+-- Cluster-wide per-tenant daily LLM cost-budget counter (opt-in
+-- AGENT_BUDGET_STORE=postgres). Default store is the per-process in-memory Map;
+-- this shared table lets N worker processes charge the SAME (tenant_id, day_key)
+-- row via an atomic upsert-increment so the per-tenant daily cap is enforced
+-- once fleet-wide. Counters only — no PHI. Tenant-scoped, RLS-isolated. See
+-- lib/db/src/schema/tenant-budgets.ts + threat_model §DoS.
+CREATE TABLE IF NOT EXISTS tenant_budgets (
+  tenant_id text NOT NULL,
+  day_key text NOT NULL,
+  tokens_used bigint NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, day_key)
+);
 
 -- Opt-in (MEMORY_CONSOLIDATION_SUMMARY): one LLM-generated natural-language
 -- summary per collapsed consolidation group. Unset ⇒ never written. PHI-safe by
@@ -378,7 +541,7 @@ DO $$
 DECLARE
   t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['findings', 'chat_sessions', 'chat_messages', 'break_glass_grants', 'remediation_proposals', 'memory_consolidation_summaries'] LOOP
+  FOREACH t IN ARRAY ARRAY['findings', 'chat_sessions', 'chat_messages', 'break_glass_grants', 'step_up_factors', 'remediation_proposals', 'redaction_requests', 'tenant_budgets', 'memory_consolidation_summaries'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
@@ -412,7 +575,9 @@ CREATE INDEX IF NOT EXISTS findings_search_tsv_idx
 
 ${embeddingsBlock}
 
-${chatEmbeddingsDdl(dim)}
+${chatMessagesFtsDdl()}
+
+${chatEmbeddingsBlock}
 
 CREATE OR REPLACE VIEW findings_redacted AS
 SELECT

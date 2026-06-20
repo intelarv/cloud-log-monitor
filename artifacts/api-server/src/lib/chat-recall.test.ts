@@ -11,6 +11,8 @@ import { FeatureHashEmbedder, toPgVectorLiteral } from "./embeddings";
 import {
   embedAndStoreChatMessage,
   semanticRecallMessageIds,
+  lexicalRecallMessageIds,
+  hybridRecallMessageIds,
 } from "./chat-recall";
 import { uniq, uniqueTenant } from "../test-support/ledger-harness";
 
@@ -196,5 +198,153 @@ describe("semanticRecallMessageIds", () => {
       embedder,
     });
     expect(ids).toEqual([a.messageIds[0]]);
+  });
+});
+
+describe("lexicalRecallMessageIds", () => {
+  it("ranks the best full-text match first and is (tenant, session)-scoped", async () => {
+    const tenantId = uniqueTenant("recall");
+    const { sessionId, messageIds } = await seedSession(tenantId, [
+      { role: "user", content: "tell me about retention policy gaps" },
+      { role: "assistant", content: "the weather is sunny and warm today" },
+      { role: "user", content: "which log groups lack kms encryption keys" },
+    ]);
+    // No embedding needed — the generated search_tsv column is maintained by
+    // Postgres on insert.
+    const ids = await lexicalRecallMessageIds({
+      tenantId,
+      sessionId,
+      query: "kms encryption keys",
+      k: 5,
+    });
+    expect(ids[0]).toBe(messageIds[2]);
+  });
+
+  it("returns [] for a non-positive k, an empty query, or no match", async () => {
+    const tenantId = uniqueTenant("recall");
+    const { sessionId } = await seedSession(tenantId, [
+      { role: "user", content: "retention policy gaps" },
+    ]);
+    expect(
+      await lexicalRecallMessageIds({ tenantId, sessionId, query: "x", k: 0 }),
+    ).toEqual([]);
+    expect(
+      await lexicalRecallMessageIds({ tenantId, sessionId, query: "  ", k: 5 }),
+    ).toEqual([]);
+    expect(
+      await lexicalRecallMessageIds({
+        tenantId,
+        sessionId,
+        query: "zzzzz nonexistent token",
+        k: 5,
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("hybridRecallMessageIds", () => {
+  it("fuses the vector + lexical legs and returns at most k ids", async () => {
+    const tenantId = uniqueTenant("recall");
+    const contents = [
+      "tell me about retention policy gaps",
+      "the weather is sunny and warm today",
+      "which log groups lack kms encryption keys",
+    ];
+    const { sessionId, messageIds } = await seedSession(
+      tenantId,
+      contents.map((c, i) => ({
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: c,
+      })),
+    );
+    for (let i = 0; i < messageIds.length; i++) {
+      await embedAndStoreChatMessage({
+        tenantId,
+        sessionId,
+        messageId: messageIds[i]!,
+        content: contents[i]!,
+        embedder,
+      });
+    }
+
+    const ids = await hybridRecallMessageIds({
+      tenantId,
+      sessionId,
+      query: "log groups missing kms encryption keys",
+      k: 2,
+      embedder,
+    });
+    expect(ids.length).toBeLessThanOrEqual(2);
+    // Both legs agree the kms message is most relevant ⇒ it tops the fusion.
+    expect(ids[0]).toBe(messageIds[2]);
+  });
+
+  it("still returns results when only the lexical leg matches (no embeddings yet)", async () => {
+    const tenantId = uniqueTenant("recall");
+    const { sessionId, messageIds } = await seedSession(tenantId, [
+      { role: "user", content: "which log groups lack kms encryption keys" },
+    ]);
+    // Deliberately do NOT embed — vector leg returns [], lexical leg matches.
+    const ids = await hybridRecallMessageIds({
+      tenantId,
+      sessionId,
+      query: "kms encryption keys",
+      k: 5,
+      embedder,
+    });
+    expect(ids).toEqual([messageIds[0]]);
+  });
+
+  it("returns [] when both legs are empty (caller falls back to recency)", async () => {
+    const tenantId = uniqueTenant("recall");
+    const { sessionId } = await seedSession(tenantId, [
+      { role: "user", content: "retention policy gaps" },
+    ]);
+    // No embeddings + a query with no lexical match ⇒ both legs empty.
+    const ids = await hybridRecallMessageIds({
+      tenantId,
+      sessionId,
+      query: "zzzzz nonexistent token",
+      k: 5,
+      embedder,
+    });
+    expect(ids).toEqual([]);
+  });
+
+  it("fuses (dedups) an id present in BOTH legs into a single output entry", async () => {
+    const tenantId = uniqueTenant("recall");
+    const contents = [
+      "kms encryption keys retention policy gaps",
+      "the weather is sunny and warm today",
+    ];
+    const { sessionId, messageIds } = await seedSession(
+      tenantId,
+      contents.map((c, i) => ({
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: c,
+      })),
+    );
+    for (let i = 0; i < messageIds.length; i++) {
+      await embedAndStoreChatMessage({
+        tenantId,
+        sessionId,
+        messageId: messageIds[i]!,
+        content: contents[i]!,
+        embedder,
+      });
+    }
+
+    // This query matches msg0 on BOTH legs: lexical (shared tokens) AND vector
+    // (feature-hash similarity). RRF must merge the two rankings so msg0 appears
+    // exactly once — a fusion-wiring regression would double-count it.
+    const ids = await hybridRecallMessageIds({
+      tenantId,
+      sessionId,
+      query: "kms encryption keys retention policy gaps",
+      k: 5,
+      embedder,
+    });
+    expect(ids).toContain(messageIds[0]);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });

@@ -14,4 +14,6 @@ export type StepUpStatusProvider = typeof StepUpStatusProvider[keyof typeof Step
 export const StepUpStatusProvider = {
   dev: 'dev',
   totp: 'totp',
+  webauthn: 'webauthn',
+  oidc: 'oidc',
 } as const;

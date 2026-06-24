@@ -297,6 +297,15 @@ export const NOT_ALERTABLE: ReadonlySet<string> = new Set([
   "auth.step_up_enroll_started",
   "auth.step_up_enrolled",
   "auth.step_up_enroll_failed",
+  // Backup/recovery code lifecycle (M29). Generating a fresh set, redeeming a
+  // single-use code as a step-up factor, and removing a factor are all
+  // legitimate self-service account-recovery actions, auditable in the ledger.
+  // A redeemed code still produces an `auth.step_up_granted` (the alertable
+  // signal stays the threshold on `auth.step_up_failed`); these are the
+  // bookkeeping events around it and do not page on-call.
+  "auth.step_up_recovery_generated",
+  "auth.step_up_recovery_consumed",
+  "auth.step_up_factor_removed",
   // Legitimate break-glass flow events. The `break_glass.raw_phi_accessed`
   // event IS the security-relevant one (warning-level above); grant +
   // approval are gated by step-up + the two-person rule.

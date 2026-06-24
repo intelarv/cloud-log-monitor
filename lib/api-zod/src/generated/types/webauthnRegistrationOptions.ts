@@ -8,15 +8,10 @@ See docs/ARCHITECTURE.md §24 for scope.
  * OpenAPI spec version: 0.1.0
  */
 
-export interface StepUpInput {
-  /**
-     * @minLength 1
-     * @maxLength 8192
-     */
-  token: string;
-  /**
-     * @minLength 3
-     * @maxLength 200
-     */
-  reason: string;
+export interface WebauthnRegistrationOptions {
+  challenge: string;
+  rpId: string;
+  rpName: string;
+  userIdB64url: string;
+  userName: string;
 }

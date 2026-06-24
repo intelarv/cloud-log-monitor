@@ -8,10 +8,10 @@ See docs/ARCHITECTURE.md §24 for scope.
  * OpenAPI spec version: 0.1.0
  */
 
-export interface StepUpInput {
+export interface RecoveryStepUpInput {
   /**
      * @minLength 1
-     * @maxLength 8192
+     * @maxLength 64
      */
   token: string;
   /**

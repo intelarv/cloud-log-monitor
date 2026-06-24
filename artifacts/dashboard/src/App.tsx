@@ -15,6 +15,7 @@ import Chat from "./pages/chat";
 import Ledger from "./pages/ledger";
 import Remediation from "./pages/remediation";
 import Admin from "./pages/admin";
+import OidcCallback from "./pages/oidc-callback";
 
 // A 401 normally means the session expired, so bounce to /login. The one
 // exception is a *step-up*-required 401 (`step_up_required: true`): that is an
@@ -71,6 +72,7 @@ function App() {
               <Route path="/ledger" component={Ledger} />
               <Route path="/remediation" component={Remediation} />
               <Route path="/admin" component={Admin} />
+              <Route path="/oidc-callback" component={OidcCallback} />
               <Route component={NotFound} />
             </Switch>
           </WouterRouter>

@@ -49,4 +49,21 @@ describe("stepUpProvider", () => {
       else process.env.STEP_UP_PROVIDER = prev;
     }
   });
+
+  it("resolves the oidc provider only on the exact lowercase value", () => {
+    const prev = process.env.STEP_UP_PROVIDER;
+    try {
+      // Case-sensitive (mirrors totp) and default-inert: a non-exact value
+      // falls back to dev so no OIDC env/dependency path is reached.
+      process.env.STEP_UP_PROVIDER = "OIDC";
+      expect(stepUpProvider()).toBe("dev");
+      process.env.STEP_UP_PROVIDER = "oidc";
+      expect(stepUpProvider()).toBe("oidc");
+      delete process.env.STEP_UP_PROVIDER;
+      expect(stepUpProvider()).toBe("dev");
+    } finally {
+      if (prev === undefined) delete process.env.STEP_UP_PROVIDER;
+      else process.env.STEP_UP_PROVIDER = prev;
+    }
+  });
 });

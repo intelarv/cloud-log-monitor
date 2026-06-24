@@ -27,6 +27,9 @@ import { useToast } from "@/hooks/use-toast";
 import StepUpModal from "../components/step-up-modal";
 import BreakGlassNoteModal from "../components/break-glass-note-modal";
 import TotpEnrollment from "../components/totp-enrollment";
+import WebauthnEnrollment from "../components/webauthn-enrollment";
+import OidcEnrollment from "../components/oidc-enrollment";
+import RecoveryCodes from "../components/recovery-codes";
 
 export default function Admin() {
   const { data: activeGrants, isLoading: loadingGrants } = useListBreakGlassGrants();
@@ -264,6 +267,9 @@ export default function Admin() {
           </Card>
 
           <TotpEnrollment />
+          <WebauthnEnrollment />
+          <OidcEnrollment />
+          <RecoveryCodes />
 
           <Card>
             <CardHeader>

@@ -431,6 +431,9 @@ CREATE TABLE IF NOT EXISTS step_up_factors (
 );
 CREATE INDEX IF NOT EXISTS step_up_factors_tenant_user_idx
   ON step_up_factors (tenant_id, user_id);
+-- Backup/recovery codes (M29): AES-256-GCM JSON {codes:[{hash,consumedAt}]}.
+-- Nullable until the user generates a set; see lib/step-up-verifier.ts.
+ALTER TABLE step_up_factors ADD COLUMN IF NOT EXISTS recovery_enc text;
 
 -- HITL remediation proposals. Tenant-scoped, RLS-isolated. UPDATE is permitted
 -- (the pending -> confirmed/rejected decision transition); DELETE is not enforced

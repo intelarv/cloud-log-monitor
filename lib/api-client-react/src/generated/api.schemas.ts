@@ -310,7 +310,7 @@ export interface MaintenanceMetrics {
 export interface StepUpInput {
   /**
      * @minLength 1
-     * @maxLength 256
+     * @maxLength 8192
      */
   token: string;
   /**
@@ -332,6 +332,8 @@ export type StepUpStatusProvider = typeof StepUpStatusProvider[keyof typeof Step
 export const StepUpStatusProvider = {
   dev: 'dev',
   totp: 'totp',
+  webauthn: 'webauthn',
+  oidc: 'oidc',
 } as const;
 
 export interface StepUpStatus {
@@ -352,6 +354,84 @@ export interface StepUpEnrollVerifyInput {
 
 export interface StepUpEnrollVerifyResult {
   verified: boolean;
+}
+
+export interface WebauthnRegistrationOptions {
+  challenge: string;
+  rpId: string;
+  rpName: string;
+  userIdB64url: string;
+  userName: string;
+}
+
+export interface WebauthnRegisterFinishInput {
+  /**
+     * @minLength 1
+     * @maxLength 16384
+     */
+  attestationObject: string;
+  /**
+     * @minLength 1
+     * @maxLength 8192
+     */
+  clientDataJSON: string;
+}
+
+export interface WebauthnRegisterFinishResult {
+  verified: boolean;
+}
+
+export interface WebauthnStepUpOptions {
+  challenge: string;
+  rpId: string;
+  allowCredentials: string[];
+}
+
+export interface OidcAuthUrl {
+  authorization_url: string;
+}
+
+export interface OidcRegisterFinishInput {
+  /**
+     * @minLength 1
+     * @maxLength 8192
+     */
+  code: string;
+  /**
+     * @minLength 1
+     * @maxLength 2048
+     */
+  state: string;
+}
+
+export interface OidcRegisterFinishResult {
+  verified: boolean;
+}
+
+export interface RecoveryStatus {
+  enabled: boolean;
+  remaining: number;
+}
+
+export interface RecoveryCodesResult {
+  codes: string[];
+}
+
+export interface RecoveryStepUpInput {
+  /**
+     * @minLength 1
+     * @maxLength 64
+     */
+  token: string;
+  /**
+     * @minLength 3
+     * @maxLength 200
+     */
+  reason: string;
+}
+
+export interface FactorRemoveResult {
+  removed: boolean;
 }
 
 export interface BreakGlassGrantInput {

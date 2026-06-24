@@ -11,6 +11,9 @@ import {
 } from "./search-config";
 import {
   OpenSearchLexicalProvider,
+  buildIsmPolicy,
+  createOpenSearchProvider,
+  loadIlmConfigFromEnv,
   safeTenantSegment,
   type OpenSearchClient,
 } from "./cloud-search";
@@ -534,5 +537,236 @@ describe("planReindexResume", () => {
     expect(
       planReindexResume(["a", "b"], { tenantId: "zz", sinceId: "f1" }),
     ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M30: OpenSearch ILM (ISM) lifecycle tiering — opt-in, default-inert
+// ---------------------------------------------------------------------------
+
+describe("loadIlmConfigFromEnv", () => {
+  it("returns undefined (inert) when OPENSEARCH_ILM_ENABLED is unset", () => {
+    expect(loadIlmConfigFromEnv({})).toBeUndefined();
+    expect(
+      loadIlmConfigFromEnv({ OPENSEARCH_ILM_HOT_MAX_AGE: "30d" }),
+    ).toBeUndefined();
+  });
+
+  it("parses the configured ages and defaults the policy name from the prefix", () => {
+    const cfg = loadIlmConfigFromEnv({
+      OPENSEARCH_ILM_ENABLED: "true",
+      OPENSEARCH_ILM_HOT_MAX_AGE: "30d",
+      OPENSEARCH_ILM_WARM_MAX_AGE: "90d",
+      OPENSEARCH_ILM_DELETE_MIN_AGE: "365d",
+    });
+    expect(cfg).toEqual({
+      policyName: "phi-audit-findings-ilm",
+      hotMaxAge: "30d",
+      warmMaxAge: "90d",
+      deleteMinAge: "365d",
+    });
+  });
+
+  it("honors an explicit policy name and derives the default from a custom prefix", () => {
+    expect(
+      loadIlmConfigFromEnv({
+        OPENSEARCH_ILM_ENABLED: "1",
+        OPENSEARCH_ILM_HOT_MAX_AGE: "7d",
+        OPENSEARCH_ILM_POLICY_NAME: "my-policy",
+      })?.policyName,
+    ).toBe("my-policy");
+    expect(
+      loadIlmConfigFromEnv({
+        OPENSEARCH_ILM_ENABLED: "1",
+        OPENSEARCH_ILM_HOT_MAX_AGE: "7d",
+        OPENSEARCH_INDEX_PREFIX: "acme-findings",
+      })?.policyName,
+    ).toBe("acme-findings-ilm");
+  });
+
+  it("throws when enabled but no lifecycle age is configured", () => {
+    expect(() =>
+      loadIlmConfigFromEnv({ OPENSEARCH_ILM_ENABLED: "true" }),
+    ).toThrow(/no lifecycle ages/);
+  });
+
+  it("throws on a malformed duration", () => {
+    expect(() =>
+      loadIlmConfigFromEnv({
+        OPENSEARCH_ILM_ENABLED: "true",
+        OPENSEARCH_ILM_HOT_MAX_AGE: "30 days",
+      }),
+    ).toThrow(/OPENSEARCH_ILM_HOT_MAX_AGE/);
+  });
+});
+
+describe("buildIsmPolicy", () => {
+  it("builds the full hot→warm→cold→delete chain with min_index_age transitions", () => {
+    const doc = buildIsmPolicy(
+      {
+        policyName: "p",
+        hotMaxAge: "30d",
+        warmMaxAge: "90d",
+        deleteMinAge: "365d",
+      },
+      "phi-audit-findings",
+    ) as {
+      policy: {
+        default_state: string;
+        states: Array<{
+          name: string;
+          transitions: Array<{
+            state_name: string;
+            conditions: { min_index_age: string };
+          }>;
+        }>;
+        ism_template: Array<{ index_patterns: string[] }>;
+      };
+    };
+    expect(doc.policy.default_state).toBe("hot");
+    expect(doc.policy.states.map((s) => s.name)).toEqual([
+      "hot",
+      "warm",
+      "cold",
+      "delete",
+    ]);
+    const byName = Object.fromEntries(
+      doc.policy.states.map((s) => [s.name, s]),
+    );
+    expect(byName["hot"]!.transitions).toEqual([
+      { state_name: "warm", conditions: { min_index_age: "30d" } },
+    ]);
+    expect(byName["warm"]!.transitions).toEqual([
+      { state_name: "cold", conditions: { min_index_age: "90d" } },
+    ]);
+    expect(byName["cold"]!.transitions).toEqual([
+      { state_name: "delete", conditions: { min_index_age: "365d" } },
+    ]);
+    expect(byName["delete"]!.transitions).toEqual([]);
+    // Auto-attaches to every index under the prefix (shared + per-tenant).
+    expect(doc.policy.ism_template[0]!.index_patterns).toEqual([
+      "phi-audit-findings*",
+    ]);
+  });
+
+  it("emits only reachable tiers — delete-only yields hot→delete", () => {
+    const doc = buildIsmPolicy(
+      { policyName: "p", deleteMinAge: "180d" },
+      "idx",
+    ) as {
+      policy: {
+        states: Array<{
+          name: string;
+          transitions: Array<{ state_name: string }>;
+        }>;
+      };
+    };
+    expect(doc.policy.states.map((s) => s.name)).toEqual(["hot", "delete"]);
+    expect(doc.policy.states[0]!.transitions[0]!.state_name).toBe("delete");
+  });
+});
+
+describe("OpenSearchLexicalProvider ILM application (fake client)", () => {
+  function makeIlmClient(): {
+    client: OpenSearchClient;
+    ilmCalls: Array<{ name: string; body: Record<string, unknown> }>;
+    ensured: string[];
+  } {
+    const ilmCalls: Array<{ name: string; body: Record<string, unknown> }> = [];
+    const ensured: string[] = [];
+    const client: OpenSearchClient = {
+      async ensureIndex(index) {
+        ensured.push(index);
+      },
+      async indexDoc() {},
+      async searchIds() {
+        return [];
+      },
+      async ensureIlmPolicy(name, body) {
+        ilmCalls.push({ name, body });
+      },
+    };
+    return { client, ilmCalls, ensured };
+  }
+
+  it("applies the policy exactly once before index creation when ILM is enabled", async () => {
+    const { client, ilmCalls } = makeIlmClient();
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      ilm: { policyName: "idx-ilm", hotMaxAge: "30d", deleteMinAge: "365d" },
+      clientFactory: async () => client,
+    });
+    await provider.search("t1", "ssn", 5);
+    await provider.search("t2", "name", 5);
+    await provider.indexFinding({
+      findingId: "F-1",
+      tenantId: "t1",
+      classification: "phi",
+      subclass: null,
+      severity: "high",
+      source: "s",
+      snippet: "<REDACTED>",
+    });
+    // Applied once across all operations.
+    expect(ilmCalls).toHaveLength(1);
+    expect(ilmCalls[0]!.name).toBe("idx-ilm");
+    const body = ilmCalls[0]!.body as {
+      policy: { ism_template: Array<{ index_patterns: string[] }> };
+    };
+    expect(body.policy.ism_template[0]!.index_patterns).toEqual(["idx*"]);
+  });
+
+  it("never calls ensureIlmPolicy when ILM is not configured (byte-identical)", async () => {
+    const { client, ilmCalls } = makeIlmClient();
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      clientFactory: async () => client,
+    });
+    await provider.search("t1", "ssn", 5);
+    expect(ilmCalls).toHaveLength(0);
+  });
+
+  it("is silently skipped when the client cannot apply ISM", async () => {
+    const ensured: string[] = [];
+    const legacyClient: OpenSearchClient = {
+      async ensureIndex(index) {
+        ensured.push(index);
+      },
+      async indexDoc() {},
+      async searchIds() {
+        return [];
+      },
+    };
+    const provider = new OpenSearchLexicalProvider({
+      endpoint: "https://os",
+      indexPrefix: "idx",
+      ilm: { policyName: "idx-ilm", hotMaxAge: "30d" },
+      clientFactory: async () => legacyClient,
+    });
+    // No throw even though the client lacks ensureIlmPolicy; index still ensured.
+    await provider.search("t1", "ssn", 5);
+    expect(ensured).toEqual(["idx"]);
+  });
+});
+
+describe("createOpenSearchProvider ILM wiring", () => {
+  it("passes ILM config through from env", () => {
+    const p = createOpenSearchProvider({
+      OPENSEARCH_ENDPOINT: "https://os.example:9200",
+      OPENSEARCH_ILM_ENABLED: "true",
+      OPENSEARCH_ILM_HOT_MAX_AGE: "30d",
+    });
+    expect(p).toBeInstanceOf(OpenSearchLexicalProvider);
+  });
+
+  it("surfaces an ILM misconfiguration as a loud boot failure", () => {
+    expect(() =>
+      createOpenSearchProvider({
+        OPENSEARCH_ENDPOINT: "https://os.example:9200",
+        OPENSEARCH_ILM_ENABLED: "true",
+      }),
+    ).toThrow(/no lifecycle ages/);
   });
 });

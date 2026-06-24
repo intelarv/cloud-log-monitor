@@ -429,6 +429,256 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /auth/step-up/webauthn/register/begin:
+    post:
+      operationId: stepUpWebauthnRegisterBegin
+      tags: [auth]
+      summary: |
+        Begin WebAuthn step-up registration (STEP_UP_PROVIDER=webauthn only).
+        Returns the public-key creation options for navigator.credentials.create().
+      responses:
+        "200":
+          description: Registration options issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebauthnRegistrationOptions" }
+        "404":
+          description: WebAuthn step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/webauthn/register/finish:
+    post:
+      operationId: stepUpWebauthnRegisterFinish
+      tags: [auth]
+      summary: Verify the WebAuthn attestation ceremony and mark the credential verified.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebauthnRegisterFinishInput" }
+      responses:
+        "200":
+          description: Registration confirmed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebauthnRegisterFinishResult" }
+        "400":
+          description: Invalid input or attestation verification failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: WebAuthn step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/webauthn/challenge:
+    post:
+      operationId: stepUpWebauthnChallenge
+      tags: [auth]
+      summary: |
+        Issue a single-use assertion challenge for an enrolled WebAuthn credential.
+        The resulting assertion is submitted to /auth/step-up as the token.
+      responses:
+        "200":
+          description: Assertion challenge issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebauthnStepUpOptions" }
+        "400":
+          description: No verified WebAuthn credential
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: WebAuthn step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/oidc/register/begin:
+    post:
+      operationId: stepUpOidcRegisterBegin
+      tags: [auth]
+      summary: |
+        Begin OIDC step-up enrollment (STEP_UP_PROVIDER=oidc only). Returns an
+        IdP authorization URL the dashboard opens in a popup to link the user's
+        federated identity.
+      responses:
+        "200":
+          description: Authorization URL issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OidcAuthUrl" }
+        "404":
+          description: OIDC step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/oidc/register/finish:
+    post:
+      operationId: stepUpOidcRegisterFinish
+      tags: [auth]
+      summary: |
+        Complete OIDC enrollment with the {code,state} returned from the IdP
+        callback; verifies the ID token and links the federated identity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OidcRegisterFinishInput" }
+      responses:
+        "200":
+          description: Enrollment confirmed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OidcRegisterFinishResult" }
+        "400":
+          description: Invalid input or ID-token verification failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: OIDC step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/oidc/challenge:
+    post:
+      operationId: stepUpOidcChallenge
+      tags: [auth]
+      summary: |
+        Issue an IdP authorization URL for an enrolled federated identity. The
+        resulting {code,state} is submitted to /auth/step-up as the token (JSON).
+      responses:
+        "200":
+          description: Authorization URL issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OidcAuthUrl" }
+        "400":
+          description: No verified OIDC identity
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: OIDC step-up is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/recovery/status:
+    get:
+      operationId: stepUpRecoveryStatus
+      tags: [auth]
+      summary: |
+        Backup-code status for the caller (whether a set exists and how many
+        codes remain). 404 under the dev provider.
+      responses:
+        "200":
+          description: Recovery-code status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecoveryStatus" }
+        "404":
+          description: Step-up factor management is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/recovery/generate:
+    post:
+      operationId: stepUpRecoveryGenerate
+      tags: [auth]
+      summary: |
+        Generate (or regenerate) a fresh set of single-use backup codes.
+        Requires a valid step-up cookie and a verified factor. The plaintext
+        codes are returned exactly once.
+      responses:
+        "200":
+          description: Backup codes generated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecoveryCodesResult" }
+        "400":
+          description: No verified second factor to back up
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Step-up authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Step-up factor management is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/recovery:
+    post:
+      operationId: stepUpRecovery
+      tags: [auth]
+      summary: |
+        Redeem a single-use backup code as a step-up (5-min cookie). Mirrors
+        /auth/step-up but the token is a recovery code, consumed on success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecoveryStepUpInput" }
+      responses:
+        "200":
+          description: Step-up granted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpResult" }
+        "400":
+          description: Invalid input or rejected reason text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Invalid recovery code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: Step-up factor management is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/step-up/factor/remove:
+    post:
+      operationId: stepUpFactorRemove
+      tags: [auth]
+      summary: |
+        Remove the caller's enrolled second factor and its backup codes (the
+        "lost my device, start over" path). Requires a valid step-up cookie.
+      responses:
+        "200":
+          description: Factor removed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FactorRemoveResult" }
+        "401":
+          description: Step-up authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: No enrolled factor / factor management is not enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /admin/break-glass/grants:
     get:
       operationId: listBreakGlassGrants
@@ -1259,7 +1509,7 @@ components:
       type: object
       required: [token, reason]
       properties:
-        token: { type: string, minLength: 1, maxLength: 256 }
+        token: { type: string, minLength: 1, maxLength: 8192 }
         reason: { type: string, minLength: 3, maxLength: 200 }
 
     StepUpResult:
@@ -1274,7 +1524,7 @@ components:
       type: object
       required: [provider, enrolled, verified]
       properties:
-        provider: { type: string, enum: [dev, totp] }
+        provider: { type: string, enum: [dev, totp, webauthn, oidc] }
         enrolled: { type: boolean }
         verified: { type: boolean }
 
@@ -1296,6 +1546,86 @@ components:
       required: [verified]
       properties:
         verified: { type: boolean }
+
+    WebauthnRegistrationOptions:
+      type: object
+      required: [challenge, rpId, rpName, userIdB64url, userName]
+      properties:
+        challenge: { type: string }
+        rpId: { type: string }
+        rpName: { type: string }
+        userIdB64url: { type: string }
+        userName: { type: string }
+
+    WebauthnRegisterFinishInput:
+      type: object
+      required: [attestationObject, clientDataJSON]
+      properties:
+        attestationObject: { type: string, minLength: 1, maxLength: 16384 }
+        clientDataJSON: { type: string, minLength: 1, maxLength: 8192 }
+
+    WebauthnRegisterFinishResult:
+      type: object
+      required: [verified]
+      properties:
+        verified: { type: boolean }
+
+    WebauthnStepUpOptions:
+      type: object
+      required: [challenge, rpId, allowCredentials]
+      properties:
+        challenge: { type: string }
+        rpId: { type: string }
+        allowCredentials:
+          type: array
+          items: { type: string }
+
+    OidcAuthUrl:
+      type: object
+      required: [authorization_url]
+      properties:
+        authorization_url: { type: string }
+
+    OidcRegisterFinishInput:
+      type: object
+      required: [code, state]
+      properties:
+        code: { type: string, minLength: 1, maxLength: 8192 }
+        state: { type: string, minLength: 1, maxLength: 2048 }
+
+    OidcRegisterFinishResult:
+      type: object
+      required: [verified]
+      properties:
+        verified: { type: boolean }
+
+    RecoveryStatus:
+      type: object
+      required: [enabled, remaining]
+      properties:
+        enabled: { type: boolean }
+        remaining: { type: integer }
+
+    RecoveryCodesResult:
+      type: object
+      required: [codes]
+      properties:
+        codes:
+          type: array
+          items: { type: string }
+
+    RecoveryStepUpInput:
+      type: object
+      required: [token, reason]
+      properties:
+        token: { type: string, minLength: 1, maxLength: 64 }
+        reason: { type: string, minLength: 3, maxLength: 200 }
+
+    FactorRemoveResult:
+      type: object
+      required: [removed]
+      properties:
+        removed: { type: boolean }
 
     BreakGlassGrantInput:
       type: object

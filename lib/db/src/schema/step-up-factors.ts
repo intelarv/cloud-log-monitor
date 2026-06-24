@@ -34,6 +34,13 @@ export const stepUpFactorsTable = pgTable(
     // Reserved for future factor types (e.g. "webauthn"); only "totp" today.
     type: text("type").notNull().default("totp"),
     secretEnc: text("secret_enc").notNull(),
+    // Backup/recovery codes (M29), nullable until the user generates a set.
+    // AES-256-GCM-encrypted JSON `{codes:[{hash,consumedAt}]}` under the
+    // domain-separated `stepup-recovery` key. Each `hash` is a keyed HMAC of a
+    // single-use code; the plaintext codes are shown once at generation and
+    // never stored. Available to every non-dev provider as an account-recovery
+    // path if the primary factor (authenticator / passkey / IdP) is lost.
+    recoveryEnc: text("recovery_enc"),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
     lastUsedStep: bigint("last_used_step", { mode: "number" }),
     createdAt: timestamp("created_at", { withTimezone: true })

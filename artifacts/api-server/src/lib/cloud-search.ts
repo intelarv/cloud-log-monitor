@@ -46,6 +46,11 @@ export interface OpenSearchClient {
   ): Promise<void>;
   /** Returns the matched document ids in score order (best first). */
   searchIds(index: string, body: Record<string, unknown>): Promise<string[]>;
+  /** Create the ISM lifecycle policy `name` if it does not already exist
+   *  (idempotent, create-if-absent — never clobbers an operator-edited policy).
+   *  Optional: only invoked when ILM tiering is configured; a legacy/mock client
+   *  may omit it, in which case ILM application is silently skipped. */
+  ensureIlmPolicy?(name: string, body: Record<string, unknown>): Promise<void>;
 }
 
 export interface OpenSearchProviderOpts {
@@ -58,8 +63,136 @@ export interface OpenSearchProviderOpts {
    *  index scoped only by a `tenant_id` term filter. Off by default ⇒
    *  byte-identical to the pre-isolation single-index behavior. */
   readonly perTenantIndex?: boolean;
+  /** Opt-in ISM lifecycle tiering (hot→warm→cold→delete). Undefined ⇒ no policy
+   *  is applied and index creation is byte-identical to before. */
+  readonly ilm?: IlmConfig;
   /** Test injection: bypass the real SDK loader. */
   readonly clientFactory?: () => Promise<OpenSearchClient>;
+}
+
+// ----- ISM (Index State Management) lifecycle tiering -------------------
+//
+// M30: surface OpenSearch ILM hot→warm→cold tiering as opt-in APP config. When
+// OPENSEARCH_ILM_ENABLED is set, the provider ensures a single ISM policy whose
+// `ism_template` auto-attaches to every index matching its prefix, so findings
+// indices age through tiers by index age. Default-inert: unset ⇒ no policy, no
+// ISM call, identical behavior — and the whole OpenSearch path is itself inert
+// unless SEARCH_PROVIDER=opensearch, so the offline eval gate is unaffected.
+
+export interface IlmConfig {
+  /** Name of the ISM policy to create/attach. */
+  readonly policyName: string;
+  /** Index age at which a hot index transitions to warm (e.g. "30d"). */
+  readonly hotMaxAge?: string;
+  /** Index age at which a warm index transitions to cold (e.g. "90d"). */
+  readonly warmMaxAge?: string;
+  /** Index age at which the final tier transitions to delete (e.g. "365d"). */
+  readonly deleteMinAge?: string;
+}
+
+/** OpenSearch duration literals we accept for lifecycle ages: an integer plus a
+ *  day/hour/minute/second unit (the units the ISM `min_index_age` condition
+ *  understands in practice). Validated up front so a typo fails loudly at boot
+ *  rather than producing a policy OpenSearch silently rejects. */
+const ILM_AGE_RE = /^\d+(d|h|m|s)$/;
+
+function parseIlmAge(raw: string | undefined, name: string): string | undefined {
+  const v = raw?.trim();
+  if (!v) return undefined;
+  if (!ILM_AGE_RE.test(v)) {
+    throw new Error(
+      `${name} must be an OpenSearch duration like "30d", "12h", "30m" or "60s" (got ${JSON.stringify(v)})`,
+    );
+  }
+  return v;
+}
+
+/** Parse the ILM tiering config from env. Returns undefined (the default) unless
+ *  OPENSEARCH_ILM_ENABLED is truthy. Throws when enabled but no lifecycle age is
+ *  configured, so an operator who flips the switch without a policy fails loudly
+ *  instead of installing a no-op policy. */
+export function loadIlmConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): IlmConfig | undefined {
+  if (!isTruthyEnv(env["OPENSEARCH_ILM_ENABLED"])) return undefined;
+  const hotMaxAge = parseIlmAge(
+    env["OPENSEARCH_ILM_HOT_MAX_AGE"],
+    "OPENSEARCH_ILM_HOT_MAX_AGE",
+  );
+  const warmMaxAge = parseIlmAge(
+    env["OPENSEARCH_ILM_WARM_MAX_AGE"],
+    "OPENSEARCH_ILM_WARM_MAX_AGE",
+  );
+  const deleteMinAge = parseIlmAge(
+    env["OPENSEARCH_ILM_DELETE_MIN_AGE"],
+    "OPENSEARCH_ILM_DELETE_MIN_AGE",
+  );
+  if (!hotMaxAge && !warmMaxAge && !deleteMinAge) {
+    throw new Error(
+      "OPENSEARCH_ILM_ENABLED is set but no lifecycle ages are configured; set at " +
+        "least one of OPENSEARCH_ILM_HOT_MAX_AGE / OPENSEARCH_ILM_WARM_MAX_AGE / " +
+        "OPENSEARCH_ILM_DELETE_MIN_AGE",
+    );
+  }
+  const policyName =
+    env["OPENSEARCH_ILM_POLICY_NAME"]?.trim() ||
+    `${env["OPENSEARCH_INDEX_PREFIX"]?.trim() || DEFAULT_INDEX_PREFIX}-ilm`;
+  return { policyName, hotMaxAge, warmMaxAge, deleteMinAge };
+}
+
+/** Build the ISM policy document for `cfg`, auto-attached to every index whose
+ *  name starts with `indexPrefix` (covers both the shared index and the
+ *  per-tenant `${prefix}-${seg}` indices). Only the tiers reachable from the
+ *  configured ages are emitted: e.g. setting only DELETE_MIN_AGE yields a
+ *  hot→delete policy, while all three ages yield the full hot→warm→cold→delete
+ *  chain. Tier actions stay portable (force_merge / replica_count / delete) so
+ *  the policy applies to any OpenSearch cluster without UltraWarm/cold plugins. */
+export function buildIsmPolicy(
+  cfg: IlmConfig,
+  indexPrefix: string,
+): Record<string, unknown> {
+  const transitions: Record<
+    string,
+    Array<{ state_name: string; conditions: { min_index_age: string } }>
+  > = {};
+  const used = new Set<string>(["hot"]);
+  let current = "hot";
+  const chain: Array<[string, string | undefined]> = [
+    ["warm", cfg.hotMaxAge],
+    ["cold", cfg.warmMaxAge],
+    ["delete", cfg.deleteMinAge],
+  ];
+  for (const [name, age] of chain) {
+    if (!age) continue;
+    (transitions[current] ??= []).push({
+      state_name: name,
+      conditions: { min_index_age: age },
+    });
+    used.add(name);
+    current = name;
+  }
+  const actions: Record<string, Array<Record<string, unknown>>> = {
+    hot: [],
+    warm: [{ force_merge: { max_num_segments: 1 } }],
+    cold: [{ replica_count: { number_of_replicas: 0 } }],
+    delete: [{ delete: {} }],
+  };
+  const states = (["hot", "warm", "cold", "delete"] as const)
+    .filter((s) => used.has(s))
+    .map((s) => ({
+      name: s,
+      actions: actions[s],
+      transitions: transitions[s] ?? [],
+    }));
+  return {
+    policy: {
+      description:
+        "PHI-Audit findings index lifecycle (hot→warm→cold tiering, M30).",
+      default_state: "hot",
+      states,
+      ism_template: [{ index_patterns: [`${indexPrefix}*`], priority: 100 }],
+    },
+  };
 }
 
 const DEFAULT_INDEX_PREFIX = "phi-audit-findings";
@@ -89,10 +222,13 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
   private readonly ensured = new Set<string>();
   private readonly indexPrefix: string;
   private readonly perTenantIndex: boolean;
+  private readonly ilm?: IlmConfig;
+  private ilmEnsured = false;
 
   constructor(private readonly opts: OpenSearchProviderOpts) {
     this.indexPrefix = opts.indexPrefix ?? DEFAULT_INDEX_PREFIX;
     this.perTenantIndex = opts.perTenantIndex ?? false;
+    this.ilm = opts.ilm;
   }
 
   /** The index a given tenant's documents live in. By default this is a single
@@ -207,6 +343,26 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
               resp?.body?.hits?.hits ?? resp?.hits?.hits ?? [];
             return (hits as ReadonlyArray<{ _id: string }>).map((h) => h._id);
           },
+          async ensureIlmPolicy(
+            name: string,
+            body: Record<string, unknown>,
+          ): Promise<void> {
+            const path = `/_plugins/_ism/policies/${encodeURIComponent(name)}`;
+            // Create-if-absent: a GET that succeeds means the policy already
+            // exists, so we leave any operator edits untouched. Only a 404
+            // triggers a create; other errors propagate (fail loud at boot).
+            try {
+              await native.transport.request({ method: "GET", path });
+              return;
+            } catch (err) {
+              const status =
+                (err as { statusCode?: number; meta?: { statusCode?: number } })
+                  ?.statusCode ??
+                (err as { meta?: { statusCode?: number } })?.meta?.statusCode;
+              if (status && status !== 404) throw err;
+            }
+            await native.transport.request({ method: "PUT", path, body });
+          },
         } satisfies OpenSearchClient;
       })();
     }
@@ -217,9 +373,26 @@ export class OpenSearchLexicalProvider implements LexicalSearchProvider {
     client: OpenSearchClient,
     index: string,
   ): Promise<void> {
+    // Apply the ISM lifecycle policy (once per provider) BEFORE creating any
+    // index, so its `ism_template` auto-attaches the policy at index creation.
+    await this.ensureIlm(client);
     if (this.ensured.has(index)) return;
     await client.ensureIndex(index);
     this.ensured.add(index);
+  }
+
+  /** Ensure the opt-in ISM tiering policy exists. No-op (and byte-identical to
+   *  the pre-M30 path) unless `ilm` is configured; guarded so it runs at most
+   *  once per provider, and silently skipped if the client cannot apply ISM. */
+  private async ensureIlm(client: OpenSearchClient): Promise<void> {
+    if (!this.ilm || this.ilmEnsured) return;
+    if (!client.ensureIlmPolicy) {
+      this.ilmEnsured = true;
+      return;
+    }
+    const policy = buildIsmPolicy(this.ilm, this.indexPrefix);
+    await client.ensureIlmPolicy(this.ilm.policyName, policy);
+    this.ilmEnsured = true;
   }
 
   async search(
@@ -326,12 +499,14 @@ export function createOpenSearchProvider(
     );
   }
   const perTenantIndex = isTruthyEnv(env["OPENSEARCH_PER_TENANT_INDEX"]);
+  const ilm = loadIlmConfigFromEnv(env);
   return new OpenSearchLexicalProvider({
     endpoint,
     indexPrefix,
     perTenantIndex,
     ...(username ? { username } : {}),
     ...(password ? { password } : {}),
+    ...(ilm ? { ilm } : {}),
   });
 }
 

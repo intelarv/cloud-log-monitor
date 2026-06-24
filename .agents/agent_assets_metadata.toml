@@ -119,10 +119,16 @@ title = "Project source (572 files)"
 id = "e3wHlQ5qXRKc163KdrLMv"
 uri = "file://exports/phi-audit-source.tar.gz"
 type = "unspecified"
-title = "PHI Audit — Source Files"
+title = "PHI Audit — Project Source (tar.gz)"
 
 [[outputs]]
 id = "7XFebtH1qKjuPcMk2gRu9"
 uri = "file://exports/source_20260613_145656.tar.gz"
 type = "unspecified"
 title = "Project source (569 files, 2.4 MB)"
+
+[[outputs]]
+id = "teymkraYbwMtna1prqvRy"
+uri = "file://exports/phi-audit-source-20260616.tar.gz"
+type = "unspecified"
+title = "PHI Audit — source archive (2026-06-16)"

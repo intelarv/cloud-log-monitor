@@ -8,15 +8,15 @@ See docs/ARCHITECTURE.md §24 for scope.
  * OpenAPI spec version: 0.1.0
  */
 
-export interface StepUpInput {
+export interface OidcRegisterFinishInput {
   /**
      * @minLength 1
      * @maxLength 8192
      */
-  token: string;
+  code: string;
   /**
-     * @minLength 3
-     * @maxLength 200
+     * @minLength 1
+     * @maxLength 2048
      */
-  reason: string;
+  state: string;
 }

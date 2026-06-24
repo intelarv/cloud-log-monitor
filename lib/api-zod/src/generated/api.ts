@@ -394,7 +394,7 @@ export const GetMaintenanceMetricsResponse = zod.object({
 /**
  * @summary Elevate the session for break-glass actions (5-min cookie).
  */
-export const stepUpBodyTokenMax = 256;
+export const stepUpBodyTokenMax = 8192;
 
 export const stepUpBodyReasonMin = 3;
 export const stepUpBodyReasonMax = 200;
@@ -417,7 +417,7 @@ export const StepUpResponse = zod.object({
  * @summary Active step-up provider and (for TOTP) the caller's factor status.
  */
 export const StepUpStatusResponse = zod.object({
-  "provider": zod.enum(['dev', 'totp']),
+  "provider": zod.enum(['dev', 'totp', 'webauthn', 'oidc']),
   "enrolled": zod.boolean(),
   "verified": zod.boolean()
 })
@@ -447,6 +447,149 @@ export const StepUpEnrollVerifyBody = zod.object({
 
 export const StepUpEnrollVerifyResponse = zod.object({
   "verified": zod.boolean()
+})
+
+
+/**
+ * @summary Begin WebAuthn step-up registration (STEP_UP_PROVIDER=webauthn only).
+Returns the public-key creation options for navigator.credentials.create().
+
+ */
+export const StepUpWebauthnRegisterBeginResponse = zod.object({
+  "challenge": zod.string(),
+  "rpId": zod.string(),
+  "rpName": zod.string(),
+  "userIdB64url": zod.string(),
+  "userName": zod.string()
+})
+
+
+/**
+ * @summary Verify the WebAuthn attestation ceremony and mark the credential verified.
+ */
+export const stepUpWebauthnRegisterFinishBodyAttestationObjectMax = 16384;
+
+export const stepUpWebauthnRegisterFinishBodyClientDataJSONMax = 8192;
+
+
+
+export const StepUpWebauthnRegisterFinishBody = zod.object({
+  "attestationObject": zod.string().min(1).max(stepUpWebauthnRegisterFinishBodyAttestationObjectMax),
+  "clientDataJSON": zod.string().min(1).max(stepUpWebauthnRegisterFinishBodyClientDataJSONMax)
+})
+
+export const StepUpWebauthnRegisterFinishResponse = zod.object({
+  "verified": zod.boolean()
+})
+
+
+/**
+ * @summary Issue a single-use assertion challenge for an enrolled WebAuthn credential.
+The resulting assertion is submitted to /auth/step-up as the token.
+
+ */
+export const StepUpWebauthnChallengeResponse = zod.object({
+  "challenge": zod.string(),
+  "rpId": zod.string(),
+  "allowCredentials": zod.array(zod.string())
+})
+
+
+/**
+ * @summary Begin OIDC step-up enrollment (STEP_UP_PROVIDER=oidc only). Returns an
+IdP authorization URL the dashboard opens in a popup to link the user's
+federated identity.
+
+ */
+export const StepUpOidcRegisterBeginResponse = zod.object({
+  "authorization_url": zod.string()
+})
+
+
+/**
+ * @summary Complete OIDC enrollment with the {code,state} returned from the IdP
+callback; verifies the ID token and links the federated identity.
+
+ */
+export const stepUpOidcRegisterFinishBodyCodeMax = 8192;
+
+export const stepUpOidcRegisterFinishBodyStateMax = 2048;
+
+
+
+export const StepUpOidcRegisterFinishBody = zod.object({
+  "code": zod.string().min(1).max(stepUpOidcRegisterFinishBodyCodeMax),
+  "state": zod.string().min(1).max(stepUpOidcRegisterFinishBodyStateMax)
+})
+
+export const StepUpOidcRegisterFinishResponse = zod.object({
+  "verified": zod.boolean()
+})
+
+
+/**
+ * @summary Issue an IdP authorization URL for an enrolled federated identity. The
+resulting {code,state} is submitted to /auth/step-up as the token (JSON).
+
+ */
+export const StepUpOidcChallengeResponse = zod.object({
+  "authorization_url": zod.string()
+})
+
+
+/**
+ * @summary Backup-code status for the caller (whether a set exists and how many
+codes remain). 404 under the dev provider.
+
+ */
+export const StepUpRecoveryStatusResponse = zod.object({
+  "enabled": zod.boolean(),
+  "remaining": zod.number()
+})
+
+
+/**
+ * @summary Generate (or regenerate) a fresh set of single-use backup codes.
+Requires a valid step-up cookie and a verified factor. The plaintext
+codes are returned exactly once.
+
+ */
+export const StepUpRecoveryGenerateResponse = zod.object({
+  "codes": zod.array(zod.string())
+})
+
+
+/**
+ * @summary Redeem a single-use backup code as a step-up (5-min cookie). Mirrors
+/auth/step-up but the token is a recovery code, consumed on success.
+
+ */
+export const stepUpRecoveryBodyTokenMax = 64;
+
+export const stepUpRecoveryBodyReasonMin = 3;
+export const stepUpRecoveryBodyReasonMax = 200;
+
+
+
+export const StepUpRecoveryBody = zod.object({
+  "token": zod.string().min(1).max(stepUpRecoveryBodyTokenMax),
+  "reason": zod.string().min(stepUpRecoveryBodyReasonMin).max(stepUpRecoveryBodyReasonMax)
+})
+
+export const StepUpRecoveryResponse = zod.object({
+  "ok": zod.boolean(),
+  "expires_at": zod.coerce.date(),
+  "ttl_seconds": zod.number()
+})
+
+
+/**
+ * @summary Remove the caller's enrolled second factor and its backup codes (the
+"lost my device, start over" path). Requires a valid step-up cookie.
+
+ */
+export const StepUpFactorRemoveResponse = zod.object({
+  "removed": zod.boolean()
 })
 
 

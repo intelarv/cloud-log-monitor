@@ -31,6 +31,7 @@ import type {
   ChatSession,
   ChatSessionInput,
   ErrorResponse,
+  FactorRemoveResult,
   Finding,
   FindingRawEvidence,
   HealthStatus,
@@ -45,8 +46,14 @@ import type {
   ListRemediationProposalsParams,
   LoginInput,
   MaintenanceMetrics,
+  OidcAuthUrl,
+  OidcRegisterFinishInput,
+  OidcRegisterFinishResult,
   ReReviewFindingInput,
   ReReviewFindingResult,
+  RecoveryCodesResult,
+  RecoveryStatus,
+  RecoveryStepUpInput,
   RemediationDecisionInput,
   RemediationProposal,
   ReopenFindingInput,
@@ -61,7 +68,11 @@ import type {
   StepUpInput,
   StepUpResult,
   StepUpStatus,
-  ToolGetFindingInput
+  ToolGetFindingInput,
+  WebauthnRegisterFinishInput,
+  WebauthnRegisterFinishResult,
+  WebauthnRegistrationOptions,
+  WebauthnStepUpOptions
 } from './api.schemas';
 
 import { customFetch } from '../custom-fetch';
@@ -1644,6 +1655,756 @@ export const useStepUpEnrollVerify = <TError = ErrorType<ErrorResponse>,
         TContext
       > => {
       return useMutation(getStepUpEnrollVerifyMutationOptions(options));
+    }
+
+export const getStepUpWebauthnRegisterBeginUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/webauthn/register/begin`
+}
+
+/**
+ * @summary Begin WebAuthn step-up registration (STEP_UP_PROVIDER=webauthn only).
+Returns the public-key creation options for navigator.credentials.create().
+
+ */
+export const stepUpWebauthnRegisterBegin = async ( options?: RequestInit): Promise<WebauthnRegistrationOptions> => {
+
+  return customFetch<WebauthnRegistrationOptions>(getStepUpWebauthnRegisterBeginUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpWebauthnRegisterBeginMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnRegisterBegin>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnRegisterBegin>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpWebauthnRegisterBegin'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpWebauthnRegisterBegin>>, void> = () => {
+
+
+          return  stepUpWebauthnRegisterBegin(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpWebauthnRegisterBeginMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpWebauthnRegisterBegin>>>
+
+    export type StepUpWebauthnRegisterBeginMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Begin WebAuthn step-up registration (STEP_UP_PROVIDER=webauthn only).
+Returns the public-key creation options for navigator.credentials.create().
+
+ */
+export const useStepUpWebauthnRegisterBegin = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnRegisterBegin>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpWebauthnRegisterBegin>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpWebauthnRegisterBeginMutationOptions(options));
+    }
+
+export const getStepUpWebauthnRegisterFinishUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/webauthn/register/finish`
+}
+
+/**
+ * @summary Verify the WebAuthn attestation ceremony and mark the credential verified.
+ */
+export const stepUpWebauthnRegisterFinish = async (webauthnRegisterFinishInput: WebauthnRegisterFinishInput, options?: RequestInit): Promise<WebauthnRegisterFinishResult> => {
+
+  return customFetch<WebauthnRegisterFinishResult>(getStepUpWebauthnRegisterFinishUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      webauthnRegisterFinishInput,)
+  }
+);}
+
+
+
+
+export const getStepUpWebauthnRegisterFinishMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnRegisterFinish>>, TError,{data: BodyType<WebauthnRegisterFinishInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnRegisterFinish>>, TError,{data: BodyType<WebauthnRegisterFinishInput>}, TContext> => {
+
+const mutationKey = ['stepUpWebauthnRegisterFinish'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpWebauthnRegisterFinish>>, {data: BodyType<WebauthnRegisterFinishInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  stepUpWebauthnRegisterFinish(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpWebauthnRegisterFinishMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpWebauthnRegisterFinish>>>
+    export type StepUpWebauthnRegisterFinishMutationBody = BodyType<WebauthnRegisterFinishInput>
+    export type StepUpWebauthnRegisterFinishMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Verify the WebAuthn attestation ceremony and mark the credential verified.
+ */
+export const useStepUpWebauthnRegisterFinish = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnRegisterFinish>>, TError,{data: BodyType<WebauthnRegisterFinishInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpWebauthnRegisterFinish>>,
+        TError,
+        {data: BodyType<WebauthnRegisterFinishInput>},
+        TContext
+      > => {
+      return useMutation(getStepUpWebauthnRegisterFinishMutationOptions(options));
+    }
+
+export const getStepUpWebauthnChallengeUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/webauthn/challenge`
+}
+
+/**
+ * @summary Issue a single-use assertion challenge for an enrolled WebAuthn credential.
+The resulting assertion is submitted to /auth/step-up as the token.
+
+ */
+export const stepUpWebauthnChallenge = async ( options?: RequestInit): Promise<WebauthnStepUpOptions> => {
+
+  return customFetch<WebauthnStepUpOptions>(getStepUpWebauthnChallengeUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpWebauthnChallengeMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnChallenge>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnChallenge>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpWebauthnChallenge'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpWebauthnChallenge>>, void> = () => {
+
+
+          return  stepUpWebauthnChallenge(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpWebauthnChallengeMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpWebauthnChallenge>>>
+
+    export type StepUpWebauthnChallengeMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Issue a single-use assertion challenge for an enrolled WebAuthn credential.
+The resulting assertion is submitted to /auth/step-up as the token.
+
+ */
+export const useStepUpWebauthnChallenge = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpWebauthnChallenge>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpWebauthnChallenge>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpWebauthnChallengeMutationOptions(options));
+    }
+
+export const getStepUpOidcRegisterBeginUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/oidc/register/begin`
+}
+
+/**
+ * @summary Begin OIDC step-up enrollment (STEP_UP_PROVIDER=oidc only). Returns an
+IdP authorization URL the dashboard opens in a popup to link the user's
+federated identity.
+
+ */
+export const stepUpOidcRegisterBegin = async ( options?: RequestInit): Promise<OidcAuthUrl> => {
+
+  return customFetch<OidcAuthUrl>(getStepUpOidcRegisterBeginUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpOidcRegisterBeginMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcRegisterBegin>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcRegisterBegin>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpOidcRegisterBegin'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpOidcRegisterBegin>>, void> = () => {
+
+
+          return  stepUpOidcRegisterBegin(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpOidcRegisterBeginMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpOidcRegisterBegin>>>
+
+    export type StepUpOidcRegisterBeginMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Begin OIDC step-up enrollment (STEP_UP_PROVIDER=oidc only). Returns an
+IdP authorization URL the dashboard opens in a popup to link the user's
+federated identity.
+
+ */
+export const useStepUpOidcRegisterBegin = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcRegisterBegin>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpOidcRegisterBegin>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpOidcRegisterBeginMutationOptions(options));
+    }
+
+export const getStepUpOidcRegisterFinishUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/oidc/register/finish`
+}
+
+/**
+ * @summary Complete OIDC enrollment with the {code,state} returned from the IdP
+callback; verifies the ID token and links the federated identity.
+
+ */
+export const stepUpOidcRegisterFinish = async (oidcRegisterFinishInput: OidcRegisterFinishInput, options?: RequestInit): Promise<OidcRegisterFinishResult> => {
+
+  return customFetch<OidcRegisterFinishResult>(getStepUpOidcRegisterFinishUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      oidcRegisterFinishInput,)
+  }
+);}
+
+
+
+
+export const getStepUpOidcRegisterFinishMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcRegisterFinish>>, TError,{data: BodyType<OidcRegisterFinishInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcRegisterFinish>>, TError,{data: BodyType<OidcRegisterFinishInput>}, TContext> => {
+
+const mutationKey = ['stepUpOidcRegisterFinish'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpOidcRegisterFinish>>, {data: BodyType<OidcRegisterFinishInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  stepUpOidcRegisterFinish(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpOidcRegisterFinishMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpOidcRegisterFinish>>>
+    export type StepUpOidcRegisterFinishMutationBody = BodyType<OidcRegisterFinishInput>
+    export type StepUpOidcRegisterFinishMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Complete OIDC enrollment with the {code,state} returned from the IdP
+callback; verifies the ID token and links the federated identity.
+
+ */
+export const useStepUpOidcRegisterFinish = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcRegisterFinish>>, TError,{data: BodyType<OidcRegisterFinishInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpOidcRegisterFinish>>,
+        TError,
+        {data: BodyType<OidcRegisterFinishInput>},
+        TContext
+      > => {
+      return useMutation(getStepUpOidcRegisterFinishMutationOptions(options));
+    }
+
+export const getStepUpOidcChallengeUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/oidc/challenge`
+}
+
+/**
+ * @summary Issue an IdP authorization URL for an enrolled federated identity. The
+resulting {code,state} is submitted to /auth/step-up as the token (JSON).
+
+ */
+export const stepUpOidcChallenge = async ( options?: RequestInit): Promise<OidcAuthUrl> => {
+
+  return customFetch<OidcAuthUrl>(getStepUpOidcChallengeUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpOidcChallengeMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcChallenge>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcChallenge>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpOidcChallenge'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpOidcChallenge>>, void> = () => {
+
+
+          return  stepUpOidcChallenge(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpOidcChallengeMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpOidcChallenge>>>
+
+    export type StepUpOidcChallengeMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Issue an IdP authorization URL for an enrolled federated identity. The
+resulting {code,state} is submitted to /auth/step-up as the token (JSON).
+
+ */
+export const useStepUpOidcChallenge = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpOidcChallenge>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpOidcChallenge>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpOidcChallengeMutationOptions(options));
+    }
+
+export const getStepUpRecoveryStatusUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/recovery/status`
+}
+
+/**
+ * @summary Backup-code status for the caller (whether a set exists and how many
+codes remain). 404 under the dev provider.
+
+ */
+export const stepUpRecoveryStatus = async ( options?: RequestInit): Promise<RecoveryStatus> => {
+
+  return customFetch<RecoveryStatus>(getStepUpRecoveryStatusUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getStepUpRecoveryStatusQueryKey = () => {
+    return [
+    `/api/auth/step-up/recovery/status`
+    ] as const;
+    }
+
+
+export const getStepUpRecoveryStatusQueryOptions = <TData = Awaited<ReturnType<typeof stepUpRecoveryStatus>>, TError = ErrorType<ErrorResponse>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof stepUpRecoveryStatus>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getStepUpRecoveryStatusQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof stepUpRecoveryStatus>>> = ({ signal }) => stepUpRecoveryStatus({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof stepUpRecoveryStatus>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type StepUpRecoveryStatusQueryResult = NonNullable<Awaited<ReturnType<typeof stepUpRecoveryStatus>>>
+export type StepUpRecoveryStatusQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Backup-code status for the caller (whether a set exists and how many
+codes remain). 404 under the dev provider.
+
+ */
+
+export function useStepUpRecoveryStatus<TData = Awaited<ReturnType<typeof stepUpRecoveryStatus>>, TError = ErrorType<ErrorResponse>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof stepUpRecoveryStatus>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getStepUpRecoveryStatusQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getStepUpRecoveryGenerateUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/recovery/generate`
+}
+
+/**
+ * @summary Generate (or regenerate) a fresh set of single-use backup codes.
+Requires a valid step-up cookie and a verified factor. The plaintext
+codes are returned exactly once.
+
+ */
+export const stepUpRecoveryGenerate = async ( options?: RequestInit): Promise<RecoveryCodesResult> => {
+
+  return customFetch<RecoveryCodesResult>(getStepUpRecoveryGenerateUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpRecoveryGenerateMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpRecoveryGenerate>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpRecoveryGenerate>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpRecoveryGenerate'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpRecoveryGenerate>>, void> = () => {
+
+
+          return  stepUpRecoveryGenerate(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpRecoveryGenerateMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpRecoveryGenerate>>>
+
+    export type StepUpRecoveryGenerateMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Generate (or regenerate) a fresh set of single-use backup codes.
+Requires a valid step-up cookie and a verified factor. The plaintext
+codes are returned exactly once.
+
+ */
+export const useStepUpRecoveryGenerate = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpRecoveryGenerate>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpRecoveryGenerate>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpRecoveryGenerateMutationOptions(options));
+    }
+
+export const getStepUpRecoveryUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/recovery`
+}
+
+/**
+ * @summary Redeem a single-use backup code as a step-up (5-min cookie). Mirrors
+/auth/step-up but the token is a recovery code, consumed on success.
+
+ */
+export const stepUpRecovery = async (recoveryStepUpInput: RecoveryStepUpInput, options?: RequestInit): Promise<StepUpResult> => {
+
+  return customFetch<StepUpResult>(getStepUpRecoveryUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      recoveryStepUpInput,)
+  }
+);}
+
+
+
+
+export const getStepUpRecoveryMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpRecovery>>, TError,{data: BodyType<RecoveryStepUpInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpRecovery>>, TError,{data: BodyType<RecoveryStepUpInput>}, TContext> => {
+
+const mutationKey = ['stepUpRecovery'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpRecovery>>, {data: BodyType<RecoveryStepUpInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  stepUpRecovery(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpRecoveryMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpRecovery>>>
+    export type StepUpRecoveryMutationBody = BodyType<RecoveryStepUpInput>
+    export type StepUpRecoveryMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Redeem a single-use backup code as a step-up (5-min cookie). Mirrors
+/auth/step-up but the token is a recovery code, consumed on success.
+
+ */
+export const useStepUpRecovery = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpRecovery>>, TError,{data: BodyType<RecoveryStepUpInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpRecovery>>,
+        TError,
+        {data: BodyType<RecoveryStepUpInput>},
+        TContext
+      > => {
+      return useMutation(getStepUpRecoveryMutationOptions(options));
+    }
+
+export const getStepUpFactorRemoveUrl = () => {
+
+
+
+
+  return `/api/auth/step-up/factor/remove`
+}
+
+/**
+ * @summary Remove the caller's enrolled second factor and its backup codes (the
+"lost my device, start over" path). Requires a valid step-up cookie.
+
+ */
+export const stepUpFactorRemove = async ( options?: RequestInit): Promise<FactorRemoveResult> => {
+
+  return customFetch<FactorRemoveResult>(getStepUpFactorRemoveUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getStepUpFactorRemoveMutationOptions = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpFactorRemove>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof stepUpFactorRemove>>, TError,void, TContext> => {
+
+const mutationKey = ['stepUpFactorRemove'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof stepUpFactorRemove>>, void> = () => {
+
+
+          return  stepUpFactorRemove(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StepUpFactorRemoveMutationResult = NonNullable<Awaited<ReturnType<typeof stepUpFactorRemove>>>
+
+    export type StepUpFactorRemoveMutationError = ErrorType<ErrorResponse>
+
+    /**
+ * @summary Remove the caller's enrolled second factor and its backup codes (the
+"lost my device, start over" path). Requires a valid step-up cookie.
+
+ */
+export const useStepUpFactorRemove = <TError = ErrorType<ErrorResponse>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof stepUpFactorRemove>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof stepUpFactorRemove>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getStepUpFactorRemoveMutationOptions(options));
     }
 
 export const getListBreakGlassGrantsUrl = () => {

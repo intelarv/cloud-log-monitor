@@ -54,3 +54,28 @@ exactly this duplicate-ledger/double-charge risk.
 **How to apply:** keep the retry-policy object in a pure, SDK-free module so it's
 unit-testable without the optional `@temporalio/*` packages installed (assert
 `retry.maximumAttempts === 1`); the workflow shim just imports it.
+
+## Awaited one-shot jobs CANNOT buffer like fire-and-forget submits — inline-fallback instead
+
+The buffer-during-startup rule above is for **fire-and-forget** work (submitReview
+returns void; cron schedules). A one-shot job whose **result is awaited by the
+caller** (boot search-index reconcile logs the counts; the replay route returns
+`{replayed,delivered,errors}`) cannot be buffered across the async-start window —
+there is no caller still waiting by the time the worker comes up. So an
+`executeOneShot<T>(job): Promise<T>` seam must, when the durable engine isn't
+`running` yet, run `job.run()` **inline** (logged) and return that, NOT enqueue.
+This is safe only because the migrated one-shots are idempotent (reconcile is a
+no-op for the Postgres provider) or dev-only (fixture replay). The boot reconcile
+*always* takes this inline path under `WORKFLOW_ENGINE=temporal` because it runs
+before `startAgentSupervisor` selects+starts the engine.
+
+**Why:** the periodic/reaper migration was fire-and-forget so it could buffer;
+the one-shot migration looks identical but the awaited return value changes the
+correct degraded behavior from "buffer + flush" to "run inline now".
+
+**How to apply:** when deciding buffer-vs-inline for a not-yet-running durable
+backend, branch on whether the caller awaits a result. Awaited ⇒ inline fallback
+(only if the unit is idempotent/safe to run off the durable path). Fire-and-forget
+⇒ buffer + flush. Also: one-shots must use a UNIQUE per-run workflow id (they are
+intentionally NOT deduped, unlike the fixed-id cron jobs whose AlreadyStarted is
+swallowed for idempotency).
